@@ -57,17 +57,77 @@ fn between<A, B>(first: &Timed<A>, second: &Timed<B>) -> (Duration, Duration) {
     )
 }
 
-/// Asserts a meter fell from `from` to `to` at [`METER_DECAY_DB_PER_SECOND`]
-/// over some time within `(least, most)`.
+/// Whether a meter fed silence can fall from `from` to `to` at
+/// [`METER_DECAY_DB_PER_SECOND`] over some time within `(least, most)`,
+/// 0.05 dB either way. It compares amplitudes, never their logarithm, so a
+/// reading of 0.0 (or a start at 0.0) gives no infinity and no NaN: 0.0 is
+/// consistent exactly when the most decay possible reaches [`METER_FLOOR`],
+/// below which a meter reads silence.
+fn fell_consistently(
+    from: f32,
+    to: f32,
+    (least, most): (Duration, Duration),
+) -> Result<(), String> {
+    let slack = 10f32.powf(0.05 / 20.0);
+    let highest = from * fall(least) * slack;
+    let lowest = from * fall(most) / slack;
+    let floored = lowest < METER_FLOOR;
+    if to == 0.0 {
+        return if floored {
+            Ok(())
+        } else {
+            Err(format!(
+                "read silence, but over at most {most:?} it falls no lower than {lowest}"
+            ))
+        };
+    }
+    if highest < METER_FLOOR {
+        return Err(format!(
+            "read {to}, but over at least {least:?} it falls below the floor"
+        ));
+    }
+    if (lowest..=highest).contains(&to) {
+        Ok(())
+    } else {
+        Err(format!(
+            "read {to}, expected {lowest} to {highest} after {least:?} to {most:?}"
+        ))
+    }
+}
+
+/// Asserts [`fell_consistently`].
 #[track_caller]
-fn assert_fell(from: f32, to: f32, (least, most): (Duration, Duration), what: &str) {
-    let fell = 20.0 * (to / from).log10();
-    let rate = METER_DECAY_DB_PER_SECOND;
-    let (slowest, fastest) = (-rate * least.as_secs_f32(), -rate * most.as_secs_f32());
-    assert!(
-        fell <= slowest + 0.05 && fell >= fastest - 0.05,
-        "{what}: fell {fell} dB, expected {fastest} to {slowest} dB"
+fn assert_fell(from: f32, to: f32, interval: (Duration, Duration), what: &str) {
+    if let Err(problem) = fell_consistently(from, to, interval) {
+        panic!("{what}: from {from}, {problem}");
+    }
+}
+
+#[test]
+fn the_fall_check_takes_a_meter_at_the_floor_after_a_long_stall() {
+    // Polls 5 s apart, as a stalled machine might make them: 100 dB of
+    // decay, past the floor (-100 dBFS) for anything below full scale.
+    let base = Instant::now();
+    let at = |start: Duration, end: Duration| Timed {
+        value: (),
+        start: base + start,
+        end: base + end,
+    };
+    let millis = Duration::from_millis;
+    let stalled = between(&at(millis(0), millis(1)), &at(millis(5_000), millis(5_001)));
+    assert_eq!(stalled, (millis(4_999), millis(5_001)));
+    assert_eq!(fell_consistently(0.5, 0.0, stalled), Ok(()));
+    assert_eq!(fell_consistently(0.0, 0.0, stalled), Ok(()), "no NaN");
+    assert!(fell_consistently(0.5, 0.25, stalled).is_err());
+    // Polls 300 ms apart: 6 dB, and silence would be wrong.
+    let usual = between(&at(millis(0), millis(1)), &at(millis(300), millis(301)));
+    assert_eq!(
+        fell_consistently(0.5, 0.5 * fall(millis(300)), usual),
+        Ok(())
     );
+    assert!(fell_consistently(0.5, 0.0, usual).is_err());
+    assert!(fell_consistently(0.5, 0.5, usual).is_err(), "frozen");
+    assert!(fell_consistently(0.0, 0.0, usual).is_ok(), "silence stays");
 }
 
 /// Asserts a hold that last took `peak` at most `since` ago: still `peak`
@@ -771,40 +831,52 @@ fn under_every_handover_the_bus_and_master_meters_carry_on() {
         );
         let (mut session, fake) = two_items(dir.path(), transition);
         session.send(SetlistCommand::Item(Command::Play)).unwrap();
-        let mut snapshot = setlist_step(&mut session, &fake);
-        let mut before = snapshot.clone();
-        // When the Drums bus last read its full level: its hold's start.
-        let mut loud = Instant::now();
+        let mut polled = timed(|| setlist_step(&mut session, &fake));
+        let mut before = polled.value.clone();
+        // The Drums bus took its full level, and so its hold, on every poll
+        // while the first song played: the hold started no later than the
+        // start of the last such poll (or of the first poll, before it).
+        let mut loud = polled.start;
         for _ in 0..400 {
-            if snapshot.setlist.current == 1 {
+            if polled.value.setlist.current == 1 {
                 break;
             }
-            before = snapshot.clone();
-            let start = Instant::now();
-            snapshot = setlist_step(&mut session, &fake);
-            if snapshot.song.mixer.bus_meters[Bus::Drums.index()].level[0] == 0.5 {
-                loud = start;
+            before = polled.value.clone();
+            polled = timed(|| setlist_step(&mut session, &fake));
+            let song = &polled.value;
+            if song.setlist.current == 0 && song.song.transport == TransportState::Playing {
+                loud = polled.start;
             }
         }
+        let snapshot = &polled.value;
         assert_eq!(snapshot.setlist.current, 1, "{transition:?}");
+        // Nothing but silence could have taken a meter to 0.0 since then.
+        let silenced = 0.5 * fall(polled.end - loud) < METER_FLOOR;
         let drums_before = before.song.mixer.bus_meters[Bus::Drums.index()];
         let first = &snapshot.song.mixer;
         let drums_first = first.bus_meters[Bus::Drums.index()];
         assert!(
-            drums_first.level[0] > 0.0,
+            drums_first.level[0] > 0.0 || silenced,
             "{transition:?}: the Drums bus started again from silence"
         );
         assert_eq!(drums_first.hold, drums_before.hold, "{transition:?}");
-        assert!(first.master_meter.level[0] > 0.0, "{transition:?}");
+        assert!(
+            first.master_meter.level[0] > 0.0 || silenced,
+            "{transition:?}"
+        );
 
         std::thread::sleep(Duration::from_millis(300));
-        let later = setlist_step(&mut session, &fake);
-        let since = loud.elapsed();
+        let later_poll = timed(|| setlist_step(&mut session, &fake));
+        let since = later_poll.end - loud;
+        let later = &later_poll.value;
         let mixer = &later.song.mixer;
         let drums = mixer.bus_meters[Bus::Drums.index()];
-        assert!(
-            drums.level[0] > 0.0 && drums.level[0] < drums_first.level[0],
-            "{transition:?}: the Drums bus falls: {drums:?}"
+        // The second song has no drums, so the bus took silence since.
+        assert_fell(
+            drums_first.level[0],
+            drums.level[0],
+            between(&polled, &later_poll),
+            &format!("{transition:?}: the Drums bus"),
         );
         assert_held(
             drums.hold[0],
@@ -883,6 +955,9 @@ fn a_paused_or_stopped_session_falls_to_silence_at_the_stated_rate() {
         // Not frozen: it keeps falling toward silence.
         std::thread::sleep(Duration::from_millis(50));
         let lower = step(&mut session, &fake).mixer.master_meter.level[0];
-        assert!(lower < master.level[0], "{halt:?}: {lower}");
+        assert!(
+            lower < master.level[0] || master.level[0] == 0.0,
+            "{halt:?}: {lower}"
+        );
     }
 }
