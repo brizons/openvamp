@@ -105,3 +105,10 @@ Route evidence: the parent session is long and past the ~150k-token backstop. Or
   - `PerformView.subtitle` and `StatusView`'s underruns and device line are no longer drawn, and the artist shows nowhere.
   - `numbered` means "several words".
   - A repeated Tag becomes T1/T2, against "Tag stays Tag".
+- **L39** (2026-11-21): c253dc6 (meter tests compare amplitudes, so a meter at the floor never yields −inf or NaN; the hold is anchored on the last poll that fed the peak; 10 load runs clean), 03c6df1 (the six L35/L36 desktop items; `SILENCED_OPACITY` kept at 0.4) and 1c27484 (the L38 Perform items: song facts read on the background executor through a `facts.rs` cache that never keeps a failure, retries after 5 s, and says why in the notes; layout estimate and drawing share named constants; undrawn view fields removed; Tag stays Tag; doc links). 1c27484 names Risk item 4, so it got an independent verifier: no blockers, all six behaviours hold. Advisories:
+  - A read under way when a song reopens counts as the re-read.
+  - A read that never returns blocks that folder.
+  - The artist shows nowhere (as before).
+  - The README overclaimed that a slow drive never holds up the screen. Fixed in 04267a4.
+  - Pre-existing, outside T6: `SetlistSession::poll` prepares the next item (song.json and stems) on the UI thread during the tick, and opening a song is synchronous, so a slow volume can still stall the screen and Panic. This is a follow-up for its own task.
+- The open slice 4138268..03c6df1 is under review with the user's consent; 1c27484 follows alone.
