@@ -106,13 +106,18 @@ fn a_hold_that_starts_falling_during_a_step_falls_only_past_the_hold() {
 /// Writes a song of `stems` (id, role, level) held constant, plus a silent
 /// click stem.
 fn write_song(dir: &Path, stems: &[(String, StemRole, f32)]) {
+    write_song_at(dir, stems, FRAMES, RATE);
+}
+
+/// [`write_song`] with `frames` frames at `rate`.
+fn write_song_at(dir: &Path, stems: &[(String, StemRole, f32)], frames: usize, rate: u32) {
     let mut all = stems.to_vec();
     all.push(("click".to_owned(), StemRole::Click, 0.0));
     let package = SongPackage {
         format_version: 1,
         title: "Band".to_owned(),
         artist: None,
-        sample_rate: RATE,
+        sample_rate: rate,
         key: None,
         tempo_map: vec![TempoPoint { at: 0, bpm: 120.0 }],
         time_signature_map: vec![TimeSignaturePoint {
@@ -146,13 +151,13 @@ fn write_song(dir: &Path, stems: &[(String, StemRole, f32)]) {
     fs::write(dir.join("song.json"), package.to_json().unwrap()).unwrap();
     let spec = WavSpec {
         channels: 1,
-        sample_rate: RATE,
+        sample_rate: rate,
         bits_per_sample: 32,
         sample_format: SampleFormat::Float,
     };
     for (id, _, level) in &all {
         let mut writer = WavWriter::create(dir.join(format!("stems/{id}.wav")), spec).unwrap();
-        for _ in 0..FRAMES {
+        for _ in 0..frames {
             writer.write_sample(*level).unwrap();
         }
         writer.finalize().unwrap();
@@ -357,4 +362,262 @@ fn a_lost_device_reads_falling_meters_not_the_last_peak() {
     std::thread::sleep(Duration::from_millis(100));
     let lost = session.poll().mixer.master_meter.level[0];
     assert!(lost < playing * fall(Duration::from_millis(90)), "{lost}");
+}
+
+/// Stems named and levelled as given.
+fn stems(stems: &[(&str, StemRole, f32)]) -> Vec<(String, StemRole, f32)> {
+    stems
+        .iter()
+        .map(|&(id, role, level)| (id.to_owned(), role, level))
+        .collect()
+}
+
+/// A setlist of the songs `first` and `second` in `dir`, both with
+/// `transition`, on a fresh fake output.
+fn two_items(dir: &Path, transition: Transition) -> (SetlistSession, FakeOutput) {
+    let library = Library::new(dir);
+    let mut setlist = Setlist::new("Sunday");
+    setlist.items = ["first", "second"]
+        .into_iter()
+        .map(|path| {
+            SetlistItem::Song(SongItem {
+                transition,
+                ..SongItem::new(path)
+            })
+        })
+        .collect();
+    let file = library.save_setlist(&setlist).unwrap().file;
+    let fake = FakeOutput::new();
+    let session = SetlistSession::open(
+        &library,
+        &file,
+        Box::new(fake.clone()),
+        SessionOptions::default(),
+    )
+    .unwrap();
+    (session, fake)
+}
+
+fn setlist_step(session: &mut SetlistSession, fake: &FakeOutput) -> app::SetlistSnapshot {
+    for monitor in session.disk_monitors() {
+        assert!(monitor.wait_idle(Duration::from_secs(10)));
+    }
+    fake.render(256).expect("a stream plays");
+    session.poll()
+}
+
+/// The first song, one second: drums 0.5 and a guide 0.25 (a guide plays
+/// to the end); the second: two silent stems, so any level it shows is
+/// another item's.
+fn loud_then_silent(dir: &Path) {
+    write_song_at(
+        &dir.join("first"),
+        &stems(&[
+            ("drums", StemRole::Track, 0.5),
+            ("guide", StemRole::Guide, 0.25),
+        ]),
+        RATE as usize,
+        RATE,
+    );
+    write_song_at(
+        &dir.join("second"),
+        &stems(&[
+            ("vocals", StemRole::Track, 0.0),
+            ("keys", StemRole::Track, 0.0),
+        ]),
+        FRAMES,
+        RATE,
+    );
+}
+
+#[track_caller]
+fn assert_stems_silent(snapshot: &app::SetlistSnapshot, when: &str) {
+    for stem in &snapshot.song.mixer.stems {
+        assert_eq!(
+            stem.meter,
+            Some(Meter::default()),
+            "{when}: the new item's {} shows another item's level",
+            stem.id
+        );
+    }
+}
+
+#[test]
+fn after_cue_next_the_new_items_stem_meters_start_from_silence() {
+    let dir = tempfile::tempdir().unwrap();
+    loud_then_silent(dir.path());
+    let (mut session, fake) = two_items(dir.path(), Transition::CueNext);
+    session.send(SetlistCommand::Item(Command::Play)).unwrap();
+    let mut snapshot = setlist_step(&mut session, &fake);
+    for _ in 0..200 {
+        if snapshot.setlist.current == 1 {
+            break;
+        }
+        snapshot = setlist_step(&mut session, &fake);
+    }
+    assert_eq!(
+        snapshot.setlist.current, 1,
+        "Cue next selected the second song"
+    );
+    assert_eq!(snapshot.song.mixer.stems[0].id, "vocals");
+    assert_stems_silent(&snapshot, "the poll that selected it");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_stems_silent(&setlist_step(&mut session, &fake), "0.5 s later");
+}
+
+#[test]
+fn a_selection_while_playing_starts_the_new_items_stem_meters_from_silence() {
+    let dir = tempfile::tempdir().unwrap();
+    loud_then_silent(dir.path());
+    let (mut session, fake) = two_items(dir.path(), Transition::Stay);
+    session.send(SetlistCommand::Item(Command::Play)).unwrap();
+    let mut snapshot = setlist_step(&mut session, &fake);
+    for _ in 0..12 {
+        snapshot = setlist_step(&mut session, &fake);
+    }
+    assert_eq!(level(snapshot.song.mixer.stems[1].meter), [0.25, 0.25]);
+    session.send(SetlistCommand::Select(1)).unwrap();
+    // Polled before the audio thread took the selection.
+    assert_stems_silent(&session.poll(), "before a callback");
+    let mut last = setlist_step(&mut session, &fake);
+    for _ in 0..3 {
+        last = setlist_step(&mut session, &fake);
+    }
+    assert_eq!(last.setlist.current, 1);
+    assert_stems_silent(&last, "after four callbacks");
+}
+
+#[test]
+fn next_and_previous_start_the_new_items_stem_meters_from_silence() {
+    let dir = tempfile::tempdir().unwrap();
+    write_song(
+        &dir.path().join("first"),
+        &stems(&[("drums", StemRole::Track, 0.5)]),
+    );
+    write_song(
+        &dir.path().join("second"),
+        &stems(&[("vocals", StemRole::Track, 0.125)]),
+    );
+    let (mut session, fake) = two_items(dir.path(), Transition::Stay);
+    for (command, playing) in [
+        (SetlistCommand::Next, 0.5),
+        (SetlistCommand::Previous, 0.125),
+    ] {
+        session.send(SetlistCommand::Item(Command::Play)).unwrap();
+        let mut snapshot = setlist_step(&mut session, &fake);
+        for _ in 0..12 {
+            snapshot = setlist_step(&mut session, &fake);
+        }
+        assert_eq!(
+            level(snapshot.song.mixer.stems[0].meter),
+            [playing, playing],
+            "{command:?}: the item playing"
+        );
+        session.send(command).unwrap();
+        assert_stems_silent(&session.poll(), &format!("{command:?}"));
+        assert_stems_silent(&setlist_step(&mut session, &fake), &format!("{command:?}"));
+    }
+}
+
+#[test]
+fn an_item_at_another_rate_starts_its_stem_meters_from_silence() {
+    let dir = tempfile::tempdir().unwrap();
+    write_song_at(
+        &dir.path().join("first"),
+        &stems(&[("drums", StemRole::Track, 0.5)]),
+        RATE as usize,
+        RATE,
+    );
+    write_song_at(
+        &dir.path().join("second"),
+        &stems(&[
+            ("vocals", StemRole::Track, 0.0),
+            ("keys", StemRole::Track, 0.0),
+        ]),
+        FRAMES,
+        2 * RATE,
+    );
+    let (mut session, fake) = two_items(dir.path(), Transition::CueNext);
+    session.send(SetlistCommand::Item(Command::Play)).unwrap();
+    let mut snapshot = setlist_step(&mut session, &fake);
+    for _ in 0..200 {
+        if snapshot.setlist.current == 1 {
+            break;
+        }
+        snapshot = setlist_step(&mut session, &fake);
+    }
+    assert_eq!(snapshot.setlist.current, 1, "the device reopened for it");
+    assert_eq!(
+        fake.opened().last().map(|request| request.sample_rate),
+        Some(2 * RATE)
+    );
+    assert_stems_silent(&snapshot, "the poll that reopened the device");
+    assert_stems_silent(&setlist_step(&mut session, &fake), "a callback later");
+}
+
+#[test]
+fn a_device_back_from_a_loss_does_not_show_the_level_from_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    write_song_at(
+        dir.path(),
+        &stems(&[("drums", StemRole::Track, 0.5)]),
+        8 * RATE as usize,
+        RATE,
+    );
+    let fake = FakeOutput::new();
+    let mut session = Session::open(
+        dir.path(),
+        Box::new(fake.clone()),
+        SessionOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        play(&mut session, &fake, 20).mixer.master_meter.level,
+        [0.5, 0.5]
+    );
+    fake.unplug(app::testing::FAKE_DEVICE_ID);
+    session.poll();
+    std::thread::sleep(Duration::from_millis(500));
+    let lost = session.poll().mixer;
+    let fell = 20.0 * (lost.master_meter.level[0] / 0.5).log10();
+    assert!(
+        (-11.0..=-9.0).contains(&fell),
+        "fell {fell} dB in about 0.5 s"
+    );
+    assert_eq!(
+        lost.master_meter.hold,
+        [0.5, 0.5],
+        "the hold stays its second"
+    );
+    let before = session.poll().mixer.master_meter.level[0];
+    fake.plug(app::testing::FAKE_DEVICE_ID);
+    for _ in 0..50 {
+        session.poll();
+        if fake.is_streaming() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(fake.is_streaming(), "the device plays again");
+    let back = session.poll();
+    assert!(
+        back.mixer.master_meter.level[0] <= before,
+        "back from a loss, paused, the master rose from {before} to {:?}",
+        back.mixer.master_meter
+    );
+    for _ in 0..6 {
+        let snapshot = step(&mut session, &fake);
+        assert!(
+            snapshot.mixer.master_meter.level[0] <= before,
+            "{:?}",
+            snapshot.mixer.master_meter
+        );
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    let later = step(&mut session, &fake);
+    assert!(
+        later.mixer.master_meter.level[0] < 0.25,
+        "a paused session back from a loss shows the level from before it: {:?}",
+        later.mixer.master_meter
+    );
 }

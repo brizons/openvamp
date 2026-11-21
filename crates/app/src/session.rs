@@ -824,16 +824,26 @@ impl Session {
 
     /// The second half of [`Self::poll`], on the report the first half read.
     pub(crate) fn end_poll(&mut self, report: &Report, now: Instant) -> Snapshot {
-        // A device that does not play hears nothing.
-        let peaks = match self.link {
-            Link::Streaming { .. } => report.status().meters,
-            Link::Held { .. } | Link::Lost => live::Meters::SILENT,
-        };
-        self.meters.update(&peaks, now);
+        self.meters.update(&self.heard(report), now);
         self.advance_reopen(report, now);
         self.advance_start(report, now);
         self.watch_disk(report);
         self.snapshot(report)
+    }
+
+    /// The peaks the meters take from `report`: its own while the device
+    /// plays the item the session now describes and that item's transport
+    /// runs; silence otherwise. A report read before a selection, a handoff
+    /// or a reopen describes another item, and a held or paused player's
+    /// windows hold frames nobody heard, such as the pause ramp rendered on
+    /// this thread while the device was away.
+    fn heard(&self, report: &Report) -> live::Meters {
+        let streaming = matches!(self.link, Link::Streaming { .. });
+        if streaming && report.deck.item == self.item && report.status().transport.is_running() {
+            report.status().meters
+        } else {
+            live::Meters::SILENT
+        }
     }
 
     fn dispatch(&mut self, command: Command) -> Result<(), RuntimeError> {
