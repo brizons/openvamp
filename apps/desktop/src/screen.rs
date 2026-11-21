@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use app::{AudioOutput, SetlistCommandError, SetlistState, Snapshot};
+use app::AudioOutput;
 use domain::SetlistItem;
 use gpui::{
     App, AppContext, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
@@ -25,10 +25,11 @@ use openvamp_desktop::facts::{self, FactsCache};
 use openvamp_desktop::hold::PanicHold;
 use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, Typed, is_panic_key, typed};
 use openvamp_desktop::library_page::{Dragged, LibraryPage, Opened, library_to_open};
-use openvamp_desktop::mixer::{MixerAction, MixerPage, needs_frames, restore_mix, unsaved_mix};
+use openvamp_desktop::mixer::{MixerAction, MixerPage, restore_mix, unsaved_mix};
 use openvamp_desktop::output_page::{OutputAction, OutputPage};
 use openvamp_desktop::reorder::Half;
 use openvamp_desktop::show::{LoadedSetlist, Show, Source, close, replace};
+use openvamp_desktop::tick::Timed;
 use openvamp_desktop::view::{PerformView, SongFacts};
 
 use crate::library_ui::{DraggedItem, DraggedSetlist};
@@ -40,7 +41,7 @@ use crate::{library_ui, mixer_ui, output_ui, ui};
 /// only through `Session::poll` (L16). A poll asks for a frame while the
 /// song moves or a meter reads above silence
 /// ([`openvamp_desktop::mixer::needs_frames`]), else only when it changed
-/// what the screens show.
+/// what the screens show ([`Timed::turn`]).
 const POLL_EVERY: Duration = Duration::from_millis(33);
 
 /// The Perform screen.
@@ -265,42 +266,19 @@ impl Perform {
         cx.notify();
     }
 
-    /// One turn of the timer: moves the session on, fires a panic hold
-    /// that is complete, and starts reading the facts of a song that shows
-    /// when they are wanted ([`Self::read_facts`]). It asks for a frame
-    /// while a hold fills, the song moves or a meter reads above silence
-    /// ([`needs_frames`]); otherwise only when the turn changed what the
-    /// screens show, so a still screen with every meter at 0 draws nothing.
+    /// One turn of the timer: moves on everything that changes with time
+    /// alone and draws again only when it changed what the screens show
+    /// ([`Timed::turn`]), then starts reading the facts of a song that
+    /// shows when they are wanted ([`Self::read_facts`]).
     fn tick(&mut self, cx: &mut Context<Self>) {
-        let counting = self.hold.is_counting();
-        let now = Instant::now();
-        let fires = self.hold.tick(now);
-        let Some(show) = &mut self.loaded else {
-            // Nothing moves without a song, except a hold's fill.
-            if counting {
-                cx.notify();
-            }
-            return;
+        let timed = Timed {
+            show: self.loaded.as_mut(),
+            hold: &mut self.hold,
+            mixer: &mut self.mixer,
+            output: &mut self.output,
+            settings: &mut self.settings,
         };
-        // What the screens drew from, unless they draw this turn anyway.
-        let drawn = (!needs_frames(show.snapshot())).then(|| Drawn::of(show));
-        let saving = self.mixer.buses_waiting();
-        self.mixer.tick(show, &mut self.settings, now);
-        if fires {
-            show.send(UiAction::Panic);
-        }
-        show.poll();
-        // A buffer size or routing waiting for the stream to open again;
-        // what it settles shows on the Audio output screen.
-        let output =
-            (self.page == Page::Output).then(|| self.output.view(Some(show), &self.settings));
-        self.output.follow(Some(show), &mut self.settings, now);
-        let followed =
-            output.is_some_and(|before| before != self.output.view(Some(show), &self.settings));
-        let changed = drawn.is_none_or(|drawn| !drawn.is(show))
-            || saving != self.mixer.buses_waiting()
-            || followed;
-        if counting || changed || needs_frames(show.snapshot()) {
+        if timed.turn(Instant::now()) {
             cx.notify();
         }
         self.read_facts(cx);
@@ -877,37 +855,6 @@ impl Render for Perform {
             .child(ui::nav(self.page, cx))
             .child(ui::main().child(body))
             .when(self.asking, |root| root.child(ui::shield()))
-    }
-}
-
-/// What the screens draw from a session, kept across a poll to tell
-/// whether it changed anything on show: the song's state and, for a
-/// setlist, where it stands and the control it last refused.
-struct Drawn {
-    song: Snapshot,
-    setlist: Option<(SetlistState, Option<SetlistCommandError>)>,
-}
-
-impl Drawn {
-    fn of(show: &Show) -> Self {
-        Self {
-            song: show.snapshot().clone(),
-            setlist: show
-                .setlist()
-                .map(|setlist| (setlist.snapshot.setlist.clone(), setlist.refused.clone())),
-        }
-    }
-
-    /// Whether `show` still draws the same.
-    fn is(&self, show: &Show) -> bool {
-        self.song == *show.snapshot()
-            && match (&self.setlist, show.setlist()) {
-                (None, None) => true,
-                (Some((state, refused)), Some(setlist)) => {
-                    *state == setlist.snapshot.setlist && *refused == setlist.refused
-                }
-                _ => false,
-            }
     }
 }
 

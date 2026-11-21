@@ -12,8 +12,10 @@
 //! [`app::SetlistCommand`] it sends, [`hold`] times the hold-to-panic
 //! control, [`keys`] maps the keyboard to the same controls, [`song`] opens
 //! a song in place of the current one and closes it with its ramp, [`show`]
-//! does the same for a song or a setlist, and [`ending`] decides when
-//! quitting or closing the window asks first. For the Library screen,
+//! does the same for a song or a setlist, [`ending`] decides when
+//! quitting or closing the window asks first, and [`tick`] moves on what
+//! changes with time alone on each turn of the screens' timer and says
+//! whether they draw again. For the Library screen,
 //! [`library_page`] carries out its controls and says what it shows,
 //! [`shelf`] lists, creates, duplicates and moves setlists, [`editor`] edits and
 //! saves one, and [`line_edit`] is its one-line text field. The GPUI views
@@ -39,4 +41,5 @@ pub mod shelf;
 pub mod show;
 pub mod song;
 pub mod strip;
+pub mod tick;
 pub mod view;

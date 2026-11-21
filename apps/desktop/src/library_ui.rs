@@ -689,11 +689,30 @@ const COLUMN_GAP: f32 = 10.;
 /// Where an item's problems and controls start: under its song.
 const DETAILS_INDENT: f32 = NUMBER_WIDTH + COLUMN_GAP;
 
+// An item's dropdown ([`row_dropdown`]) is drawn with these sizes, and
+// [`Columns::of`] adds them up to size its column, so a restyle changes
+// both.
+
 /// The size of the text in an item's dropdowns.
 const DROPDOWN_TEXT: f32 = 13.;
+/// The width of an item's dropdown's border.
+const DROPDOWN_BORDER: f32 = 1.;
+/// The padding at each end of an item's dropdown.
+const DROPDOWN_PADDING: f32 = 10.;
+/// The size of the icon an item's dropdown starts with.
+const DROPDOWN_ICON: f32 = 15.;
+/// The size of the chevron an item's dropdown ends with.
+const DROPDOWN_CHEVRON: f32 = 14.;
+/// The gap between an item's dropdown's icon, text and chevron.
+const DROPDOWN_GAP: f32 = 6.;
 /// What an item's dropdown takes beside its text: its border, padding,
 /// icon, chevron and the gaps between them, and a point for rounding.
-const DROPDOWN_CHROME: f32 = 2. + 2. * 10. + 15. + 14. + 2. * 6. + 1.;
+const DROPDOWN_CHROME: f32 = 2. * DROPDOWN_BORDER
+    + 2. * DROPDOWN_PADDING
+    + DROPDOWN_ICON
+    + DROPDOWN_CHEVRON
+    + 2. * DROPDOWN_GAP
+    + 1.;
 /// The design's width of the arrangement and transition columns: the
 /// widest they get.
 const DROPDOWN_MAX: f32 = 150.;
@@ -983,16 +1002,16 @@ fn row_dropdown(
     let chevron = if row.selected { "up" } else { "down" };
     button(id(name), cx, act(LibraryAction::SelectRow(row.index)))
         .h(px(40.))
-        .px(px(10.))
-        .gap(px(6.))
+        .px(px(DROPDOWN_PADDING))
+        .gap(px(DROPDOWN_GAP))
         .rounded(px(8.))
         .bg(theme::surface())
-        .border_1()
+        .border(px(DROPDOWN_BORDER))
         .border_color(theme::border())
         .text_size(px(DROPDOWN_TEXT))
-        .child(icon(icon_name, theme::text_faint(), 15.))
+        .child(icon(icon_name, theme::text_faint(), DROPDOWN_ICON))
         .child(div().flex_1().min_w_0().child(one_line_text(label)))
-        .child(icon(chevron, theme::text(), 14.))
+        .child(icon(chevron, theme::text(), DROPDOWN_CHEVRON))
 }
 
 /// One labelled line of an item's controls.

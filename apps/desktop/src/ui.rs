@@ -12,8 +12,8 @@ use domain::Transition;
 use gpui::{
     AnyElement, AnyView, App, Bounds, ClickEvent, Context, Div, DragMoveEvent, Element, ElementId,
     Entity, FocusHandle, FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    MouseButton, Pixels, Point, Rgba, ShapedLine, SharedString, Size, Stateful, Style, TextRun,
-    Window, div, prelude::*, px, relative, svg,
+    MouseButton, Pixels, Point, Rgba, ShapedLine, SharedString, Size, Stateful, Style, TextAlign,
+    TextRun, Window, div, prelude::*, px, relative, svg,
 };
 use openvamp_desktop::action::UiAction;
 use openvamp_desktop::mixer::MixerScreen;
@@ -1834,43 +1834,32 @@ pub(crate) fn half_across(bounds: &Bounds<Pixels>, position: Point<Pixels>) -> O
     })
 }
 
-/// One line of text cut with an ellipsis ("…") when it does not fit.
-///
-/// gpui 0.2.2's own `truncate()` sets `whitespace_nowrap`, and a text that
-/// does not wrap keeps the size of its first measurement, taken while its
-/// width is not known yet (the layout's max-content pass): it then draws in
-/// full and its box clips it, with no ellipsis. A text that wraps is
-/// measured again with each width it is asked about, so this one wraps, is
-/// clamped to one line, and ends in an ellipsis at the width it was last
-/// measured with, which is its box only when no other width came after it:
-/// [`OneLineText`] does not depend on that.
-pub(crate) trait OneLine: Styled + Sized {
-    fn one_line(self) -> Self {
-        self.whitespace_normal().text_ellipsis().line_clamp(1)
-    }
-}
-
-impl<E: Styled> OneLine for E {}
-
 /// One line of text, in the text style its parents set, that ends in an
 /// ellipsis ("…") when its box is narrower than the text. Its box is as
 /// wide as the whole text unless its parent makes it narrower (a block
 /// parent stretches it to its own width, and as a flex item it shrinks to
 /// nothing before it overflows), and never shorter than the font's ascent
-/// and descent, so its glyphs stay inside it.
+/// and descent, so its glyphs stay inside it. In a box wider than the
+/// text, the line sits where the text style's alignment puts it
+/// ([`line_start`]).
 ///
-/// [`OneLine`] is not enough where the text's width comes from the layout
-/// rather than from the text: gpui 0.2.2's text measures itself with each
-/// width taffy asks about, keeps only the last result, gives that result
-/// again for any question without a width (its min- and max-content), and
-/// paints those lines (`TextLayout::layout` in gpui's `elements/text.rs`).
-/// Taffy asks a flex item about several widths and answers repeated
-/// questions from its own cache without asking the text again, so the
-/// width the text was last cut to need not be the box it ends up in: cut
-/// to nothing in a narrow pass, a title then says its width is nothing and
-/// stays gone; cut to three letters, it paints three letters in a wide box.
-/// This text answers every question with its whole width, and cuts itself
-/// to its final box when it paints.
+/// gpui 0.2.2's own one-line texts are not enough. Its `truncate()` sets
+/// `whitespace_nowrap`, and a text that does not wrap keeps the size of its
+/// first measurement, taken while its width is not known yet (the layout's
+/// max-content pass): it then draws in full and its box clips it, with no
+/// ellipsis. A text that wraps, clamped to one line with an ellipsis,
+/// fails wherever its width comes from the layout rather than from the
+/// text: gpui 0.2.2's text measures itself with each width taffy asks
+/// about, keeps only the last result, gives that result again for any
+/// question without a width (its min- and max-content), and paints those
+/// lines (`TextLayout::layout` in gpui's `elements/text.rs`). Taffy asks a
+/// flex item about several widths and answers repeated questions from its
+/// own cache without asking the text again, so the width the text was last
+/// cut to need not be the box it ends up in: cut to nothing in a narrow
+/// pass, a title then says its width is nothing and stays gone; cut to
+/// three letters, it paints three letters in a wide box. This text answers
+/// every question with its whole width, and cuts itself to its final box
+/// when it paints.
 pub(crate) struct OneLineText {
     text: SharedString,
 }
@@ -1980,9 +1969,30 @@ impl Element for OneLineText {
         cx: &mut App,
     ) {
         let line = cut.as_ref().unwrap_or(&layout.line);
+        let start = line_start(
+            window.text_style().text_align,
+            bounds.size.width,
+            line.width,
+        );
+        let origin = Point {
+            x: bounds.origin.x + start,
+            y: bounds.origin.y,
+        };
         // Painting fails only when a glyph cannot be rasterized; the line
         // then shows without it, as gpui's own text does.
-        let _ = line.paint(bounds.origin, layout.height, window, cx);
+        let _ = line.paint(origin, layout.height, window, cx);
+    }
+}
+
+/// Where a line `line` wide starts in a box `width` wide, from the box's
+/// start, as `align` places it: at the start, centred, or at the end. A
+/// line as wide as its box or wider starts at the box's start.
+fn line_start(align: TextAlign, width: Pixels, line: Pixels) -> Pixels {
+    let room = (width - line).max(px(0.));
+    match align {
+        TextAlign::Left => px(0.),
+        TextAlign::Center => room / 2.,
+        TextAlign::Right => room,
     }
 }
 
@@ -2009,4 +2019,27 @@ fn mono_note(text: impl Into<SharedString>) -> impl IntoElement {
         .text_color(theme::text_muted())
         .whitespace_nowrap()
         .child(text.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{TextAlign, px};
+
+    use super::line_start;
+
+    #[test]
+    fn a_one_line_text_starts_where_its_alignment_puts_it_in_its_box() {
+        let (wide, line) = (px(100.), px(40.));
+        assert_eq!(line_start(TextAlign::Left, wide, line), px(0.));
+        assert_eq!(line_start(TextAlign::Center, wide, line), px(30.));
+        assert_eq!(line_start(TextAlign::Right, wide, line), px(60.));
+    }
+
+    #[test]
+    fn a_line_as_wide_as_its_box_or_wider_starts_at_the_box_start() {
+        for align in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
+            assert_eq!(line_start(align, px(40.), px(40.)), px(0.), "{align:?}");
+            assert_eq!(line_start(align, px(40.), px(55.)), px(0.), "{align:?}");
+        }
+    }
 }

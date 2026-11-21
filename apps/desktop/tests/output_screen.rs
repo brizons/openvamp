@@ -22,12 +22,16 @@ use domain::{
 use hound::{SampleFormat, WavSpec, WavWriter};
 use library::ConfigStore;
 use openvamp_desktop::audio_settings::AudioSettings;
-use openvamp_desktop::mixer::{MixerPage, bus_icon, restore_mix, unsaved_mix};
+use openvamp_desktop::hold::{PANIC_HOLD, PanicHold};
+use openvamp_desktop::mixer::{
+    BUS_SAVE_DELAY, MixerAction, MixerPage, bus_icon, restore_mix, unsaved_mix,
+};
 use openvamp_desktop::output_page::{
     APPLY_PATIENCE, DeviceState, OutputAction, OutputPage, OutputScreen, click_cell,
     problem_notice, rate_note, refusal,
 };
 use openvamp_desktop::show::{Show, Source, replace};
+use openvamp_desktop::tick::{Drawn, Timed};
 
 const RATE: u32 = 8_000;
 
@@ -151,6 +155,10 @@ struct Bench {
     show: Option<Show>,
     settings: AudioSettings,
     page: OutputPage,
+    /// The Mixer screen, for the bus changes a turn of the timer saves.
+    mixer: MixerPage,
+    /// The Panic control's hold, which a turn of the timer moves on.
+    hold: PanicHold,
     /// The screen's clock: it stands still unless a test moves it on, so a
     /// change waits for the device however slow the machine is.
     clock: Instant,
@@ -182,6 +190,8 @@ impl Bench {
             show: None,
             settings,
             page: OutputPage::new(),
+            mixer: MixerPage::new(),
+            hold: PanicHold::new(),
             clock: Instant::now(),
         };
         bench.open();
@@ -277,6 +287,51 @@ impl Bench {
         }
         self.page
             .follow(self.show.as_mut(), &mut self.settings, self.clock);
+    }
+
+    /// A turn of the screen's timer, its clock moved on by `by`
+    /// ([`Timed::turn`]): whether the screen draws again.
+    fn turn(&mut self, by: Duration) -> bool {
+        self.clock += by;
+        Timed {
+            show: self.show.as_mut(),
+            hold: &mut self.hold,
+            mixer: &mut self.mixer,
+            output: &mut self.page,
+            settings: &mut self.settings,
+        }
+        .turn(self.clock)
+    }
+
+    /// Turns of the timer, the clock standing still, until one draws
+    /// nothing; bounded by time, since the disk thread may be slow under
+    /// load.
+    fn until_still(&mut self) {
+        let deadline = Instant::now() + WAIT;
+        while self.turn(Duration::ZERO) {
+            assert!(Instant::now() < deadline, "the screen never stood still");
+            if let Some(show) = &self.show {
+                wait_disks(show);
+            }
+        }
+    }
+
+    /// What the screens draw now that a turn can change ([`Drawn`]).
+    fn drawn(&self) -> Drawn {
+        Drawn::of(
+            self.show.as_ref().expect("a song is open"),
+            &self.mixer,
+            &self.page,
+        )
+    }
+
+    /// The session's last snapshot.
+    fn snapshot(&self) -> app::Snapshot {
+        self.show
+            .as_ref()
+            .expect("a song is open")
+            .snapshot()
+            .clone()
     }
 
     /// The routing saved for `device`, as the settings file holds it.
@@ -1140,4 +1195,162 @@ fn a_routing_given_while_the_device_is_unplugged_is_saved_and_plays_once_it_is_b
         bench.fake.opened().last().map(|request| request.channels),
         Some(8)
     );
+}
+
+/// Asks the interface, which plays 256 frames whatever it is asked for,
+/// for 128 with the song stopped: the stream opens again at once and looks
+/// the same as the one before, so only [`APPLY_PATIENCE`] settles the
+/// change, and the session shows nothing new when it does.
+fn clamped_buffer_waiting() -> Bench {
+    let mut bench = Bench::on("fake:2");
+    bench.rounds_to.store(256, Ordering::SeqCst);
+    bench.act(OutputAction::Buffer(128));
+    bench.until_still();
+    assert!(bench.view().applying, "the change waits for its patience");
+    bench
+}
+
+#[test]
+fn what_the_screens_draw_changes_when_a_waiting_change_settles_though_the_session_shows_the_same() {
+    let mut bench = clamped_buffer_waiting();
+    let (snapshot, before) = (bench.snapshot(), bench.drawn());
+    assert_eq!(bench.drawn(), before, "nothing changed, nothing to draw");
+
+    bench.later(APPLY_PATIENCE);
+
+    assert_eq!(bench.snapshot(), snapshot);
+    assert!(!bench.view().applying);
+    assert_ne!(bench.drawn(), before);
+}
+
+#[test]
+fn a_change_its_patience_alone_settles_draws_the_screen_again() {
+    let mut bench = clamped_buffer_waiting();
+    let snapshot = bench.snapshot();
+    assert!(
+        !bench.turn(APPLY_PATIENCE - Duration::from_millis(1)),
+        "it may still be ramping out: nothing new to draw"
+    );
+
+    assert!(
+        bench.turn(Duration::from_millis(1)),
+        "the screen draws the verdict"
+    );
+    assert_eq!(bench.snapshot(), snapshot, "the session shows the same");
+    let view = bench.view();
+    assert!(!view.applying);
+    assert_eq!(
+        notices_of(&view, BUFFER_NOT_KEPT),
+        [
+            "The buffer size could not be changed: audio device \"Interface\" plays buffers of 256 frames, not 128"
+        ]
+    );
+    assert!(!bench.turn(Duration::ZERO), "and nothing after it");
+}
+
+/// The song open with settings that cannot be written, after a bus change
+/// waiting to be saved.
+fn bus_change_waiting_unsavable() -> Bench {
+    let mut bench = Bench::on("fake:2");
+    let blocked = bench.dir.path().join("blocked");
+    fs::write(&blocked, "a file, not a folder").unwrap();
+    bench.settings = AudioSettings::load(Some(ConfigStore::new(blocked.join("config"))));
+    let show = bench.show.as_mut().expect("a song is open");
+    bench.mixer.act(
+        MixerAction::BusFader {
+            bus: Bus::Drums,
+            position: 0.3,
+        },
+        show,
+        bench.clock,
+    );
+    bench.until_still();
+    assert!(bench.mixer.buses_waiting());
+    bench
+}
+
+#[test]
+fn what_the_screens_draw_changes_when_bus_changes_stop_waiting_though_the_session_shows_the_same() {
+    let mut bench = bus_change_waiting_unsavable();
+    let (snapshot, before) = (bench.snapshot(), bench.drawn());
+
+    let show = bench.show.as_mut().expect("a song is open");
+    bench
+        .mixer
+        .tick(show, &mut bench.settings, bench.clock + BUS_SAVE_DELAY);
+
+    assert_eq!(bench.snapshot(), snapshot, "the session still has them");
+    assert!(!bench.mixer.buses_waiting());
+    assert_ne!(bench.drawn(), before);
+}
+
+#[test]
+fn bus_changes_that_could_not_be_saved_once_they_settled_draw_the_screen_again() {
+    let mut bench = bus_change_waiting_unsavable();
+    let snapshot = bench.snapshot();
+
+    assert!(bench.turn(BUS_SAVE_DELAY), "the screen says why");
+    assert_eq!(bench.snapshot(), snapshot);
+    let show = bench.show.as_ref().expect("a song is open");
+    let notices = bench
+        .mixer
+        .view(Some(show))
+        .expect("a song is open")
+        .notices;
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|notice| notice.starts_with("The bus levels could not be saved: "))
+            .count(),
+        1,
+        "{notices:?}"
+    );
+    assert!(!bench.turn(Duration::ZERO));
+}
+
+#[test]
+fn a_still_screen_draws_nothing_however_long_it_waits() {
+    let mut bench = Bench::on("fake:2");
+    bench.until_still();
+
+    assert!(!bench.turn(Duration::from_secs(60)));
+}
+
+#[test]
+fn a_playing_song_draws_on_every_turn() {
+    let mut bench = Bench::on("fake:2");
+    bench.play();
+
+    assert!(bench.turn(Duration::ZERO));
+    assert!(bench.turn(Duration::ZERO));
+}
+
+#[test]
+fn a_hold_of_panic_draws_on_every_turn_while_it_counts_with_or_without_a_song() {
+    let mut bench = Bench::on("fake:2");
+    bench.until_still();
+    bench.hold.press(bench.clock);
+    assert!(bench.turn(PANIC_HOLD / 4), "the fill grows");
+    assert!(bench.turn(PANIC_HOLD / 4), "the fill grows");
+    bench.hold.cancel();
+    assert!(!bench.turn(PANIC_HOLD / 4), "no hold, nothing to draw");
+
+    // With no song open, as the screen starts.
+    let mut mixer = MixerPage::new();
+    let mut turn = |hold: &mut PanicHold, now| {
+        Timed {
+            show: None,
+            hold,
+            mixer: &mut mixer,
+            output: &mut bench.page,
+            settings: &mut bench.settings,
+        }
+        .turn(now)
+    };
+    let now = Instant::now();
+    let mut hold = PanicHold::new();
+    hold.press(now);
+    assert!(turn(&mut hold, now + PANIC_HOLD / 4), "the fill grows");
+    hold.cancel();
+    assert!(!turn(&mut hold, now + PANIC_HOLD / 2));
 }

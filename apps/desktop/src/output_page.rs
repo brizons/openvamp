@@ -410,6 +410,18 @@ pub enum OutputAction {
     Reset,
 }
 
+/// What [`OutputPage::follow`] settles, as the Audio output screen shows
+/// it: whether a buffer size or a routing still waits for the device, and
+/// why the last ones were not kept. A turn of the screens' timer that
+/// changes it draws them again ([`crate::tick::Drawn`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settling {
+    buffer_waits: bool,
+    routing_waits: bool,
+    buffer_problem: Option<String>,
+    routing_problem: Option<String>,
+}
+
 /// The device whose routing the screen edits.
 struct Current {
     id: String,
@@ -490,6 +502,16 @@ impl OutputPage {
         }
         if let Some(pending) = self.pending_routing.take() {
             self.routing_problem = Some(routing_not_kept(closed(&pending.before.device)));
+        }
+    }
+
+    /// What [`Self::follow`] has settled so far ([`Settling`]).
+    pub fn settling(&self) -> Settling {
+        Settling {
+            buffer_waits: self.pending_buffer.is_some(),
+            routing_waits: self.pending_routing.is_some(),
+            buffer_problem: self.buffer_problem.clone(),
+            routing_problem: self.routing_problem.clone(),
         }
     }
 

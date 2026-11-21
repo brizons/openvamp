@@ -13,8 +13,8 @@
 use domain::Bus;
 use gpui::{
     AnyElement, ClickEvent, Context, Div, DragMoveEvent, ElementId, FontWeight, IntoElement,
-    Render, Rgba, SharedString, Stateful, Window, div, linear_color_stop, linear_gradient,
-    prelude::*, px, relative, rgb,
+    Render, Rgba, Stateful, Window, div, linear_color_stop, linear_gradient, prelude::*, px,
+    relative, rgb,
 };
 use openvamp_desktop::action::{Intent, Page, UiAction};
 use openvamp_desktop::mixer::{
@@ -25,7 +25,7 @@ use openvamp_desktop::mixer::{
 
 use crate::screen::Perform;
 use crate::theme;
-use crate::ui::{OneLine, button, icon};
+use crate::ui::{button, icon, one_line_text};
 
 /// The narrowest a stem strip gets before the strips scroll; wider
 /// windows share the width between them.
@@ -383,17 +383,15 @@ fn header(view: &MixerScreen, cx: &mut Context<Perform>) -> impl IntoElement {
                 .gap(px(2.))
                 .child(
                     div()
-                        .one_line()
                         .text_size(px(20.))
                         .font_weight(FontWeight::BOLD)
-                        .child(view.title.clone()),
+                        .child(one_line_text(view.title.clone())),
                 )
                 .children(view.position.clone().map(|position| {
                     div()
-                        .one_line()
                         .text_size(px(13.))
                         .text_color(theme::text_muted())
-                        .child(position)
+                        .child(one_line_text(position))
                 })),
         )
         .child(arrangement)
@@ -457,10 +455,9 @@ fn toolbar(view: &MixerScreen, cx: &mut Context<Perform>) -> impl IntoElement {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .one_line()
                     .text_size(px(14.))
                     .text_color(theme::text_muted())
-                    .child(view.summary.clone()),
+                    .child(one_line_text(view.summary.clone())),
             )
             .child(
                 div()
@@ -589,7 +586,7 @@ fn stem_strip(stem: &StemStrip, menu: bool, cx: &mut Context<Perform>) -> AnyEle
     })
     .text_size(px(11.))
     .text_color(theme::text_muted())
-    .child(div().min_w_0().one_line().child(stem.bus.name()));
+    .child(div().min_w_0().child(one_line_text(stem.bus.name())));
     let body: AnyElement = if menu {
         bus_choices(stem, cx).into_any_element()
     } else {
@@ -607,12 +604,11 @@ fn stem_strip(stem: &StemStrip, menu: bool, cx: &mut Context<Perform>) -> AnyEle
             div()
                 .w_full()
                 .px(px(4.))
-                .one_line()
                 .text_center()
                 .font_family(theme::CONDENSED)
                 .text_size(px(14.))
                 .font_weight(FontWeight::BOLD)
-                .child(stem.name.clone()),
+                .child(one_line_text(stem.name.clone())),
         )
         .child(chip)
         .child(body)
@@ -699,7 +695,7 @@ fn bus_choice(
         item.bg(theme::segment()).text_color(theme::text())
     })
     .when(!on, |item| item.text_color(theme::text_muted()))
-    .child(div().min_w_0().one_line().child(label))
+    .child(div().min_w_0().child(one_line_text(label)))
 }
 
 fn bus_strip(bus: &BusStrip, zone: f32, cx: &mut Context<Perform>) -> AnyElement {
@@ -785,12 +781,11 @@ fn bus_name(name: &str) -> impl IntoElement {
     div()
         .w_full()
         .px(px(4.))
-        .one_line()
         .text_center()
         .font_family(theme::CONDENSED)
         .text_size(px(12.))
         .font_weight(FontWeight::SEMIBOLD)
-        .child(SharedString::from(name.to_uppercase()))
+        .child(one_line_text(name.to_uppercase()))
 }
 
 /// A bus's two meters, `meters` left and right, and its fader, at least
