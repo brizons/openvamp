@@ -49,7 +49,7 @@ Out of scope: MIDI (F9), guide-voice cues (F4), per-song buses (F7.5's opt-in), 
 | T3 | S1, S2 | delegated (context backstop) | done (verified L13, review approved L15, warnings fixed L16) | 1cbfba9, d316ae4, 0a8e147 |
 | T4 | S1, S2 | delegated (context backstop) | done (verified L19, review approved L20, warnings fixed L24) | 54a4c2d, e1df15f, df47462, 7a7bb46, c9737ea, a59db4b, 0e8461e |
 | T5 | S3 | delegated (context backstop) | done (review approved L23, L26; fixes L25, L27); user test pending | 408bd20, 0003229, a1f47c0, b439ea0, ca779ba, c3bb45c, fc4cb7d |
-| T6 | S3 (L28) | parent compares; T6a desktop writer (delegated, context backstop) fixes screens; T6b engine/app writer (delegated, parallel unit with a disjoint surface) adds meters | in progress | c64a330, e180cbb |
+| T6 | S3 (L28) | parent compares; T6a desktop writer (delegated, context backstop) fixes screens; T6b engine/app writer (delegated, parallel unit with a disjoint surface) adds meters | done (verified L32, L39; reviews approved L33, L35, L36, L38, L40) | c64a330, e180cbb, 3b7fb94, 0d30d52, 65fc824, c738f1e, 67ebc99, fde4166, 0509afa, 03c6df1, 1c27484, 04267a4, 9bca81e; meters 39bb0f1, 12f8f23, 188f907, 2534fe8, 074155d, 8d17027, 4138268, c253dc6, 872d1e8 |
 
 T1 `domain`: buses, part-to-bus rules table, arrangement mix model and `mix.json` v1, routing model, presets and split mode. T2 `library` and app config: read and write `mix.json` atomically, per-device routing and global bus settings in the config folder. T3 `engine`: per-stem, per-bus and master gain ramps, mute and solo rules, bus rendering and the router into N channels, allocation-free, unity bit-exact. T4 `io-cpal` and `app`: multichannel open, routing in the output request (restored on reopen), mixer and routing commands, snapshot levels, setlist carry. T5 desktop: Mixer and Audio output screens.
 
@@ -119,3 +119,16 @@ Route evidence: the parent session is long and past the ~150k-token backstop. Or
   - The facts note reuses the queued-jump colour.
   - The README repeats the 5 s retry.
   - A read already under way when `forget()` runs counts as the re-read.
+- **L41** (2026-11-21, user, verbatim): "pero que tanta vuelta das te vas a gastar todos los tokens". Non-blocking review warnings are now logged as follow-ups instead of more fix-and-review rounds. 872d1e8 (the paused-fall exemption keyed to the time needed to reach the floor) and 9bca81e (the three L40 desktop items: shared dropdown sizes; `OneLine` removed, its seven Mixer uses moved to an aligned `OneLineText`; the tick's redraw decision is a tested GPUI-free function that also redraws for time-only changes) close T6. The parent saw the Mixer's centred labels in the running app.
+
+  **Follow-ups (not done)**, the L40 warnings on 1c27484:
+  - A hung `song.json` read is never retried and shows no note.
+  - A failed re-read after `forget()` replaces facts that were good.
+  - The Tag exception is an exact, case-sensitive "Tag".
+  - The facts note reuses the queued-jump colour.
+  - The README repeats the 5 s retry.
+
+  **Pre-existing:** the setlist prepares the next item and opens songs on the UI thread (L39).
+
+  **Also left out:** arrangement switching; a setlist date and library size (no data); the waveform (deferred).
+
