@@ -308,9 +308,15 @@ pub struct MixerView {
     ///
     /// Every meter is the current item's, as its mixer sets it: during a
     /// setlist crossfade, the item fading in before the crossfade's gain;
-    /// the item fading out has none. A stopped, paused or lost device reads
-    /// silence, falling from where it was. The stem meters start from
-    /// silence with every new item; the bus and master meters go on.
+    /// the item fading out has none. The meters take the engine's peaks
+    /// only while the device plays the item shown and its transport runs,
+    /// ramps out included (pausing, stopping, panicking); once it has
+    /// paused or stopped, while the device is lost, or when a report still
+    /// describes the item before a selection, they take silence and fall
+    /// from where they were at [`crate::METER_DECAY_DB_PER_SECOND`], their
+    /// holds staying [`crate::METER_HOLD`] first, to 0.0 below
+    /// [`crate::METER_FLOOR`]. The stem meters start from silence with
+    /// every new item; the bus and master meters go on.
     pub master_meter: Meter,
 }
 
@@ -1514,16 +1520,7 @@ impl Session {
             },
             device,
             mixer: MixerView {
-                stems: self
-                    .mix
-                    .views()
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, stem)| StemView {
-                        meter: self.meters.stem(index),
-                        ..stem
-                    })
-                    .collect(),
+                stems: self.mix.views(|index| self.meters.stem(index)),
                 mix: self.mix.mix.clone(),
                 mix_changed: self.mix.changed(),
                 mix_error: self.mix.error().map(str::to_owned),

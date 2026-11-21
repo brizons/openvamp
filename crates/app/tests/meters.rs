@@ -757,3 +757,64 @@ fn under_every_handover_the_bus_and_master_meters_carry_on() {
         }
     }
 }
+
+/// The fall in dB from `from` to `to`.
+fn fell_db(from: f32, to: f32) -> f32 {
+    20.0 * (to / from).log10()
+}
+
+#[test]
+fn a_paused_or_stopped_session_falls_to_silence_at_the_stated_rate() {
+    for (halt, silent) in [
+        (Command::Pause, TransportState::Paused),
+        (Command::Stop, TransportState::Stopped),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        write_song(dir.path(), &band());
+        let fake = FakeOutput::new();
+        let mut session = Session::open(
+            dir.path(),
+            Box::new(fake.clone()),
+            SessionOptions::default(),
+        )
+        .unwrap();
+        let playing = play(&mut session, &fake, 8).mixer;
+        assert_eq!(playing.master_meter.level, [0.875, 0.875]);
+        session.send(halt).unwrap();
+        // Past the ramp out.
+        let mut snapshot = step(&mut session, &fake);
+        for _ in 0..3 {
+            snapshot = step(&mut session, &fake);
+        }
+        assert_eq!(snapshot.transport, silent, "{halt:?}");
+        let from = snapshot.mixer.master_meter.level[0];
+        let since = std::time::Instant::now();
+        std::thread::sleep(Duration::from_millis(300));
+        let later = step(&mut session, &fake);
+        let elapsed = since.elapsed().as_secs_f32();
+        let master = later.mixer.master_meter;
+        let fell = fell_db(from, master.level[0]);
+        // 20 dB a second, for the time between the two polls (a little
+        // less than measured here, which also counts the second poll).
+        assert!(
+            fell <= -20.0 * 0.3 + 0.1 && fell >= -20.0 * elapsed - 0.1,
+            "{halt:?}: the master fell {fell} dB in {elapsed} s"
+        );
+        assert_eq!(
+            master.hold,
+            [0.875, 0.875],
+            "{halt:?}: the hold stays its second"
+        );
+        let drums = level(later.mixer.stems[0].meter)[0];
+        assert!(
+            drums > 0.0 && drums < 0.5 * 10f32.powf(-0.3 + 0.005),
+            "{halt:?}: the drums stem falls too: {drums}"
+        );
+        let bus = later.mixer.bus_meters[Bus::Drums.index()].level[0];
+        assert_eq!(bus, drums, "{halt:?}: and its bus");
+        // Not frozen: it keeps falling toward silence.
+        std::thread::sleep(Duration::from_millis(50));
+        let lower = step(&mut session, &fake).mixer.master_meter.level[0];
+        assert!(lower < master.level[0], "{halt:?}: {lower}");
+    }
+}
