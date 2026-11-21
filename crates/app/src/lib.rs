@@ -66,6 +66,7 @@
 
 mod error;
 mod item;
+mod meter;
 mod mixer;
 mod output;
 mod renderer;
@@ -78,6 +79,7 @@ pub mod testing;
 pub use engine::live::{FadeState, JumpKind, JumpTiming};
 pub use error::{OpenError, RuntimeError};
 pub use library::{LoadError, SongProblem};
+pub use meter::{METER_DECAY_DB_PER_SECOND, METER_FLOOR, METER_HOLD, Meter, MeterBallistics};
 pub use mixer::StemView;
 pub use output::{
     AudioOutput, DEFAULT_BUFFER_FRAMES, DeviceChoice, DeviceInfo, LossReason, MAX_BUFFER_FRAMES,

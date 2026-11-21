@@ -19,6 +19,7 @@ use rtrb::Consumer;
 
 use crate::error::{OpenError, RuntimeError};
 use crate::item::Item;
+use crate::meter::{Meter, SessionMeters};
 use crate::mixer::{ItemMix, StemView};
 use crate::output::{
     AudioOutput, DEFAULT_BUFFER_FRAMES, DeviceChoice, LossReason, MAX_BUFFER_FRAMES,
@@ -298,6 +299,19 @@ pub struct MixerView {
     /// [`Session::set_routing`]'s), or plain stereo, fitted to the device's
     /// outputs.
     pub routing: Routing,
+    /// The level meter of each bus, in [`Bus::ALL`] order: the sum of its
+    /// stems after their gains, before the router (split mode and a mono
+    /// output's fold do not change it).
+    pub bus_meters: [Meter; Bus::ALL.len()],
+    /// The master's level meter: every bus summed, what the plain stereo
+    /// routing plays on outputs 1 and 2.
+    ///
+    /// Every meter is the current item's, as its mixer sets it: during a
+    /// setlist crossfade, the item fading in before the crossfade's gain;
+    /// the item fading out has none. A stopped, paused or lost device reads
+    /// silence, falling from where it was. The stem meters start from
+    /// silence with every new item; the bus and master meters go on.
+    pub master_meter: Meter,
 }
 
 impl Default for MixerView {
@@ -312,6 +326,8 @@ impl Default for MixerView {
             buses: BusSettings::new(),
             buses_changed: false,
             routing: Routing::stereo(2),
+            bus_meters: [Meter::default(); Bus::ALL.len()],
+            master_meter: Meter::default(),
         }
     }
 }
@@ -481,6 +497,8 @@ pub struct Session {
     reopen: Option<Reopen>,
     /// The operator's last transport command was a pause, stop or panic.
     halted: bool,
+    /// The level meters, from the peaks the reports carry.
+    meters: SessionMeters,
 }
 
 /// A song folder opened for streaming with its player built, ready to play
@@ -616,6 +634,7 @@ impl PreparedSong {
             gains_pending: false,
             reopen: None,
             halted: false,
+            meters: SessionMeters::new(),
         };
         match session.open_held(state) {
             Ok((stream, home)) => {
@@ -805,6 +824,12 @@ impl Session {
 
     /// The second half of [`Self::poll`], on the report the first half read.
     pub(crate) fn end_poll(&mut self, report: &Report, now: Instant) -> Snapshot {
+        // A device that does not play hears nothing.
+        let peaks = match self.link {
+            Link::Streaming { .. } => report.status().meters,
+            Link::Held { .. } | Link::Lost => live::Meters::SILENT,
+        };
+        self.meters.update(&peaks, now);
         self.advance_reopen(report, now);
         self.advance_start(report, now);
         self.watch_disk(report);
@@ -1479,7 +1504,16 @@ impl Session {
             },
             device,
             mixer: MixerView {
-                stems: self.mix.views(),
+                stems: self
+                    .mix
+                    .views()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, stem)| StemView {
+                        meter: self.meters.stem(index),
+                        ..stem
+                    })
+                    .collect(),
                 mix: self.mix.mix.clone(),
                 mix_changed: self.mix.changed(),
                 mix_error: self.mix.error().map(str::to_owned),
@@ -1487,6 +1521,8 @@ impl Session {
                 buses: self.buses.clone(),
                 buses_changed: self.buses != self.buses_saved,
                 routing: self.routing_in_use.clone(),
+                bus_meters: self.meters.buses(),
+                master_meter: self.meters.master(),
             },
             underruns: status.underruns,
             decode_errors: self.monitor.decode_errors(),
@@ -1540,6 +1576,7 @@ impl Session {
         self.song = song;
         self.monitor = monitor;
         self.item = item;
+        self.meters.new_stems();
         self.start = None;
         self.decode_errors_seen = 0;
         self.deferral_seen = None;
