@@ -131,4 +131,11 @@ Route evidence: the parent session is long and past the ~150k-token backstop. Or
   **Pre-existing:** the setlist prepares the next item and opens songs on the UI thread (L39).
 
   **Also left out:** arrangement switching; a setlist date and library size (no data); the waveform (deferred).
+- **L42** (2026-11-21): final check. `cargo test --workspace --locked` gives 816 passed, 0 failed, 6 ignored. The last slice, 1c27484..d5036ca (11 files, 639 lines; `high`; consent granted), was approved and acknowledged (review-ae731a847ab20f95). It left only suggestions, logged here and not fixed:
+  - one always-true assertion in `output_screen.rs`;
+  - a comment repeating figures the constants already give;
+  - `Settling` compares less than the old whole-view check;
+  - no test opens a setlist for `Drawn`.
+
+  T6 is done and the feature's tasks are complete. Pushing, the PR and the merge are the user's decisions.
 
