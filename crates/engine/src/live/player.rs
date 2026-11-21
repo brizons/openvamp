@@ -178,11 +178,11 @@ struct Block<'a> {
     track_gain: &'a [f32],
     /// The master gain and transport ramp of each frame, for the meters.
     master: &'a [f32],
-    /// The block's frames from `meter_from` to `split` belong to the
+    /// The block's frames from `meter_from` to `meter_split` belong to the
     /// meters' window before the one under way once the block ends, those
-    /// from `split` on to that one, and earlier ones to neither.
+    /// from `meter_split` on to that one, and earlier ones to neither.
     meter_from: usize,
-    split: usize,
+    meter_split: usize,
     envelope: Envelope,
     envelope_start: u64,
 }
@@ -204,7 +204,7 @@ impl StemMeter<'_> {
         if let Some((before, after)) = &mut self.peaks
             && i >= block.meter_from
         {
-            let peak = if i < block.split {
+            let peak = if i < block.meter_split {
                 &mut **before
             } else {
                 &mut **after
@@ -283,12 +283,12 @@ fn add_stem(
             bus[2 * i] += left;
             bus[2 * i + 1] += right;
         }
-        if tails {
-            let (left, right) = (heard_frames[2 * i] + left, heard_frames[2 * i + 1] + right);
-            meter.raise(block, i, left, right);
+        let (left, right) = if tails {
+            (heard_frames[2 * i] + left, heard_frames[2 * i + 1] + right)
         } else {
-            meter.raise(block, i, left, right);
-        }
+            (left, right)
+        };
+        meter.raise(block, i, left, right);
     }
 }
 
@@ -1336,11 +1336,11 @@ impl Player {
             track_gain: &self.track_gain,
             master: &self.master,
             meter_from: self.meter_segments.0,
-            split: self.meter_segments.1,
+            meter_split: self.meter_segments.1,
             envelope: Envelope::FadeIn(self.voice.fade_in),
             envelope_start: self.voice.envelope_position(),
         };
-        let [now, next] = &mut self.block_meters;
+        let [before, after] = &mut self.block_meters;
         for (index, stem) in self.stems.iter_mut().enumerate() {
             let bus = stem.bus.index();
             add_stem(
@@ -1351,7 +1351,7 @@ impl Player {
                 out,
                 &mut self.underruns,
                 StemMeter {
-                    peaks: now.stems.get_mut(index).zip(next.stems.get_mut(index)),
+                    peaks: before.stems.get_mut(index).zip(after.stems.get_mut(index)),
                     bus: Some(&mut meter_buses[bus * stride..bus * stride + 2 * n]),
                     heard: &mut self.meter_heard,
                 },
@@ -1402,14 +1402,14 @@ impl Player {
             track_gain: &self.track_gain,
             master: &self.master,
             meter_from: self.meter_segments.0,
-            split: self.meter_segments.1,
+            meter_split: self.meter_segments.1,
             envelope: Envelope::FadeIn(self.voice.fade_in),
             envelope_start: self.voice.envelope_position(),
         };
-        let [now, next] = &mut self.block_meters;
+        let [before, after] = &mut self.block_meters;
         for (index, stem) in self.stems.iter_mut().enumerate() {
             let meter = StemMeter {
-                peaks: now.stems.get_mut(index).zip(next.stems.get_mut(index)),
+                peaks: before.stems.get_mut(index).zip(after.stems.get_mut(index)),
                 bus: None,
                 heard: &mut self.meter_heard,
             };
