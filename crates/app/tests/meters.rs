@@ -952,12 +952,17 @@ fn a_paused_or_stopped_session_falls_to_silence_at_the_stated_rate() {
         );
         let bus = later.value.mixer.bus_meters[Bus::Drums.index()].level[0];
         assert_eq!(bus, drums.1, "{halt:?}: and its bus");
-        // Not frozen: it keeps falling toward silence.
+        // Not frozen: it keeps falling toward silence. It may read silence
+        // already only when the most decay since the ramp ended reaches the
+        // floor, which takes about 5 s, not the 350 ms a normal run takes.
         std::thread::sleep(Duration::from_millis(50));
-        let lower = step(&mut session, &fake).mixer.master_meter.level[0];
+        let lowest = timed(|| step(&mut session, &fake));
+        let lower = lowest.value.mixer.master_meter.level[0];
+        let floored = from.level[0] * fall(between(&silenced, &lowest).1) < METER_FLOOR;
         assert!(
-            lower < master.level[0] || master.level[0] == 0.0,
-            "{halt:?}: {lower}"
+            lower < master.level[0] || (master.level[0] == 0.0 && lower == 0.0 && floored),
+            "{halt:?}: the master went from {} to {lower}",
+            master.level[0]
         );
     }
 }
