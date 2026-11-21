@@ -311,7 +311,7 @@ fn a_song_gets_its_arrangement_start_end_fade_out_and_transition() {
     assert_eq!(
         row.meta,
         // The arrangement has its own column, so the meta line leaves it out.
-        "A · 132 BPM · Verse 1 – Chorus · fade-out"
+        "A · 132 BPM · Verse 1 – Chorus · fade-out · 1 stem"
     );
     assert_eq!(row.length, "0:02");
 
@@ -1228,7 +1228,7 @@ fn the_editor_meta_line_leaves_the_arrangement_to_its_column() {
     let page = LibraryPage::open(dir.path(), Some(&file)).unwrap();
 
     let rows = page.view(None).editor.unwrap().rows;
-    assert_eq!(rows[0].meta, "90 BPM");
+    assert_eq!(rows[0].meta, "90 BPM · 1 stem");
     assert_eq!(rows[0].arrangement, "Default");
     // A song the library lacks has nothing to say but its arrangement,
     // which its column shows.
@@ -1481,4 +1481,133 @@ fn after_a_drop_the_open_details_stay_on_the_same_item() {
             "row {selected} selected, {from} dropped at {to}"
         );
     }
+}
+
+/// The editor header's summary of a setlist of `items`.
+fn summary_of(items: Vec<SetlistItem>) -> String {
+    let dir = library();
+    let file = save(dir.path(), "Sunday", items);
+    let page = LibraryPage::open(dir.path(), Some(&file)).unwrap();
+    page.view(None).editor.unwrap().summary
+}
+
+/// A click-only tile of `bars` bars of 2/4 at 60 BPM: two seconds a bar.
+fn two_second_bars(bars: Option<u32>) -> SetlistItem {
+    SetlistItem::Click(ClickItem {
+        bars,
+        ..ClickItem::new(
+            60.0,
+            TimeSignature {
+                numerator: 2,
+                denominator: 4,
+            },
+        )
+    })
+}
+
+#[test]
+fn the_editor_header_counts_the_items_and_rounds_their_length_to_minutes() {
+    // As the design writes it: "5 items · ≈ 23 min".
+    assert_eq!(
+        summary_of(vec![two_second_bars(Some(44))]),
+        "1 item · ≈ 1 min"
+    );
+    assert_eq!(
+        summary_of(vec![two_second_bars(Some(45))]),
+        "1 item · ≈ 2 min",
+        "1:30 rounds up"
+    );
+    assert_eq!(
+        summary_of(vec![
+            two_second_bars(Some(600)),
+            two_second_bars(Some(77)),
+            SetlistItem::Song(SongItem::new("Songs/Amazing.song")),
+        ]),
+        "3 items · ≈ 23 min",
+        "22:38"
+    );
+    assert_eq!(
+        summary_of(vec![SetlistItem::Song(SongItem::new("Songs/Amazing.song"))]),
+        "1 item · < 1 min"
+    );
+    // A length that depends on the operator, or a song the library lacks:
+    // the known part, as a floor.
+    assert_eq!(
+        summary_of(vec![two_second_bars(Some(59)), two_second_bars(None)]),
+        "2 items · at least 1 min"
+    );
+    assert_eq!(
+        summary_of(vec![
+            SetlistItem::Song(SongItem::new("Songs/Amazing.song")),
+            SetlistItem::Song(SongItem::new("Songs/Gone.song")),
+        ]),
+        "2 items",
+        "less than a minute known says nothing about the length"
+    );
+    // The longest length a file can hold does not overflow.
+    assert_eq!(
+        summary_of(vec![SetlistItem::Click(ClickItem {
+            bars: Some(u32::MAX),
+            ..ClickItem::new(
+                1.0,
+                TimeSignature {
+                    numerator: u32::MAX,
+                    denominator: 4,
+                },
+            )
+        })]),
+        format!("1 item · ≈ {} min", u64::MAX / 60)
+    );
+    assert_eq!(summary_of(Vec::new()), "No items yet");
+}
+
+#[test]
+fn the_editor_meta_line_ends_with_the_song_s_stem_count() {
+    let dir = library();
+    let file = save(
+        dir.path(),
+        "Sunday",
+        vec![
+            SetlistItem::Song(SongItem::new("Songs/Amazing.song")),
+            SetlistItem::Song(SongItem {
+                start_position: Some(1),
+                end_position: Some(2),
+                fade_out: true,
+                ..SongItem::new("Songs/Amazing.song")
+            }),
+            SetlistItem::Song(SongItem::new("Songs/Gone.song")),
+        ],
+    );
+    let page = LibraryPage::open(dir.path(), Some(&file)).unwrap();
+
+    let rows = page.view(None).editor.unwrap().rows;
+    // As the design writes it: "A · 132 BPM · 14 stems".
+    assert_eq!(rows[0].meta, "A · 132 BPM · 1 stem");
+    // The excerpt and the fade-out matter more on stage: they come first.
+    assert_eq!(
+        rows[1].meta,
+        "A · 132 BPM · Verse 1 – Chorus · fade-out · 1 stem"
+    );
+    // A song the library lacks has no stems to count.
+    assert_eq!(rows[2].meta, "—");
+}
+
+#[test]
+fn the_editor_says_in_a_short_line_that_perform_plays_the_setlist_as_opened() {
+    let dir = library();
+    let file = save(dir.path(), "Sunday", Vec::new());
+    let page = LibraryPage::open(dir.path(), Some(&file)).unwrap();
+
+    assert_eq!(
+        page.view(Some(&file)).editor.unwrap().on_perform.as_deref(),
+        Some("On Perform · changes play the next time it opens")
+    );
+    assert_eq!(page.view(None).editor.unwrap().on_perform, None);
+    assert_eq!(
+        page.view(Some("Other.setlist.json"))
+            .editor
+            .unwrap()
+            .on_perform,
+        None
+    );
 }

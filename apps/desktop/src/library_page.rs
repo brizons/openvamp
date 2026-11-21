@@ -23,6 +23,10 @@ use crate::shelf::Shelf;
 /// buttons would leave the name no room.
 pub const ARMED_LABEL: &str = "Click again to remove";
 
+/// The line above the editor's name while its setlist is open on the
+/// Perform screen, which plays it as it was when opened.
+pub const ON_PERFORM: &str = "On Perform · changes play the next time it opens";
+
 /// The meters a click-only tile offers, as (numerator, denominator).
 pub const METERS: [(u32, u32); 8] = [
     (2, 4),
@@ -845,24 +849,12 @@ impl LibraryPage {
             .enumerate()
             .map(|(index, item)| self.editor_row(editor, index, item))
             .collect();
-        let summary = if rows.is_empty() {
-            "No items yet".to_owned()
-        } else {
-            let lengths: Vec<Option<u64>> = setlist
-                .items
-                .iter()
-                .map(|item| self.seconds(item))
-                .collect();
-            let total = clock(
-                lengths
-                    .iter()
-                    .flatten()
-                    .fold(0, |total: u64, seconds| total.saturating_add(*seconds)),
-            );
-            let open = lengths.iter().any(Option::is_none);
-            let at_least = if open { "at least " } else { "" };
-            format!("{} · {at_least}{total}", plural(rows.len(), "item"))
-        };
+        let lengths: Vec<Option<u64>> = setlist
+            .items
+            .iter()
+            .map(|item| self.seconds(item))
+            .collect();
+        let summary = summary(&lengths);
         EditorView {
             name: setlist.name.clone(),
             renaming: (self.typing == Some(Field::Rename)).then(|| self.rename.text().to_owned()),
@@ -875,6 +867,7 @@ impl LibraryPage {
                 .map(ToString::to_string)
                 .collect(),
             playing: playing == Some(editor.file()),
+            on_perform: (playing == Some(editor.file())).then(|| ON_PERFORM.to_owned()),
             remove: if armed {
                 ARMED_LABEL.to_owned()
             } else {
@@ -1053,6 +1046,33 @@ fn song_row(index: usize, song: &SongEntry) -> SongRow {
     }
 }
 
+/// The editor header's summary of items lasting `lengths` (`None` where
+/// that depends on the operator or the library lacks the song), as the
+/// design writes it: "5 items · ≈ 23 min". With a length left open, the
+/// known part is a floor: "5 items · at least 22 min", and nothing about
+/// the length under a minute.
+fn summary(lengths: &[Option<u64>]) -> String {
+    if lengths.is_empty() {
+        return "No items yet".to_owned();
+    }
+    let items = plural(lengths.len(), "item");
+    let total = lengths
+        .iter()
+        .flatten()
+        .fold(0, |total: u64, seconds| total.saturating_add(*seconds));
+    if lengths.iter().any(Option::is_none) {
+        return match total / 60 {
+            0 => items,
+            minutes => format!("{items} · at least {minutes} min"),
+        };
+    }
+    // Rounded to the nearest minute, half a minute up.
+    match total.saturating_add(30) / 60 {
+        0 => format!("{items} · < 1 min"),
+        minutes => format!("{items} · ≈ {minutes} min"),
+    }
+}
+
 /// "1 item", "5 items".
 fn plural(count: usize, word: &str) -> String {
     if count == 1 {
@@ -1225,7 +1245,7 @@ pub struct EditorView {
     pub name: String,
     /// The name being typed, while renaming.
     pub renaming: Option<String>,
-    /// How many items and how long, such as "5 items · 22:35".
+    /// How many items and about how long, such as "5 items · ≈ 23 min".
     pub summary: String,
     /// The items.
     pub rows: Vec<EditorRow>,
@@ -1234,6 +1254,9 @@ pub struct EditorView {
     /// Whether it is open on the Perform screen, which plays it as it was
     /// when opened.
     pub playing: bool,
+    /// The line above the name while it is open on the Perform screen:
+    /// [`ON_PERFORM`].
+    pub on_perform: Option<String>,
     /// The remove control: "Remove", or [`ARMED_LABEL`] once armed.
     pub remove: String,
     /// Whether the next press of the remove control removes the setlist.

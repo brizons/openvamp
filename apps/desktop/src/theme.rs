@@ -198,6 +198,10 @@ const ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/acoustic-guitar.svg"),
     ),
     (
+        "icons/arrangement.svg",
+        include_bytes!("../assets/icons/arrangement.svg"),
+    ),
+    (
         "icons/back-to-start.svg",
         include_bytes!("../assets/icons/back-to-start.svg"),
     ),
@@ -205,6 +209,10 @@ const ICONS: &[(&str, &[u8])] = &[
     (
         "icons/check.svg",
         include_bytes!("../assets/icons/check.svg"),
+    ),
+    (
+        "icons/clock.svg",
+        include_bytes!("../assets/icons/clock.svg"),
     ),
     (
         "icons/close.svg",
@@ -339,6 +347,10 @@ const ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/speech.svg"),
     ),
     ("icons/stay.svg", include_bytes!("../assets/icons/stay.svg")),
+    (
+        "icons/stems.svg",
+        include_bytes!("../assets/icons/stems.svg"),
+    ),
     ("icons/stop.svg", include_bytes!("../assets/icons/stop.svg")),
     (
         "icons/trash.svg",

@@ -73,8 +73,9 @@ impl Catalog {
     }
 
     /// [`Self::meta`] without the song's arrangement, for a list that shows
-    /// the arrangement in a column of its own: "A · 132 BPM", or "—" when
-    /// there is nothing else to say (a song the library lacks).
+    /// the arrangement in a column of its own, and ending with the song's
+    /// stem count: "A · 132 BPM · 14 stems", or "—" when there is nothing
+    /// else to say (a song the library lacks).
     pub fn meta_without_arrangement(&self, item: &SetlistItem) -> String {
         self.describe(item, Arrangement::Left)
     }
@@ -99,7 +100,8 @@ impl Catalog {
 
     fn song_meta(&self, item: &SongItem, named: Arrangement) -> String {
         let mut parts = Vec::new();
-        let arrangement = self.song(&item.song).and_then(|entry| {
+        let entry = self.song(&item.song);
+        let arrangement = entry.and_then(|entry| {
             parts.extend(entry.key.clone());
             parts.push(format!("{} BPM", entry.bpm));
             entry
@@ -128,6 +130,14 @@ impl Catalog {
         }
         if item.fade_out {
             parts.push("fade-out".to_owned());
+        }
+        // The editor's line ends with the stem count, as the design's does;
+        // the strip's has no room for it.
+        if let (Some(entry), false) = (entry, shown) {
+            parts.push(match entry.stems {
+                1 => "1 stem".to_owned(),
+                stems => format!("{stems} stems"),
+            });
         }
         if parts.is_empty() {
             return "—".to_owned();
