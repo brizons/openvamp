@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use app::testing::FakeOutput;
 use app::{AudioOutput, OutputError, RuntimeError, SessionOptions};
@@ -70,6 +71,21 @@ fn write_song(dir: &Path) {
         writer.write_sample((frame % 50) as i16 * 20).unwrap();
     }
     writer.finalize().unwrap();
+}
+
+/// How long the helpers wait for the disk thread or a change, at most.
+const WAIT: Duration = Duration::from_secs(30);
+
+/// Waits until the disk threads of the song `show` plays have buffered
+/// what they can, as the setlist tests do before each callback.
+fn wait_disks(show: &Show) {
+    let monitors = match show {
+        Show::Song(song) => vec![song.session.disk_monitor()],
+        Show::Setlist(setlist) => setlist.session.disk_monitors(),
+    };
+    for monitor in monitors {
+        assert!(monitor.wait_idle(WAIT), "the disk thread keeps up");
+    }
 }
 
 struct Bench {
@@ -153,7 +169,9 @@ impl Bench {
     fn play(&mut self) {
         let show = self.show.as_mut().expect("a song is open");
         show.send(openvamp_desktop::action::UiAction::TogglePlay);
-        for _ in 0..100 {
+        let deadline = Instant::now() + WAIT;
+        while Instant::now() < deadline {
+            wait_disks(show);
             self.fake.render(256);
             show.poll();
             if show.snapshot().output_frame > 0 {
@@ -163,10 +181,17 @@ impl Bench {
         panic!("the transport never started");
     }
 
-    /// `buffers` audio callbacks, the song and the screen polled after
-    /// each, as the screen's timer does.
-    fn run(&mut self, buffers: usize) {
-        for _ in 0..buffers {
+    /// Audio callbacks, the song and the screen polled after each as the
+    /// screen's timer does, until no change waits for the device; bounded
+    /// by time, not by a count of callbacks, since the disk thread may be
+    /// slow under load.
+    fn settle(&mut self) {
+        let deadline = Instant::now() + WAIT;
+        while self.view().applying {
+            assert!(Instant::now() < deadline, "a change never settled");
+            if let Some(show) = &self.show {
+                wait_disks(show);
+            }
             self.fake.render(256);
             if let Some(show) = &mut self.show {
                 show.poll();
@@ -605,7 +630,7 @@ fn a_buffer_size_refused_once_the_song_has_ramped_out_is_not_kept_and_says_why()
     );
     assert_eq!(view.notices, Vec::<String>::new());
     assert_eq!(bench.settings.buffer_frames(), 256, "not kept yet");
-    bench.run(40);
+    bench.settle();
     let view = bench.view();
     assert!(!view.applying);
     assert_eq!(
@@ -626,7 +651,7 @@ fn a_buffer_size_taken_once_the_song_has_ramped_out_is_kept() {
 
     assert!(bench.view().applying);
     assert_eq!(bench.settings.buffer_frames(), 256, "not kept yet");
-    bench.run(40);
+    bench.settle();
     let view = bench.view();
     assert!(!view.applying);
     assert_eq!((view.buffer, bench.settings.buffer_frames()), (512, 512));
@@ -647,7 +672,7 @@ fn a_routing_needing_more_outputs_the_device_refuses_while_playing_is_not_saved(
 
     assert!(bench.view().applying);
     assert_eq!(bench.stored("fake:2"), Some(Routing::stereo(8)));
-    bench.run(40);
+    bench.settle();
     let view = bench.view();
     assert!(!view.applying);
     assert_eq!(
@@ -668,7 +693,7 @@ fn a_routing_needing_more_outputs_taken_while_playing_is_saved_once_it_plays() {
 
     assert!(bench.view().applying);
     assert_eq!(bench.stored("fake:2"), Some(Routing::stereo(8)), "not yet");
-    bench.run(40);
+    bench.settle();
     assert!(!bench.view().applying);
     assert_eq!(bench.view().notices, Vec::<String>::new());
     assert_eq!(bench.stored("fake:2"), Some(Routing::preset(8)));
@@ -713,7 +738,7 @@ fn a_routing_for_more_outputs_than_the_device_now_has_plays_refitted_and_is_save
     bench.fake.set_channels("fake:2", 2);
 
     bench.act(OutputAction::Reset);
-    bench.run(40);
+    bench.settle();
 
     let view = bench.view();
     assert!(!view.applying, "the session took it, fitted to two outputs");
