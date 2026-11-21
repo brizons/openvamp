@@ -134,10 +134,12 @@ impl Perform {
     /// closes the session and its device; what went wrong goes to stderr.
     pub fn close_song(&mut self) {
         self.save_waiting_buses();
-        if let Some(show) = self.loaded.take()
-            && let Some(problem) = close(show, thread::sleep).problem()
-        {
-            eprintln!("warning: {problem}");
+        if let Some(show) = self.loaded.take() {
+            // A buffer size or routing waiting for the device is not kept.
+            self.output.song_closed();
+            if let Some(problem) = close(show, thread::sleep).problem() {
+                eprintln!("warning: {problem}");
+            }
         }
     }
 
@@ -229,6 +231,9 @@ impl Perform {
         );
         match replaced {
             Ok(replaced) => {
+                // What plays closed: a buffer size or routing waiting for
+                // its device is not kept.
+                self.output.song_closed();
                 self.hold = PanicHold::new();
                 self.problems = replaced.problems();
                 for problem in &self.problems {
@@ -285,7 +290,7 @@ impl Perform {
         // what it settles shows on the Audio output screen.
         let output =
             (self.page == Page::Output).then(|| self.output.view(Some(show), &self.settings));
-        self.output.follow(Some(show), &mut self.settings);
+        self.output.follow(Some(show), &mut self.settings, now);
         let followed =
             output.is_some_and(|before| before != self.output.view(Some(show), &self.settings));
         let changed = drawn.is_none_or(|drawn| !drawn.is(show))
@@ -459,9 +464,12 @@ impl Perform {
         if self.asking {
             return;
         }
-        let reopen = self
-            .output
-            .act(action, self.loaded.as_mut(), &mut self.settings);
+        let reopen = self.output.act(
+            action,
+            self.loaded.as_mut(),
+            &mut self.settings,
+            Instant::now(),
+        );
         if reopen && let Some(show) = &self.loaded {
             // A mix not saved yet carries onto the new device.
             let unsaved = unsaved_mix(show);
