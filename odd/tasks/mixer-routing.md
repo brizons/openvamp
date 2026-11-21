@@ -112,3 +112,10 @@ Route evidence: the parent session is long and past the ~150k-token backstop. Or
   - The README overclaimed that a slow drive never holds up the screen. Fixed in 04267a4.
   - Pre-existing, outside T6: `SetlistSession::poll` prepares the next item (song.json and stems) on the UI thread during the tick, and opening a song is synchronous, so a slow volume can still stall the screen and Panic. This is a follow-up for its own task.
 - The open slice 4138268..03c6df1 is under review with the user's consent; 1c27484 follows alone.
+- **L40** (2026-11-21): the open slice 4138268..03c6df1 was reviewed to close it before the high-risk commit (19 files, 2469 lines; `medium`/`under_budget`; consent granted; lenses resilience, reliability, readability): approved and acknowledged (review-cdbccd462e6c721d). Its follow-ups went to the writers: `DROPDOWN_CHROME` duplicates the dropdown's literals; the stale `OneLine` trait; the tick's redraw gating has no tests and may miss time-only changes; the paused-fall exemption is too wide. Then 1c27484 alone (raised with `--escalate-item 4`; 11 files, 815 lines; consent granted): approved and acknowledged (review-a24ef857c1828871); the reviewed boundary is now 1c27484. Its warnings:
+  - A hung read is never retried and shows no note.
+  - A failed re-read after `forget()` replaces facts that were good.
+  - The Tag exception is an exact, case-sensitive "Tag".
+  - The facts note reuses the queued-jump colour.
+  - The README repeats the 5 s retry.
+  - A read already under way when `forget()` runs counts as the re-read.
