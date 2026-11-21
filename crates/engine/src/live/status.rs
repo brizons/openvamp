@@ -118,4 +118,7 @@ pub struct Status {
     /// Reads a stem source could not serve; each one played silence for
     /// that stem.
     pub underruns: u64,
+    /// The peak levels of the stems, the buses and the master
+    /// ([`super::Meters`]).
+    pub meters: super::Meters,
 }
