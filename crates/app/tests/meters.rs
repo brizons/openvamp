@@ -10,7 +10,7 @@ use std::time::Duration;
 use app::testing::FakeOutput;
 use app::{
     Command, METER_DECAY_DB_PER_SECOND, METER_FLOOR, METER_HOLD, Meter, MeterBallistics, Session,
-    SessionOptions, SetlistCommand, SetlistSession, Snapshot,
+    SessionOptions, SetlistCommand, SetlistSession, Snapshot, TransportState,
 };
 use domain::{
     Arrangement, Bus, SectionMarker, SectionType, Setlist, SetlistItem, SongItem, SongPackage,
@@ -620,4 +620,140 @@ fn a_device_back_from_a_loss_does_not_show_the_level_from_before_it() {
         "a paused session back from a loss shows the level from before it: {:?}",
         later.mixer.master_meter
     );
+}
+
+/// One callback of `frames` frames once the disk has served what it may,
+/// then a poll.
+fn step_frames(session: &mut Session, fake: &FakeOutput, frames: usize) -> Snapshot {
+    assert!(session.disk_monitor().wait_idle(Duration::from_secs(10)));
+    fake.render(frames).expect("a stream plays");
+    session.poll()
+}
+
+/// Pause, Stop and Panic: the poll after a short callback into the ramp
+/// still takes the ramp's peaks, as the transport still runs. A meter fed
+/// silence for the 300 ms before would read 0.5 at −6 dB, 0.25.
+#[test]
+fn a_ramp_out_is_metered_while_the_transport_still_runs() {
+    for (halt, ramping) in [
+        (Command::Pause, TransportState::Pausing),
+        (Command::Stop, TransportState::Stopping),
+        (Command::Panic, TransportState::Panicking),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        write_song_at(
+            dir.path(),
+            &stems(&[("drums", StemRole::Track, 0.5)]),
+            8 * RATE as usize,
+            RATE,
+        );
+        let fake = FakeOutput::new();
+        let mut session = Session::open(
+            dir.path(),
+            Box::new(fake.clone()),
+            SessionOptions::default(),
+        )
+        .unwrap();
+        let snapshot = play(&mut session, &fake, 20);
+        assert_eq!(snapshot.transport, TransportState::Playing);
+        assert_eq!(snapshot.mixer.master_meter.level, [0.5, 0.5]);
+        std::thread::sleep(Duration::from_millis(300));
+        session.send(halt).unwrap();
+        let snapshot = step_frames(&mut session, &fake, 16);
+        assert_eq!(snapshot.transport, ramping, "{halt:?}");
+        let mixer = &snapshot.mixer;
+        let stem = level(mixer.stems[0].meter)[0];
+        assert!(
+            stem > 0.45,
+            "{halt:?}: the stem was not fed the ramp: {stem}"
+        );
+        assert!(
+            mixer.bus_meters[Bus::Drums.index()].level[0] > 0.45,
+            "{halt:?}"
+        );
+        assert!(mixer.master_meter.level[0] > 0.45, "{halt:?}");
+        // A panic ramps over 500 ms: a poll 200 ms into it still reads it,
+        // at about 0.6 of 0.5, where silence would have fallen to 0.25.
+        if halt == Command::Panic {
+            std::thread::sleep(Duration::from_millis(300));
+            let snapshot = step_frames(&mut session, &fake, 1_600);
+            assert_eq!(snapshot.transport, TransportState::Panicking);
+            let master = snapshot.mixer.master_meter.level[0];
+            assert!(master > 0.27, "the panic ramp was not metered: {master}");
+        }
+    }
+}
+
+/// AutoLink, Crossfade and Cue next: the first song's Drums bus and the
+/// master carry on across the change, falling, with their hold; the new
+/// item's stems read its own level once it plays (AutoLink, Crossfade) and
+/// silence while it waits stopped (Cue next).
+#[test]
+fn under_every_handover_the_bus_and_master_meters_carry_on() {
+    for transition in [
+        Transition::AutoLink,
+        Transition::Crossfade,
+        Transition::CueNext,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        write_song_at(
+            &dir.path().join("first"),
+            &stems(&[("drums", StemRole::Track, 0.5)]),
+            3 * RATE as usize,
+            RATE,
+        );
+        write_song_at(
+            &dir.path().join("second"),
+            &stems(&[("vocals", StemRole::Track, 0.125)]),
+            6 * RATE as usize,
+            RATE,
+        );
+        let (mut session, fake) = two_items(dir.path(), transition);
+        session.send(SetlistCommand::Item(Command::Play)).unwrap();
+        let mut snapshot = setlist_step(&mut session, &fake);
+        let mut before = snapshot.clone();
+        for _ in 0..400 {
+            if snapshot.setlist.current == 1 {
+                break;
+            }
+            before = snapshot.clone();
+            snapshot = setlist_step(&mut session, &fake);
+        }
+        assert_eq!(snapshot.setlist.current, 1, "{transition:?}");
+        let drums_before = before.song.mixer.bus_meters[Bus::Drums.index()];
+        let first = &snapshot.song.mixer;
+        let drums_first = first.bus_meters[Bus::Drums.index()];
+        assert!(
+            drums_first.level[0] > 0.0,
+            "{transition:?}: the Drums bus started again from silence"
+        );
+        assert_eq!(drums_first.hold, drums_before.hold, "{transition:?}");
+        assert!(first.master_meter.level[0] > 0.0, "{transition:?}");
+
+        std::thread::sleep(Duration::from_millis(300));
+        let later = setlist_step(&mut session, &fake);
+        let mixer = &later.song.mixer;
+        let drums = mixer.bus_meters[Bus::Drums.index()];
+        assert!(
+            drums.level[0] > 0.0 && drums.level[0] < drums_first.level[0],
+            "{transition:?}: the Drums bus falls: {drums:?}"
+        );
+        assert_eq!(drums.hold, [0.5, 0.5], "{transition:?}: its hold stays");
+        match transition {
+            Transition::CueNext => {
+                assert_eq!(later.song.transport, TransportState::Stopped);
+                assert_eq!(level(mixer.stems[0].meter), [0.0, 0.0]);
+            }
+            _ => {
+                assert_eq!(later.song.transport, TransportState::Playing);
+                assert_eq!(
+                    level(mixer.stems[0].meter),
+                    [0.125, 0.125],
+                    "{transition:?}: the incoming item is metered"
+                );
+                assert_eq!(mixer.bus_meters[Bus::Vocals.index()].level, [0.125, 0.125]);
+                assert!(mixer.master_meter.level[0] >= 0.125, "{transition:?}");
+            }
+        }
+    }
 }
