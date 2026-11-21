@@ -17,9 +17,9 @@ use domain::{
 use hound::{SampleFormat, WavSpec, WavWriter};
 use library::ConfigStore;
 use openvamp_desktop::audio_settings::AudioSettings;
-use openvamp_desktop::mixer::{MixerPage, restore_mix, unsaved_mix};
+use openvamp_desktop::mixer::{MixerPage, bus_icon, restore_mix, unsaved_mix};
 use openvamp_desktop::output_page::{
-    OutputAction, OutputPage, OutputScreen, click_cell, problem_notice,
+    DeviceState, OutputAction, OutputPage, OutputScreen, click_cell, problem_notice, rate_note,
 };
 use openvamp_desktop::show::{Show, Source, replace};
 
@@ -754,4 +754,66 @@ fn a_routing_for_more_outputs_than_the_device_now_has_plays_refitted_and_is_save
         Some(Routing::preset(8)),
         "saved as asked, for when the device has its eight outputs again"
     );
+}
+
+#[test]
+fn the_device_button_dot_says_whether_the_device_plays_the_song() {
+    let mut bench = Bench::on("fake:2");
+    assert_eq!(bench.view().device_state, DeviceState::Open);
+
+    bench.fake.unplug("fake:2");
+    bench.show.as_mut().unwrap().poll();
+
+    let view = bench.view();
+    assert_eq!(view.device_state, DeviceState::Lost);
+    assert_eq!(
+        view.device, "Interface · 8 outputs",
+        "the device it waits for"
+    );
+
+    bench.show = None;
+    assert_eq!(
+        bench.view().device_state,
+        DeviceState::Closed,
+        "nothing plays: no claim"
+    );
+}
+
+#[test]
+fn the_sample_rate_says_it_matches_the_song_only_while_one_plays() {
+    let mut bench = Bench::on("fake:2");
+
+    let view = bench.view();
+    assert_eq!(view.sample_rate, "8 kHz");
+    assert_eq!(view.sample_rate_note.as_deref(), Some("matches the song"));
+
+    bench.show = None;
+    let view = bench.view();
+    assert_eq!(view.sample_rate, "Set by the song that plays");
+    assert_eq!(view.sample_rate_note, None);
+}
+
+#[test]
+fn the_rate_note_compares_the_device_with_the_song() {
+    assert_eq!(rate_note(48_000, 48_000), "matches the song");
+    assert_eq!(rate_note(48_000, 44_100), "the song is 44.1 kHz");
+}
+
+#[test]
+fn each_matrix_row_carries_its_bus_icon_as_the_mixer_draws_it() {
+    let view = Bench::on("fake:2").view();
+
+    let icons: Vec<&str> = view.rows.iter().map(|row| row.icon).collect();
+    assert_eq!(
+        icons,
+        [
+            "headphones",
+            "drum",
+            "bass",
+            "piano",
+            "electric-guitar",
+            "mic"
+        ]
+    );
+    assert!(view.rows.iter().all(|row| row.icon == bus_icon(row.bus)));
 }

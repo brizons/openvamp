@@ -1,10 +1,11 @@
 //! The Audio output screen without a window (S3, F8): the output devices
-//! with their output counts, the rate the device runs at, the buffer size
-//! with its latency, split mode for 2-output devices, and the routing
-//! matrix of buses by outputs with its presets. Every change applies to
-//! the song playing at once and is saved for its device (keyed by the
-//! device's id); with nothing playing, the chosen device's routing is
-//! edited and saved for the next session.
+//! with their output counts and whether the one in use plays, the rate the
+//! device runs at against the song's, the buffer size with its latency,
+//! split mode for 2-output devices, and the routing matrix of buses (with
+//! the Mixer's bus icons) by outputs with its presets. Every change
+//! applies to the song playing at once and is saved for its device (keyed
+//! by the device's id); with nothing playing, the chosen device's routing
+//! is edited and saved for the next session.
 
 use app::{
     DeviceInfo, DeviceStatus, LossReason, MAX_BUFFER_FRAMES, MIN_BUFFER_FRAMES, OutputError,
@@ -13,6 +14,7 @@ use app::{
 use domain::{Bus, Destination, Routing};
 
 use crate::audio_settings::AudioSettings;
+use crate::mixer::bus_icon;
 use crate::show::Show;
 
 /// The buffer sizes offered, in frames (F8.5).
@@ -130,6 +132,29 @@ fn outputs_text(outputs: u16) -> String {
     format!("{outputs} output{}", if outputs == 1 { "" } else { "s" })
 }
 
+/// What the screen says after the rate a device runs at, `device`, of the
+/// song's rate `song`: "matches the song", or the song's rate when they
+/// differ (nothing resamples, so the session plays at the song's rate).
+pub fn rate_note(device: u32, song: u32) -> String {
+    if device == song {
+        "matches the song".to_owned()
+    } else {
+        format!("the song is {}", rate_text(song))
+    }
+}
+
+/// What the dot on the device button says of the device in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceState {
+    /// No song is open, so no stream: the screen claims nothing (no dot).
+    Closed,
+    /// A stream is open on the device.
+    Open,
+    /// The session lost the device, or it refused to open again; the
+    /// session keeps trying.
+    Lost,
+}
+
 /// One device of the device menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceRow {
@@ -146,6 +171,8 @@ pub struct RoutingRow {
     pub bus: Bus,
     /// Its name.
     pub name: &'static str,
+    /// Its icon, as the Mixer's bus strip draws it ([`bus_icon`]).
+    pub icon: &'static str,
     /// Whether it plays on each output, from output 1.
     pub cells: Vec<bool>,
 }
@@ -157,10 +184,16 @@ pub struct OutputScreen {
     pub devices: Vec<DeviceRow>,
     /// The device in use, as its row reads; "No output device" without one.
     pub device: String,
+    /// The dot on the device button.
+    pub device_state: DeviceState,
     /// Whether the device menu is open.
     pub device_menu: bool,
-    /// The rate the device runs at, such as "48 kHz".
+    /// The rate the device runs at, such as "48 kHz"; "Set by the song
+    /// that plays" with nothing playing.
     pub sample_rate: String,
+    /// What follows the rate while a stream plays ([`rate_note`]); `None`
+    /// with nothing playing.
+    pub sample_rate_note: Option<String>,
     /// The buffer sizes offered.
     pub buffer_sizes: [u32; 5],
     /// The buffer size in use.
@@ -501,6 +534,7 @@ impl OutputPage {
                 RoutingRow {
                     bus,
                     name: bus.name(),
+                    icon: bus_icon(bus),
                     cells: (1..=outputs).map(|output| on.contains(&output)).collect(),
                 }
             })
@@ -527,11 +561,20 @@ impl OutputPage {
         OutputScreen {
             devices,
             device,
+            device_state: show.map_or(DeviceState::Closed, |show| match show.snapshot().device {
+                DeviceStatus::Connected(_) => DeviceState::Open,
+                DeviceStatus::Disconnected { .. } | DeviceStatus::PlayerLost { .. } => {
+                    DeviceState::Lost
+                }
+            }),
             device_menu: self.device_menu,
             sample_rate: stream.as_ref().map_or_else(
                 || "Set by the song that plays".to_owned(),
                 |stream| rate_text(stream.sample_rate),
             ),
+            sample_rate_note: show
+                .zip(stream.as_ref())
+                .map(|(show, stream)| rate_note(stream.sample_rate, show.song().sample_rate)),
             buffer_sizes: BUFFER_SIZES,
             buffer: stream
                 .as_ref()

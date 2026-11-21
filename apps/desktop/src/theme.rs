@@ -322,6 +322,14 @@ const ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/previous.svg"),
     ),
     (
+        "icons/reset.svg",
+        include_bytes!("../assets/icons/reset.svg"),
+    ),
+    (
+        "icons/routing.svg",
+        include_bytes!("../assets/icons/routing.svg"),
+    ),
+    (
         "icons/search.svg",
         include_bytes!("../assets/icons/search.svg"),
     ),
