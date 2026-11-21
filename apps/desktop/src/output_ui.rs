@@ -11,7 +11,7 @@ use openvamp_desktop::output_page::{DeviceState, OutputAction, OutputScreen, Rou
 
 use crate::screen::Perform;
 use crate::theme;
-use crate::ui::{OneLine, icon};
+use crate::ui::{icon, one_line_text};
 
 /// The width of the matrix's bus column.
 const BUS_COLUMN: f32 = 150.;
@@ -192,8 +192,7 @@ fn device_panel(view: &OutputScreen, cx: &mut Context<Perform>) -> impl IntoElem
             div()
                 .flex_1()
                 .min_w_0()
-                .one_line()
-                .child(view.device.clone()),
+                .child(one_line_text(view.device.clone())),
         )
         .child(icon("down", theme::text(), 16.));
     let menu = view.device_menu.then(|| {
@@ -217,7 +216,7 @@ fn device_panel(view: &OutputScreen, cx: &mut Context<Perform>) -> impl IntoElem
                 .rounded(px(8.))
                 .text_size(px(14.))
                 .when(device.chosen, |row| row.bg(theme::selected()))
-                .child(div().min_w_0().one_line().child(device.label.clone()))
+                .child(div().min_w_0().child(one_line_text(device.label.clone())))
             }))
     });
     let rate = match &view.sample_rate_note {
@@ -321,6 +320,11 @@ fn device_panel(view: &OutputScreen, cx: &mut Context<Perform>) -> impl IntoElem
         .children(view.split_mode.map(|on| split_mode(on, cx)))
 }
 
+/// The split mode's switch beside its name and what it does. The text
+/// gives way to the switch and wraps within the card: a text that wraps
+/// says it is as wide as its whole line (gpui 0.2.2 knows no narrower
+/// min-content width for it), so without `min_w_0` it would push the
+/// switch out of the card.
 fn split_mode(on: bool, cx: &mut Context<Perform>) -> impl IntoElement {
     div()
         .flex()
@@ -332,6 +336,7 @@ fn split_mode(on: bool, cx: &mut Context<Perform>) -> impl IntoElement {
         .child(
             div()
                 .flex_1()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .gap(px(2.))
@@ -440,10 +445,9 @@ fn routing_panel(view: &OutputScreen, cx: &mut Context<Perform>) -> impl IntoEle
                 .child(
                     div()
                         .min_w_0()
-                        .one_line()
                         .text_size(px(13.))
                         .text_color(theme::text_muted())
-                        .child(view.hint),
+                        .child(one_line_text(view.hint)),
                 )
                 .child(div().flex_1())
                 .child(preset)
@@ -486,10 +490,9 @@ fn matrix_row(row: &RoutingRow, min_width: f32, cx: &mut Context<Perform>) -> An
                 .child(
                     div()
                         .min_w_0()
-                        .one_line()
                         .text_size(px(14.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(row.name),
+                        .child(one_line_text(row.name)),
                 ),
         )
         .children(row.cells.iter().enumerate().map(|(index, &on)| {

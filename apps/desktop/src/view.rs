@@ -77,10 +77,11 @@ pub fn short_label(label: &str) -> String {
     format!("{short}{number}")
 }
 
-/// The short names of `positions` on the song map and the pads
-/// ([`short_label`]), where a section without a number that plays more
-/// than once is numbered by its turn: "Chorus" twice is "C1" and "C2".
-fn abbreviations(positions: &[PositionInfo]) -> Vec<String> {
+/// The names of `positions` on the song map, the pads and the Now and Next
+/// cards, where a section without a number that plays more than once is
+/// numbered by its turn: "Chorus" twice is "Chorus 1" and "Chorus 2", as
+/// the design canvas writes them.
+fn section_names(positions: &[PositionInfo]) -> Vec<String> {
     positions
         .iter()
         .enumerate()
@@ -89,14 +90,14 @@ fn abbreviations(positions: &[PositionInfo]) -> Vec<String> {
             let numbered = label.len() > first_word(label).len();
             let repeats = positions.iter().filter(|p| p.label == label).count() > 1;
             if numbered || !repeats {
-                return short_label(label);
+                return label.to_owned();
             }
             let turn = positions[..index]
                 .iter()
                 .filter(|p| p.label == label)
                 .count()
                 + 1;
-            short_label(&format!("{label} {turn}"))
+            format!("{label} {turn}")
         })
         .collect()
 }
@@ -141,7 +142,8 @@ fn first_word(label: &str) -> &str {
 pub struct MapBlock {
     /// Index into the arrangement.
     pub position: usize,
-    /// Full label, such as "Verse 2".
+    /// Full name, such as "Verse 2", or "Chorus 2" for the second
+    /// "Chorus".
     pub label: String,
     /// Short label, such as "V2".
     pub short: String,
@@ -189,7 +191,7 @@ pub struct SongMap {
 pub struct Pad {
     /// Index into the arrangement; the pad queues a jump to it.
     pub position: usize,
-    /// Label, such as "Verse 2".
+    /// Its name, as the song map names it ([`MapBlock::label`]).
     pub label: String,
     /// Its short name, large on the pad: "V2", or "C2" for the second
     /// "Chorus" ([`MapBlock::short`]).
@@ -213,7 +215,8 @@ pub struct Pad {
 /// The card that says what is playing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NowCard {
-    /// The current section.
+    /// The current section, as the song map names it
+    /// ([`MapBlock::label`]).
     pub name: String,
     /// Time left in it, such as "6.3 s left".
     pub detail: String,
@@ -231,7 +234,8 @@ pub struct NowCard {
 pub struct NextCard {
     /// "Next", "Jump queued" or "Loop queued".
     pub heading: String,
-    /// The section that plays next, or "End of song".
+    /// The section that plays next, as the song map names it
+    /// ([`MapBlock::label`]), or "End of song".
     pub name: String,
     /// When, such as "Executes in 4.2 s".
     pub detail: String,
@@ -502,14 +506,15 @@ impl PerformView {
             None => format!("arrangement \"{}\"", song.arrangement),
         };
         let bars = position_bars(song, facts);
-        let abbreviations = abbreviations(&song.positions);
+        let names = section_names(&song.positions);
+        let abbreviations: Vec<String> = names.iter().map(|name| short_label(name)).collect();
         let pads = song
             .positions
             .iter()
             .enumerate()
             .map(|(position, info)| Pad {
                 position,
-                label: info.label.clone(),
+                label: names[position].clone(),
                 abbr: abbreviations[position].clone(),
                 icon: section_icon(&info.label),
                 bars: bars[position].map(bars_text),
@@ -533,9 +538,12 @@ impl PerformView {
                 clock(timeline.total, song.sample_rate)
             ),
             bar_beat: format!("Bar {} · beat {}", snapshot.bar, snapshot.beat),
-            map: song_map(snapshot, song, &timeline, &abbreviations, &bars),
+            map: song_map(snapshot, song, &timeline, &names, &abbreviations, &bars),
             now: NowCard {
-                name: snapshot.section.clone(),
+                name: names
+                    .get(snapshot.position)
+                    .cloned()
+                    .unwrap_or_else(|| snapshot.section.clone()),
                 detail: format!(
                     "{} left",
                     seconds(timeline.left_in_section, song.sample_rate)
@@ -544,7 +552,14 @@ impl PerformView {
                 kind: SectionKind::of(&snapshot.section),
                 icon: section_icon(&snapshot.section),
             },
-            next: next_card(snapshot, song, next, timeline.left_in_section, bars_left),
+            next: next_card(
+                snapshot,
+                song,
+                &names,
+                next,
+                timeline.left_in_section,
+                bars_left,
+            ),
             pads,
             jump_timing: snapshot.jump_timing,
             live_loop: snapshot.live_loop(),
@@ -652,6 +667,7 @@ fn song_map(
     snapshot: &Snapshot,
     song: &SongInfo,
     timeline: &Timeline,
+    names: &[String],
     abbreviations: &[String],
     bars: &[Option<u64>],
 ) -> SongMap {
@@ -664,7 +680,7 @@ fn song_map(
         .map(|(position, info)| {
             let block = MapBlock {
                 position,
-                label: info.label.clone(),
+                label: names[position].clone(),
                 short: abbreviations[position].clone(),
                 kind: SectionKind::of(&info.label),
                 start: timeline.fraction(start),
@@ -719,16 +735,13 @@ fn next_position(snapshot: &Snapshot, song: &SongInfo) -> Option<usize> {
 fn next_card(
     snapshot: &Snapshot,
     song: &SongInfo,
+    names: &[String],
     next: Option<usize>,
     left_in_section: u64,
     bars_left: Option<u64>,
 ) -> NextCard {
     let rate = song.sample_rate;
-    let name = |position: usize| {
-        song.positions
-            .get(position)
-            .map_or_else(String::new, |p| p.label.clone())
-    };
+    let name = |position: usize| names.get(position).cloned().unwrap_or_default();
     let (kind, icon) = match next.and_then(|position| song.positions.get(position)) {
         Some(info) => (SectionKind::of(&info.label), section_icon(&info.label)),
         None => (SectionKind::Neutral, END_ICON),

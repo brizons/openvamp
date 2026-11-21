@@ -10,9 +10,10 @@
 use app::JumpTiming;
 use domain::Transition;
 use gpui::{
-    AnyElement, AnyView, App, Bounds, ClickEvent, Context, Div, DragMoveEvent, ElementId, Entity,
-    FocusHandle, FontWeight, IntoElement, MouseButton, Pixels, Point, Rgba, SharedString, Size,
-    Stateful, Window, div, prelude::*, px, relative, svg,
+    AnyElement, AnyView, App, Bounds, ClickEvent, Context, Div, DragMoveEvent, Element, ElementId,
+    Entity, FocusHandle, FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
+    MouseButton, Pixels, Point, Rgba, ShapedLine, SharedString, Size, Stateful, Style, TextRun,
+    Window, div, prelude::*, px, relative, svg,
 };
 use openvamp_desktop::action::UiAction;
 use openvamp_desktop::mixer::MixerScreen;
@@ -369,9 +370,8 @@ fn setlist_chip(setlist: &SetlistView, cx: &mut Context<Perform>) -> impl IntoEl
                 .gap(px(1.))
                 .child(
                     div()
-                        .one_line()
                         .text_size(px(16.))
-                        .child(setlist.name.clone()),
+                        .child(one_line_text(setlist.name.clone())),
                 )
                 .child(
                     div()
@@ -555,18 +555,16 @@ fn device_chip(device: &DeviceChip, cx: &mut Context<Perform>) -> impl IntoEleme
                 .gap(px(1.))
                 .child(
                     div()
-                        .one_line()
                         .text_size(px(13.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(device.name.clone()),
+                        .child(one_line_text(device.name.clone())),
                 )
                 .child(
                     div()
-                        .one_line()
                         .font_family(theme::MONO)
                         .text_size(px(11.))
                         .text_color(theme::text_muted())
-                        .child(device.meta.clone()),
+                        .child(one_line_text(device.meta.clone())),
                 ),
         )
 }
@@ -689,13 +687,14 @@ fn now_playing(
                         .flex_col()
                         .justify_center()
                         .gap(px(6.))
+                        // The title's box holds its descenders: a line of 1.15
+                        // em is shorter than the font's ascent and descent.
                         .child(
                             div()
-                                .one_line()
                                 .text_size(px(26.))
                                 .line_height(relative(1.15))
                                 .font_weight(FontWeight::BOLD)
-                                .child(view.title.clone()),
+                                .child(one_line_text(view.title.clone())),
                         )
                         .child(song_facts(&view.header)),
                 )
@@ -752,7 +751,11 @@ fn song_facts(header: &SongHeader) -> impl IntoElement {
                 .text_size(px(13.))
                 .text_color(theme::text())
                 .child(icon("arrangement", theme::text_faint(), 14.))
-                .child(div().min_w_0().one_line().child(header.arrangement.clone()))
+                .child(
+                    div()
+                        .min_w_0()
+                        .child(one_line_text(header.arrangement.clone())),
+                )
                 .child(icon("down", theme::text(), 14.)),
         )
 }
@@ -794,11 +797,10 @@ fn now_card(now: &NowCard) -> impl IntoElement {
                 .child(small_heading("Now", theme::text_muted()))
                 .child(
                     div()
-                        .one_line()
                         .text_size(px(20.))
                         .line_height(relative(1.15))
                         .font_weight(FontWeight::BOLD)
-                        .child(now.name.clone()),
+                        .child(one_line_text(now.name.clone())),
                 )
                 .child(mono_note(
                     now.bars_left.clone().unwrap_or_else(|| now.detail.clone()),
@@ -850,23 +852,21 @@ fn next_card(next: &NextCard, cx: &mut Context<Perform>) -> impl IntoElement {
                 )
                 .child(
                     div()
-                        .one_line()
                         .text_size(px(20.))
                         .line_height(relative(1.15))
                         .font_weight(FontWeight::BOLD)
                         .text_color(name_color)
-                        .child(next.name.clone()),
+                        .child(one_line_text(next.name.clone())),
                 )
                 .child(
                     div()
-                        .one_line()
                         .text_size(px(12.))
                         .text_color(theme::text_muted())
-                        .child(
+                        .child(one_line_text(
                             next.bars_detail
                                 .clone()
                                 .unwrap_or_else(|| next.detail.clone()),
-                        ),
+                        )),
                 ),
         )
         .when(next.queued, |card| {
@@ -1237,11 +1237,10 @@ fn pad_button(pad: &Pad, grid: PadGrid, cx: &mut Context<Perform>) -> AnyElement
                 )
                 .child(
                     div()
-                        .one_line()
                         .text_size(px(name_size))
                         .line_height(relative(1.2))
                         .text_color(theme::text_muted())
-                        .child(pad.label.clone()),
+                        .child(one_line_text(pad.label.clone())),
                 )
                 .when_some(pad.bars.clone().filter(|_| !compact), |column, bars| {
                     column.child(
@@ -1431,10 +1430,17 @@ fn strip_tile(
             .bg(badge_bg)
             .child(icon(badge_icon, badge_fg, 18.)),
     )
+    // The title and meta take the room the badge leaves and add none of
+    // their own to the tile: as the design's `flex: 1 0 196px` tile, it
+    // keeps its share of the strip and cuts a long title. taffy counts a
+    // flex item that clips its content as its basis (0) when it works out
+    // the tile's max-content width, which the strip's rows ask for.
     .child(
         div()
-            .flex_1()
+            .flex_grow()
+            .flex_basis(px(0.))
             .min_w_0()
+            .overflow_hidden()
             .flex()
             .flex_col()
             .gap(px(2.))
@@ -1453,16 +1459,14 @@ fn strip_tile(
                             .child(item.number.clone()),
                     )
                     // The title takes its own width and gives way to the
-                    // number and tag: a text that grows from no width keeps
-                    // the lines gpui 0.2.2 measured before the tile had a
-                    // width, and showed three letters of the title.
+                    // number and tag, ending in an ellipsis
+                    // ([`OneLineText`]).
                     .child(
                         div()
                             .min_w_0()
-                            .one_line()
                             .text_size(px(16.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(item.title.clone()),
+                            .child(one_line_text(item.title.clone())),
                     )
                     .when_some(tag, |row, (tag, color)| {
                         row.child(
@@ -1477,10 +1481,9 @@ fn strip_tile(
             )
             .child(
                 div()
-                    .one_line()
                     .text_size(px(13.))
                     .text_color(detail_color)
-                    .child(detail),
+                    .child(one_line_text(detail)),
             ),
     )
     .into_any_element()
@@ -1614,7 +1617,9 @@ impl Render for Hint {
 }
 
 /// Builds the [`Hint`] that says `text`, for an element's `tooltip`.
-fn hint(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+pub(crate) fn hint(
+    text: impl Into<SharedString>,
+) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
     let text = text.into();
     move |_, cx| cx.new(|_| Hint(text.clone())).into()
 }
@@ -1764,8 +1769,10 @@ pub(crate) fn half_across(bounds: &Bounds<Pixels>, position: Point<Pixels>) -> O
 /// does not wrap keeps the size of its first measurement, taken while its
 /// width is not known yet (the layout's max-content pass): it then draws in
 /// full and its box clips it, with no ellipsis. A text that wraps is
-/// measured again once its width is known, so this one wraps, is clamped
-/// to one line, and ends in an ellipsis at that width.
+/// measured again with each width it is asked about, so this one wraps, is
+/// clamped to one line, and ends in an ellipsis at the width it was last
+/// measured with, which is its box only when no other width came after it:
+/// [`OneLineText`] does not depend on that.
 pub(crate) trait OneLine: Styled + Sized {
     fn one_line(self) -> Self {
         self.whitespace_normal().text_ellipsis().line_clamp(1)
@@ -1773,6 +1780,140 @@ pub(crate) trait OneLine: Styled + Sized {
 }
 
 impl<E: Styled> OneLine for E {}
+
+/// One line of text, in the text style its parents set, that ends in an
+/// ellipsis ("…") when its box is narrower than the text. Its box is as
+/// wide as the whole text unless its parent makes it narrower (a block
+/// parent stretches it to its own width, and as a flex item it shrinks to
+/// nothing before it overflows), and never shorter than the font's ascent
+/// and descent, so its glyphs stay inside it.
+///
+/// [`OneLine`] is not enough where the text's width comes from the layout
+/// rather than from the text: gpui 0.2.2's text measures itself with each
+/// width taffy asks about, keeps only the last result, gives that result
+/// again for any question without a width (its min- and max-content), and
+/// paints those lines (`TextLayout::layout` in gpui's `elements/text.rs`).
+/// Taffy asks a flex item about several widths and answers repeated
+/// questions from its own cache without asking the text again, so the
+/// width the text was last cut to need not be the box it ends up in: cut
+/// to nothing in a narrow pass, a title then says its width is nothing and
+/// stays gone; cut to three letters, it paints three letters in a wide box.
+/// This text answers every question with its whole width, and cuts itself
+/// to its final box when it paints.
+pub(crate) struct OneLineText {
+    text: SharedString,
+}
+
+pub(crate) fn one_line_text(text: impl Into<SharedString>) -> OneLineText {
+    let text: SharedString = text.into();
+    // A shaped line holds no line breaks.
+    let text = if text.contains('\n') {
+        text.replace('\n', " ").into()
+    } else {
+        text
+    };
+    OneLineText { text }
+}
+
+/// The whole text shaped in its style, and its line box's height.
+pub(crate) struct OneLineLayout {
+    line: ShapedLine,
+    height: Pixels,
+}
+
+impl OneLineText {
+    fn run(&self, window: &Window) -> (TextRun, Pixels) {
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        (style.to_run(self.text.len()), font_size)
+    }
+}
+
+impl IntoElement for OneLineText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for OneLineText {
+    type RequestLayoutState = OneLineLayout;
+    /// The text cut to its box, when the whole text does not fit.
+    type PrepaintState = Option<ShapedLine>;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let (run, font_size) = self.run(window);
+        let line_height = window
+            .text_style()
+            .line_height
+            .to_pixels(font_size.into(), window.rem_size());
+        let line = window
+            .text_system()
+            .shape_line(self.text.clone(), font_size, &[run], None);
+        let height = line_height.max(line.ascent + line.descent);
+        let width = line.width.ceil();
+        let mut style = Style::default();
+        style.min_size.width = px(0.).into();
+        let layout_id = window.request_measured_layout(style, move |known, _, _, _| Size {
+            width: known.width.unwrap_or(width),
+            height,
+        });
+        (layout_id, OneLineLayout { line, height })
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        if layout.line.width <= bounds.size.width {
+            return None;
+        }
+        let (run, font_size) = self.run(window);
+        let font = run.font.clone();
+        let mut runs = vec![run];
+        let cut = cx
+            .text_system()
+            .line_wrapper(font, font_size)
+            .truncate_line(self.text.clone(), bounds.size.width, "…", &mut runs);
+        Some(window.text_system().shape_line(cut, font_size, &runs, None))
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        cut: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let line = cut.as_ref().unwrap_or(&layout.line);
+        // Painting fails only when a glyph cannot be rasterized; the line
+        // then shows without it, as gpui's own text does.
+        let _ = line.paint(bounds.origin, layout.height, window, cx);
+    }
+}
 
 pub(crate) fn icon(name: &str, color: Rgba, size: f32) -> impl IntoElement {
     svg()

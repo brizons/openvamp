@@ -963,8 +963,61 @@ fn a_tag_without_a_number_keeps_its_name_and_repeated_sections_are_numbered() {
     assert_eq!(shorts, ["In", "V1", "C1", "TA", "C2", "Tag", "Out"]);
     let abbreviations: Vec<&str> = view.pads.iter().map(|p| p.abbr.as_str()).collect();
     assert_eq!(abbreviations, shorts);
-    // The pads keep the section's full name.
-    assert_eq!(view.pads[4].label, "Chorus");
+    // The pads keep the section's full name, numbered as the map numbers it.
+    assert_eq!(view.pads[4].label, "Chorus 2");
+}
+
+#[test]
+fn now_next_pads_and_map_name_a_repeated_section_by_its_turn() {
+    let song = bars_song();
+    let names = [
+        "Intro",
+        "Verse 1",
+        "Chorus 1",
+        "Turnaround",
+        "Chorus 2",
+        "Tag",
+        "Outro",
+    ];
+
+    // The first Chorus plays; the Turnaround is next.
+    let view = PerformView::new(&at_bar(2, 30), &song);
+    assert_eq!(view.now.name, "Chorus 1");
+    assert_eq!(view.next.name, "Turnaround");
+    let pads: Vec<&str> = view.pads.iter().map(|p| p.label.as_str()).collect();
+    assert_eq!(pads, names);
+    let blocks: Vec<&str> = view.map.blocks.iter().map(|b| b.label.as_str()).collect();
+    assert_eq!(blocks, names);
+
+    // The Turnaround plays; the Chorus after it is the second one: C2.
+    let view = PerformView::new(&at_bar(3, 41), &song);
+    assert_eq!(view.next.name, "Chorus 2");
+    assert_eq!(view.map.blocks[4].short, "C2");
+
+    // The second Chorus plays.
+    let view = PerformView::new(&at_bar(4, 30), &song);
+    assert_eq!(view.now.name, "Chorus 2");
+    assert_eq!(view.now.kind, SectionKind::Chorus);
+    assert_eq!(view.now.icon, "star");
+
+    // A jump queued back to the first Chorus names it so.
+    let mut snapshot = at_bar(4, 30);
+    snapshot.queued = Some(QueuedView {
+        target: 2,
+        target_label: "Chorus".to_owned(),
+        kind: JumpKind::Jump,
+        executes_at: 0,
+        frames_until: 48_000,
+        deferrals: 0,
+    });
+    let view = PerformView::new(&snapshot, &song);
+    assert_eq!(view.next.name, "Chorus 1");
+    assert_eq!(view.next.heading, "Jump queued");
+
+    // A section played once keeps its name: "Tag", not "Tag 1".
+    let view = PerformView::new(&at_bar(5, 44), &song);
+    assert_eq!(view.now.name, "Tag");
+    assert_eq!(view.next.name, "Outro");
 }
 
 #[test]
@@ -1077,7 +1130,8 @@ fn now_and_next_show_their_section_icon_and_the_bars_left() {
     let facts = bars_facts();
     // Bar 30 of the Chorus, bars 25 to 40.
     let view = PerformView::with_facts(&at_bar(2, 30), &song, &facts);
-    assert_eq!(view.now.name, "Chorus");
+    // The first of the song's two Choruses.
+    assert_eq!(view.now.name, "Chorus 1");
     assert_eq!(view.now.kind, SectionKind::Chorus);
     assert_eq!(view.now.icon, "star");
     assert_eq!(view.now.bars_left.as_deref(), Some("11 bars left"));
