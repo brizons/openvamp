@@ -1,14 +1,18 @@
 //! Presentational code for the Mixer screen (S3, F7): draws the
-//! [`MixerScreen`] view model and sends [`MixerAction`]s to the container.
-//! Faders drag with gpui's drag events, so a fast drag keeps following the
-//! pointer outside the fader; a double click returns a fader to 0 dB. The
-//! engine reports no levels, so there are no meters.
+//! [`MixerScreen`] view model after the design canvas's Mixer artboard and
+//! sends [`MixerAction`]s to the container. Faders drag with gpui's drag
+//! events, so a fast drag keeps following the pointer outside the fader; a
+//! double click returns a fader to 0 dB. Every fader has its meter slot
+//! beside it, empty: the engine reports no levels yet (T6b fills them).
+//! The arrangement chip draws as the design's dropdown but picks nothing
+//! yet: the app cannot switch arrangements.
 
 use domain::Bus;
 use gpui::{
     AnyElement, ClickEvent, Context, Div, DragMoveEvent, ElementId, FontWeight, IntoElement,
-    Render, SharedString, Stateful, Window, div, prelude::*, px, relative,
+    Render, Rgba, SharedString, Stateful, Window, div, prelude::*, px, relative,
 };
+use openvamp_desktop::action::{Intent, UiAction};
 use openvamp_desktop::mixer::{
     BusStrip, FADER_CAP_HEIGHT, FADER_CAP_WIDTH, FADER_PADDING, Layer, MasterStrip, MixerAction,
     MixerScreen, StemStrip, fader_drag_position,
@@ -16,7 +20,26 @@ use openvamp_desktop::mixer::{
 
 use crate::screen::Perform;
 use crate::theme;
-use crate::ui::OneLine;
+use crate::ui::{OneLine, button, icon};
+
+/// The narrowest a stem strip gets before the strips scroll; wider
+/// windows share the width between them.
+const STEM_STRIP_MIN_WIDTH: f32 = 76.0;
+
+/// The narrowest a bus or master strip gets.
+const BUS_STRIP_MIN_WIDTH: f32 = 92.0;
+
+/// A fader's width: the cap and some room around it to grab.
+const FADER_WIDTH: f32 = 36.0;
+
+/// A stem's meter slot's width.
+const STEM_METER_WIDTH: f32 = 5.0;
+
+/// The width of each of a bus's two meter slots (left and right).
+const BUS_METER_WIDTH: f32 = 6.0;
+
+/// The opacity of a control that does nothing now.
+const DISABLED_OPACITY: f32 = 0.45;
 
 /// What a fader sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,17 +122,19 @@ pub fn no_mixer() -> impl IntoElement {
 
 /// The Mixer screen.
 pub fn mixer(view: &MixerScreen, cx: &mut Context<Perform>) -> impl IntoElement {
-    let strips: Vec<AnyElement> = match view.layer {
-        Layer::Stems => view
-            .stems
-            .iter()
-            .map(|stem| stem_strip(stem, view.bus_menu == Some(stem.index), cx))
-            .collect(),
+    let (strips, gap): (Vec<AnyElement>, f32) = match view.layer {
+        Layer::Stems => (
+            view.stems
+                .iter()
+                .map(|stem| stem_strip(stem, view.bus_menu == Some(stem.index), cx))
+                .collect(),
+            6.,
+        ),
         Layer::Buses => {
             let mut strips: Vec<AnyElement> =
                 view.buses.iter().map(|bus| bus_strip(bus, cx)).collect();
             strips.push(master_strip(&view.master, cx));
-            strips
+            (strips, 8.)
         }
     };
     div()
@@ -149,15 +174,19 @@ pub fn mixer(view: &MixerScreen, cx: &mut Context<Perform>) -> impl IntoElement 
                         .flex_1()
                         .min_h_0()
                         .flex()
-                        .gap(px(6.))
+                        .gap(px(gap))
+                        .pb(px(6.))
                         .overflow_x_scroll()
                         .children(strips),
                 ),
         )
 }
 
+/// The song, its place in the setlist, the arrangement, the time,
+/// play/pause and the mix's two buttons.
 fn header(view: &MixerScreen, cx: &mut Context<Perform>) -> impl IntoElement {
     let reset = action_button("mixer-reset", cx, MixerAction::Reset)
+        .flex_none()
         .h(px(44.))
         .px(px(14.))
         .rounded(px(10.))
@@ -166,26 +195,49 @@ fn header(view: &MixerScreen, cx: &mut Context<Perform>) -> impl IntoElement {
         .border_color(theme::border())
         .font_weight(FontWeight::SEMIBOLD)
         .text_size(px(14.))
-        .when(!view.can_reset, |button| button.opacity(0.4))
+        .whitespace_nowrap()
+        .when(!view.can_reset, |button| button.opacity(DISABLED_OPACITY))
         .child("Reset to song mix");
     let save = action_button("mixer-save", cx, MixerAction::Save)
+        .flex_none()
         .h(px(44.))
         .px(px(14.))
         .rounded(px(10.))
+        .bg(theme::text())
+        .text_color(theme::on_fill())
         .font_weight(FontWeight::BOLD)
         .text_size(px(14.))
-        .map(|button| {
-            if view.can_save {
-                button.bg(theme::text()).text_color(theme::on_fill())
-            } else {
-                button
-                    .bg(theme::raised())
-                    .text_color(theme::text_faint())
-                    .border_1()
-                    .border_color(theme::border())
-            }
-        })
+        .whitespace_nowrap()
+        .when(!view.can_save, |button| button.opacity(DISABLED_OPACITY))
         .child("Save mix to arrangement");
+    // Drawn as the design's dropdown; the app cannot switch arrangements
+    // yet, so it picks nothing.
+    let arrangement = div()
+        .flex_none()
+        .h(px(32.))
+        .px(px(10.))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .rounded(px(8.))
+        .bg(theme::raised())
+        .border_1()
+        .border_color(theme::border())
+        .text_size(px(13.))
+        .whitespace_nowrap()
+        .child(view.arrangement.clone())
+        .child(icon("down", theme::text(), 14.));
+    let play = button("mixer-play", cx, Intent::Ui(UiAction::TogglePlay))
+        .w(px(56.))
+        .h(px(48.))
+        .justify_center()
+        .rounded(px(12.))
+        .bg(theme::accent())
+        .child(icon(
+            if view.playing { "pause" } else { "play" },
+            theme::on_fill(),
+            24.,
+        ));
     div()
         .flex_none()
         .h(px(72.))
@@ -199,7 +251,7 @@ fn header(view: &MixerScreen, cx: &mut Context<Perform>) -> impl IntoElement {
         .border_color(theme::border())
         .child(
             div()
-                .flex_1()
+                .flex_initial()
                 .min_w_0()
                 .flex()
                 .flex_col()
@@ -211,70 +263,108 @@ fn header(view: &MixerScreen, cx: &mut Context<Perform>) -> impl IntoElement {
                         .font_weight(FontWeight::BOLD)
                         .child(view.title.clone()),
                 )
-                .child(
+                .children(view.position.clone().map(|position| {
                     div()
                         .one_line()
                         .text_size(px(13.))
                         .text_color(theme::text_muted())
-                        .child(view.arrangement.clone()),
+                        .child(position)
+                })),
+        )
+        .child(arrangement)
+        .child(div().flex_1())
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_baseline()
+                .whitespace_nowrap()
+                .font_family(theme::MONO)
+                .child(
+                    div()
+                        .text_size(px(20.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(view.time.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .text_color(theme::text_faint())
+                        .child(format!("\u{a0}/ {}", view.total)),
                 ),
         )
+        .child(play)
         .child(reset)
         .child(save)
 }
 
+/// The Buses | Stems control, and the stems' summary and bus legend or
+/// the device's outputs.
 fn toolbar(view: &MixerScreen, cx: &mut Context<Perform>) -> impl IntoElement {
-    let summary = match view.layer {
-        Layer::Stems => view.summary.clone(),
-        Layer::Buses => view.outputs.clone(),
-    };
-    div()
-        .flex_none()
-        .flex()
-        .items_center()
-        .gap(px(14.))
-        .child(
-            div()
-                .flex()
-                .p(px(3.))
-                .rounded(px(10.))
-                .bg(theme::bg())
-                .child(segment(
-                    view.layer,
-                    "layer-buses",
-                    "Buses",
-                    Layer::Buses,
-                    cx,
-                ))
-                .child(segment(
-                    view.layer,
-                    "layer-stems",
-                    "Stems",
-                    Layer::Stems,
-                    cx,
-                )),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .one_line()
-                .text_size(px(14.))
-                .text_color(theme::text_muted())
-                .child(summary),
-        )
-        .when(view.layer == Layer::Stems, |toolbar| {
-            toolbar.child(div().flex().gap(px(10.)).children(Bus::ALL.map(|bus| {
+    let toolbar = div().flex_none().flex().items_center().gap(px(12.)).child(
+        div()
+            .flex_none()
+            .flex()
+            .gap(px(2.))
+            .p(px(3.))
+            .rounded(px(10.))
+            .bg(theme::bg())
+            .border_1()
+            .border_color(theme::border())
+            .child(segment(
+                view.layer,
+                "layer-buses",
+                "Buses",
+                Layer::Buses,
+                cx,
+            ))
+            .child(segment(
+                view.layer,
+                "layer-stems",
+                "Stems",
+                Layer::Stems,
+                cx,
+            )),
+    );
+    match view.layer {
+        Layer::Stems => toolbar
+            .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(5.))
-                    .text_size(px(12.))
+                    .flex_1()
+                    .min_w_0()
+                    .one_line()
+                    .text_size(px(14.))
                     .text_color(theme::text_muted())
-                    .child(div().size(px(10.)).rounded(px(3.)).bg(theme::bus(bus)))
-                    .child(bus.name())
-            })))
-        })
+                    .child(view.summary.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .gap(px(14.))
+                    .children(Bus::ALL.map(|bus| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_size(px(12.))
+                            .text_color(theme::text_muted())
+                            .child(div().size(px(10.)).rounded(px(3.)).bg(theme::bus(bus)))
+                            .child(bus.name())
+                    })),
+            ),
+        Layer::Buses => toolbar.child(div().flex_1()).child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(13.))
+                .text_color(theme::text_muted())
+                .child(icon("output-ports", theme::text_muted(), 16.))
+                .child(view.outputs.clone()),
+        ),
+    }
 }
 
 /// One side of the Buses | Stems control.
@@ -289,7 +379,7 @@ fn segment(
     action_button(id, cx, MixerAction::ShowLayer(layer))
         .h(px(30.))
         .px(px(14.))
-        .rounded(px(8.))
+        .rounded(px(7.))
         .text_size(px(13.))
         .font_weight(FontWeight::SEMIBOLD)
         .when(on, |item| {
@@ -299,33 +389,45 @@ fn segment(
         .child(label)
 }
 
-/// A strip's frame: the bus color bar on top.
-fn strip_frame(color: gpui::Rgba, width: f32) -> Div {
+/// A strip's frame: the bus color bar on top, `bar` points tall. Strips
+/// share the row's width equally, never narrower than `min_width`; past
+/// that the row scrolls.
+fn strip_frame(color: Rgba, min_width: f32, bar: f32) -> Div {
     div()
-        .w(px(width))
-        .flex_none()
+        .flex_1()
+        .min_w(px(min_width))
         .flex()
         .flex_col()
         .items_center()
-        .gap(px(8.))
-        .pb(px(10.))
         .rounded(px(10.))
         .bg(theme::strip())
         .border_1()
         .border_color(theme::strip_border())
         .overflow_hidden()
-        .child(div().w_full().h(px(5.)).bg(color))
+        .child(div().flex_none().w_full().h(px(bar)).bg(color))
+}
+
+/// An empty meter slot `width` points wide, the height of the fader beside
+/// it: the engine reports no levels yet, so nothing fills it.
+fn meter_slot(width: f32) -> Div {
+    div()
+        .flex_none()
+        .w(px(width))
+        .rounded(px(3.))
+        .bg(theme::bg())
 }
 
 fn stem_strip(stem: &StemStrip, menu: bool, cx: &mut Context<Perform>) -> AnyElement {
     let index = stem.index;
+    let color = theme::bus(stem.bus);
     let chip = action_button(
         ElementId::Name(format!("bus-chip-{index}").into()),
         cx,
         MixerAction::OpenBusMenu(index),
     )
+    .flex_none()
     .h(px(24.))
-    .max_w(px(80.))
+    .max_w_full()
     .px(px(6.))
     .rounded(px(6.))
     .bg(theme::raised())
@@ -341,21 +443,25 @@ fn stem_strip(stem: &StemStrip, menu: bool, cx: &mut Context<Perform>) -> AnyEle
     let body: AnyElement = if menu {
         bus_choices(stem, cx).into_any_element()
     } else {
-        fader(FaderTarget::Stem(index), stem.fader, false, cx)
-            .when(stem.silenced, |fader| fader.opacity(0.4))
+        fader_zone(3.)
+            .when(stem.silenced, |zone| zone.opacity(0.4))
+            .child(meter_slot(STEM_METER_WIDTH))
+            .child(fader(FaderTarget::Stem(index), stem.fader, false, cx))
             .into_any_element()
     };
-    strip_frame(theme::bus(stem.bus), 84.)
+    strip_frame(color, STEM_STRIP_MIN_WIDTH, 5.)
+        .gap(px(8.))
+        .pb(px(10.))
+        .child(icon(stem.icon, color, 24.))
         .child(
             div()
                 .w_full()
-                .px(px(6.))
+                .px(px(4.))
                 .one_line()
+                .text_center()
                 .font_family(theme::CONDENSED)
                 .text_size(px(14.))
                 .font_weight(FontWeight::BOLD)
-                .flex()
-                .justify_center()
                 .child(stem.name.clone()),
         )
         .child(chip)
@@ -364,7 +470,7 @@ fn stem_strip(stem: &StemStrip, menu: bool, cx: &mut Context<Perform>) -> AnyEle
         .child(
             div()
                 .flex()
-                .gap(px(6.))
+                .gap(px(4.))
                 .child(toggle(
                     ElementId::Name(format!("mute-{index}").into()),
                     "M",
@@ -383,6 +489,12 @@ fn stem_strip(stem: &StemStrip, menu: bool, cx: &mut Context<Perform>) -> AnyEle
                 )),
         )
         .into_any_element()
+}
+
+/// The row that holds a strip's meter slots and its fader, as tall as the
+/// strip leaves; `gap` points between them.
+fn fader_zone(gap: f32) -> Div {
+    div().flex_1().min_h(px(120.)).flex().gap(px(gap))
 }
 
 /// A stem's bus choices: the rules table's ("Default") and every bus.
@@ -441,49 +553,104 @@ fn bus_choice(
 }
 
 fn bus_strip(bus: &BusStrip, cx: &mut Context<Perform>) -> AnyElement {
-    strip_frame(theme::bus(bus.bus), 96.)
-        .child(
-            div()
-                .w_full()
-                .px(px(6.))
-                .one_line()
-                .flex()
-                .justify_center()
-                .text_size(px(12.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(SharedString::from(bus.name.to_uppercase())),
-        )
+    let color = theme::bus(bus.bus);
+    bus_frame(color, theme::strip(), theme::strip_border())
+        .child(bus_strip_icon(bus.icon, color))
+        .child(bus_name(bus.name))
         .child(output_label(&bus.output))
         .child(
-            fader(FaderTarget::Bus(bus.bus), bus.fader, false, cx)
-                .when(bus.mute, |fader| fader.opacity(0.45)),
+            bus_meters_and_fader(FaderTarget::Bus(bus.bus), bus.fader, false, cx)
+                .when(bus.mute, |zone| zone.opacity(DISABLED_OPACITY)),
         )
         .child(readout(&bus.db))
-        .child(toggle(
-            ElementId::Name(format!("bus-mute-{}", bus.bus.id()).into()),
-            "M",
-            bus.mute,
-            theme::text(),
-            MixerAction::ToggleBusMute(bus.bus),
-            cx,
-        ))
+        .child(
+            action_button(
+                ElementId::Name(format!("bus-mute-{}", bus.bus.id()).into()),
+                cx,
+                MixerAction::ToggleBusMute(bus.bus),
+            )
+            .flex_none()
+            .w(px(48.))
+            .h(px(34.))
+            .gap(px(4.))
+            .rounded(px(8.))
+            .font_family(theme::CONDENSED)
+            .text_size(px(14.))
+            .font_weight(FontWeight::BOLD)
+            .map(|button| {
+                let color = if bus.mute {
+                    theme::on_fill()
+                } else {
+                    theme::text()
+                };
+                lit(button, bus.mute, theme::text())
+                    .child(icon("mute", color, 14.))
+                    .child("M")
+            }),
+        )
         .into_any_element()
 }
 
 fn master_strip(master: &MasterStrip, cx: &mut Context<Perform>) -> AnyElement {
-    strip_frame(theme::text(), 96.)
-        .bg(theme::raised())
+    bus_frame(theme::text(), theme::raised(), theme::chip_border())
+        .child(bus_strip_icon("speaker", theme::text()))
+        .child(bus_name("Master"))
+        .child(output_label(&master.output))
+        .child(bus_meters_and_fader(
+            FaderTarget::Master,
+            master.fader,
+            true,
+            cx,
+        ))
+        .child(readout(&master.db))
+        // The room of a bus's mute, so the faders line up.
+        .child(div().flex_none().h(px(34.)))
+        .into_any_element()
+}
+
+/// A bus or master strip's frame, on `bg` within `border`.
+fn bus_frame(color: Rgba, bg: Rgba, border: Rgba) -> Div {
+    strip_frame(color, BUS_STRIP_MIN_WIDTH, 4.)
+        .gap(px(6.))
+        .pb(px(8.))
+        .bg(bg)
+        .border_color(border)
+}
+
+/// A bus or master strip's icon, a little below the bar.
+fn bus_strip_icon(name: &'static str, color: Rgba) -> impl IntoElement {
+    div().flex_none().mt(px(4.)).child(icon(name, color, 26.))
+}
+
+fn bus_name(name: &str) -> impl IntoElement {
+    div()
+        .w_full()
+        .px(px(4.))
+        .one_line()
+        .text_center()
+        .font_family(theme::CONDENSED)
+        .text_size(px(12.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(SharedString::from(name.to_uppercase()))
+}
+
+/// A bus's two meter slots, left and right, and its fader.
+fn bus_meters_and_fader(
+    target: FaderTarget,
+    position: f32,
+    master: bool,
+    cx: &mut Context<Perform>,
+) -> Div {
+    fader_zone(7.)
         .child(
             div()
-                .text_size(px(12.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .child("MASTER"),
+                .flex_none()
+                .flex()
+                .gap(px(3.))
+                .child(meter_slot(BUS_METER_WIDTH))
+                .child(meter_slot(BUS_METER_WIDTH)),
         )
-        .child(output_label(&master.output))
-        .child(fader(FaderTarget::Master, master.fader, true, cx))
-        .child(readout(&master.db))
-        .child(div().h(px(34.)))
-        .into_any_element()
+        .child(fader(target, position, master, cx))
 }
 
 fn output_label(output: &str) -> impl IntoElement {
@@ -491,6 +658,7 @@ fn output_label(output: &str) -> impl IntoElement {
         .font_family(theme::MONO)
         .text_size(px(11.))
         .text_color(theme::text_muted())
+        .whitespace_nowrap()
         .child(output.to_owned())
 }
 
@@ -506,28 +674,31 @@ fn toggle(
     id: ElementId,
     label: &'static str,
     on: bool,
-    color: gpui::Rgba,
+    color: Rgba,
     action: MixerAction,
     cx: &mut Context<Perform>,
 ) -> Stateful<Div> {
-    action_button(id, cx, action)
+    let button = action_button(id, cx, action)
+        .flex_none()
         .size(px(30.))
         .rounded(px(7.))
         .font_family(theme::CONDENSED)
         .text_size(px(13.))
-        .font_weight(FontWeight::BOLD)
-        .map(|button| {
-            if on {
-                button.bg(color).text_color(theme::on_fill())
-            } else {
-                button
-                    .bg(theme::raised())
-                    .border_1()
-                    .border_color(theme::border())
-                    .text_color(theme::text_muted())
-            }
-        })
-        .child(label)
+        .font_weight(FontWeight::BOLD);
+    lit(button, on, color).child(label)
+}
+
+/// A mute or solo button's look: filled in `color` when on, else raised.
+fn lit(button: Stateful<Div>, on: bool, color: Rgba) -> Stateful<Div> {
+    if on {
+        button.bg(color).text_color(theme::on_fill())
+    } else {
+        button
+            .bg(theme::raised())
+            .border_1()
+            .border_color(theme::border())
+            .text_color(theme::text())
+    }
 }
 
 /// A vertical fader for `target` with its cap at `position` (0.0 at the
@@ -546,9 +717,8 @@ fn fader(
     };
     div()
         .id(target.id())
-        .flex_1()
-        .min_h(px(120.))
-        .w(px(36.))
+        .flex_none()
+        .w(px(FADER_WIDTH))
         // Room for the cap at both ends.
         .py(px(FADER_PADDING))
         .cursor_pointer()

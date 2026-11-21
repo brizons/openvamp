@@ -2,7 +2,10 @@
 //! on the app's `FakeOutput`; each control sends its mixer command, the view
 //! follows the session's mix, "Save mix to arrangement" writes `mix.json`
 //! only when the mix changed, "Reset to song mix" returns every stem to its
-//! defaults, and bus and master changes are saved once they settle. Every
+//! defaults, and bus and master changes are saved once they settle. The
+//! header and the strips show what the design canvas's Mixer artboard
+//! shows: the song's place in a setlist, its arrangement, the time, the
+//! play/pause state, and each stem named and drawn after its part. Every
 //! folder is temporary.
 
 use std::fs;
@@ -12,28 +15,46 @@ use std::time::{Duration, Instant};
 use app::SessionOptions;
 use app::testing::FakeOutput;
 use domain::{
-    Arrangement, ArrangementMix, Bus, BusSettings, Routing, SectionMarker, SectionType,
-    SongPackage, Stem, StemRole, TempoPoint, TimeSignaturePoint, Volume,
+    Arrangement, ArrangementMix, Bus, BusSettings, Routing, SectionMarker, SectionType, Setlist,
+    SetlistItem, SongItem, SongPackage, Stem, StemRole, TempoPoint, TimeSignaturePoint, Volume,
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
-use library::ConfigStore;
+use library::{ConfigStore, Library};
+use openvamp_desktop::action::UiAction;
 use openvamp_desktop::audio_settings::AudioSettings;
 use openvamp_desktop::mixer::{
-    BUS_SAVE_DELAY, Layer, MixerAction, MixerPage, db_text, fader_position, fader_volume,
+    BUS_SAVE_DELAY, Layer, MixerAction, MixerPage, bus_icon, db_text, fader_position, fader_volume,
+    stem_icon, stem_name,
 };
 use openvamp_desktop::show::{Show, Source, replace};
 
 const RATE: u32 = 8_000;
 
+/// How long a test waits for the audio and disk threads.
+const WAIT: Duration = Duration::from_secs(10);
+
 /// A two-bar song with a drums and a keys track and a guide.
 fn write_song(dir: &Path) {
+    write_song_titled(dir, "Rivers Rise");
+}
+
+/// [`write_song`] titled `title`.
+fn write_song_titled(dir: &Path, title: &str) {
+    write_song_with(
+        dir,
+        title,
+        &[
+            ("drums", "drums", StemRole::Track),
+            ("keys", "keys", StemRole::Track),
+            ("guide", "guide", StemRole::Guide),
+        ],
+    );
+}
+
+/// [`write_song`] titled `title` with `stems`, each an id, a part and a
+/// role.
+fn write_song_with(dir: &Path, title: &str, stems: &[(&str, &str, StemRole)]) {
     let bar = 2 * u64::from(RATE);
-    let stem = |id: &str, role| Stem {
-        id: id.to_owned(),
-        file: format!("{id}.wav"),
-        part: id.to_owned(),
-        role,
-    };
     let section = |id: &str, section_type, start| SectionMarker {
         id: id.to_owned(),
         section_type,
@@ -42,7 +63,7 @@ fn write_song(dir: &Path) {
     };
     let package = SongPackage {
         format_version: 1,
-        title: "Rivers Rise".to_owned(),
+        title: title.to_owned(),
         artist: None,
         sample_rate: RATE,
         key: None,
@@ -52,11 +73,15 @@ fn write_song(dir: &Path) {
             numerator: 4,
             denominator: 4,
         }],
-        stems: vec![
-            stem("drums", StemRole::Track),
-            stem("keys", StemRole::Track),
-            stem("guide", StemRole::Guide),
-        ],
+        stems: stems
+            .iter()
+            .map(|&(id, part, role)| Stem {
+                id: id.to_owned(),
+                file: format!("{id}.wav"),
+                part: part.to_owned(),
+                role,
+            })
+            .collect(),
         sections: vec![
             section("intro", SectionType::Intro, 0),
             section("outro", SectionType::Outro, bar),
@@ -76,7 +101,7 @@ fn write_song(dir: &Path) {
         bits_per_sample: 16,
         sample_format: SampleFormat::Int,
     };
-    for id in ["drums", "keys", "guide"] {
+    for &(id, _, _) in stems {
         let mut writer = WavWriter::create(dir.join(format!("{id}.wav")), spec).unwrap();
         for frame in 0..2 * bar {
             writer.write_sample((frame % 50) as i16 * 20).unwrap();
@@ -203,9 +228,9 @@ fn the_stems_layer_shows_every_stem_with_its_bus_level_mute_and_solo() {
     assert_eq!(
         stems,
         [
-            ("drums", Bus::Drums, true, "0.0", false, false, false),
-            ("keys", Bus::KeysPads, true, "0.0", false, false, false),
-            ("guide", Bus::ClickGuide, true, "0.0", false, false, false),
+            ("Drums", Bus::Drums, true, "0.0", false, false, false),
+            ("Keys", Bus::KeysPads, true, "0.0", false, false, false),
+            ("Guide", Bus::ClickGuide, true, "0.0", false, false, false),
         ]
     );
     assert!(!view.can_save, "nothing changed");
@@ -405,7 +430,19 @@ fn the_buses_layer_shows_each_bus_with_its_output_from_the_routing() {
     assert_eq!(bench.show.snapshot().mixer.routing, Routing::preset(8));
     assert_eq!(
         (view.master.output.as_str(), view.master.db.as_str()),
-        ("All", "0.0")
+        ("Out All", "0.0")
+    );
+    let icons: Vec<&str> = view.buses.iter().map(|bus| bus.icon).collect();
+    assert_eq!(
+        icons,
+        [
+            "headphones",
+            "drum",
+            "bass",
+            "piano",
+            "electric-guitar",
+            "mic"
+        ]
     );
 }
 
@@ -481,4 +518,187 @@ fn a_fader_drag_reads_the_cap_centre_along_the_padded_track() {
     assert_eq!(fader_drag_position(top, height, top + height + 50.0), 0.0);
     let squeezed = fader_drag_position(top, 2.0 * FADER_PADDING, top + 3.0);
     assert!((0.0..=1.0).contains(&squeezed), "no travel: {squeezed}");
+}
+
+#[test]
+fn a_strip_names_its_stem_after_the_part_in_title_case() {
+    assert_eq!(stem_name("drums", "s1"), "Drums");
+    assert_eq!(stem_name("synth bass", "s1"), "Synth Bass");
+    assert_eq!(stem_name("BGVs", "s1"), "BGVs", "capitals stay");
+    assert_eq!(stem_name("EG 1", "s1"), "EG 1");
+    assert_eq!(stem_name("eg_1", "s1"), "Eg 1", "underscores are spaces");
+    assert_eq!(stem_name("hi-hat", "s1"), "Hi-Hat");
+    assert_eq!(
+        stem_name("room mics (drums  live)", "s1"),
+        "Room Mics (Drums Live)"
+    );
+    assert_eq!(stem_name("batería", "s1"), "Batería");
+    assert_eq!(stem_name(" ", "lead_vox"), "Lead Vox", "no part: its id");
+}
+
+#[test]
+fn a_strip_draws_the_instrument_its_part_names() {
+    let track = |part: &str| stem_icon(StemRole::Track, part, "stem");
+    // The design canvas's stems and the icon it draws for each.
+    for (part, icon) in [
+        ("Click", "metronome"),
+        ("Drums", "drum"),
+        ("Perc", "maraca"),
+        ("Loop", "loop"),
+        ("Bass", "bass"),
+        ("Synth Bass", "sine"),
+        ("Keys", "piano"),
+        ("Pad", "sine"),
+        ("Strings", "violin"),
+        ("EG 1", "electric-guitar"),
+        ("AG", "acoustic-guitar"),
+        ("BGVs", "voices"),
+        ("Choir", "voices"),
+        ("FX", "sparkle"),
+        ("Hi-Hat", "drum"),
+        ("Percussion Loop 1", "maraca"),
+        ("Sequence Arp 1/8", "loop"),
+        ("Pad Ambient Swell", "sine"),
+        ("Room Mics L/R (Drums Live)", "drum"),
+        ("Lead Vocal Reference", "mic"),
+        ("Spoken Word Intro", "speech"),
+        ("Acoustic Guitar", "acoustic-guitar"),
+        ("AcGtr", "acoustic-guitar"),
+        ("Batería", "drum"),
+        ("Track 7", "note"),
+    ] {
+        assert_eq!(track(part), icon, "{part}");
+    }
+    assert_eq!(stem_icon(StemRole::Click, "Track 1", "a"), "metronome");
+    assert_eq!(stem_icon(StemRole::Guide, "Cues", "b"), "speech");
+    assert_eq!(
+        stem_icon(StemRole::Track, "Track 2", "kick_in"),
+        "drum",
+        "a part that names nothing: its id"
+    );
+    assert_eq!(bus_icon(Bus::Vocals), "mic");
+}
+
+#[test]
+fn the_stems_layer_names_and_draws_each_stem_after_its_part() {
+    let bench = Bench::new();
+
+    let view = bench.view();
+
+    let stems: Vec<(&str, &str)> = view
+        .stems
+        .iter()
+        .map(|stem| (stem.name.as_str(), stem.icon))
+        .collect();
+    assert_eq!(
+        stems,
+        [("Drums", "drum"), ("Keys", "piano"), ("Guide", "speech")]
+    );
+}
+
+#[test]
+fn the_header_shows_the_time_and_whether_the_song_plays() {
+    let fake = FakeOutput::new();
+    let mut bench = Bench::on(fake.clone());
+
+    let view = bench.view();
+    assert_eq!(
+        view.position, None,
+        "a song alone has no place in a setlist"
+    );
+    assert_eq!(view.arrangement, "Arrangement: default");
+    assert_eq!(
+        (view.time.as_str(), view.total.as_str()),
+        ("00:00", "00:04")
+    );
+    assert!(!view.playing);
+
+    bench.show.send(UiAction::TogglePlay);
+    let deadline = Instant::now() + WAIT;
+    while !bench.view().playing && Instant::now() < deadline {
+        fake.render(256);
+        bench.show.poll();
+    }
+    assert!(bench.view().playing, "play shows pause");
+}
+
+#[test]
+fn the_header_of_a_setlist_item_shows_its_place_and_the_arrangement_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path();
+    write_song_titled(&library.join("Songs/One.song"), "First Light");
+    write_song_titled(&library.join("Songs/Two.song"), "Rivers Rise");
+    let mut setlist = Setlist::new("Sunday");
+    setlist.items = ["Songs/One.song", "Songs/Two.song", "Songs/One.song"]
+        .map(|song| SetlistItem::Song(SongItem::new(song)))
+        .to_vec();
+    let entry = Library::new(library).save_setlist(&setlist).unwrap();
+    let source = Source::Setlist {
+        library: library.to_owned(),
+        file: entry.file,
+    };
+    let fake = FakeOutput::new();
+    let mut loaded = None;
+    replace(
+        &mut loaded,
+        &source,
+        &SessionOptions::default(),
+        || Box::new(fake.clone()),
+        |_| {},
+    )
+    .unwrap_or_else(|_| panic!("the setlist opens"));
+    let mut show = loaded.expect("the setlist is loaded");
+    let page = MixerPage::new();
+    assert_eq!(
+        page.view(Some(&show)).unwrap().position.as_deref(),
+        Some("Song 1 of 3")
+    );
+
+    show.send(UiAction::SelectItem(1));
+    let deadline = Instant::now() + WAIT;
+    let place = |show: &Show| page.view(Some(show)).unwrap().position;
+    while place(&show).as_deref() != Some("Song 2 of 3") && Instant::now() < deadline {
+        fake.render(256);
+        show.poll();
+    }
+
+    let view = page.view(Some(&show)).unwrap();
+    assert_eq!(view.title, "Rivers Rise");
+    assert_eq!(view.position.as_deref(), Some("Song 2 of 3"));
+    assert_eq!(
+        view.arrangement, "Arrangement: Default",
+        "the library names it"
+    );
+}
+
+#[test]
+fn stems_that_share_a_part_are_named_by_their_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let song = dir.path().join("Rivers Rise.song");
+    write_song_with(
+        &song,
+        "Rivers Rise",
+        &[
+            ("EG 1", "electric guitar", StemRole::Track),
+            ("eg_2", "Electric Guitar", StemRole::Track),
+            ("bass_di", "bass", StemRole::Track),
+        ],
+    );
+    let fake = FakeOutput::new();
+    let mut loaded = None;
+    replace(
+        &mut loaded,
+        &Source::Song(song),
+        &SessionOptions::default(),
+        || Box::new(fake.clone()),
+        |_| {},
+    )
+    .unwrap_or_else(|_| panic!("the song opens"));
+
+    let view = MixerPage::new().view(loaded.as_ref()).unwrap();
+
+    let names: Vec<&str> = view.stems.iter().map(|stem| stem.name.as_str()).collect();
+    assert_eq!(names, ["EG 1", "Eg 2", "Bass"]);
+    let icons: Vec<&str> = view.stems.iter().map(|stem| stem.icon).collect();
+    assert_eq!(icons, ["electric-guitar", "electric-guitar", "bass"]);
 }

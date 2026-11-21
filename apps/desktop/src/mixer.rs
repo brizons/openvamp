@@ -1,19 +1,22 @@
 //! The Mixer screen without a window (S3, F7): what its two layers show of
 //! the song playing (a setlist's current item), and the `app` command each
-//! control sends. The stems layer has a strip per stem (its bus, level,
-//! mute and solo), the buses layer a strip per bus (the output it plays on,
-//! level, mute) and the master. The song's mix is saved to its `mix.json`
-//! on request; bus and master changes are global and saved to the
+//! control sends. The header shows the song, its place in a setlist, its
+//! arrangement, the time and whether it plays. The stems layer has a strip
+//! per stem (named and drawn after its part, its bus, level, mute and
+//! solo), the buses layer a strip per bus (the output it plays on, level,
+//! mute) and the master. The song's mix is saved to its `mix.json` on
+//! request; bus and master changes are global and saved to the
 //! configuration folder once they settle.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use app::Command;
-use domain::{ArrangementMix, Bus, Destination, MAX_VOLUME_DB, Volume};
+use domain::{ArrangementMix, Bus, Destination, MAX_VOLUME_DB, SetlistItem, StemRole, Volume};
 
 use crate::audio_settings::AudioSettings;
 use crate::show::Show;
+use crate::view::PerformView;
 
 /// How long bus and master changes wait for the next one before they are
 /// saved: a fader drag is saved once, when it stops.
@@ -94,6 +97,317 @@ pub fn output_text(destination: Destination) -> String {
     }
 }
 
+/// A stem's name on its strip: its part, else its id when the part is
+/// blank, in [`title_case`] ("synth bass" is "Synth Bass", "BGVs" stays
+/// "BGVs", "hi-hat" is "Hi-Hat"). The screen names a stem whose part
+/// another stem shares by its id.
+pub fn stem_name(part: &str, id: &str) -> String {
+    title_case(if part.trim().is_empty() { id } else { part })
+}
+
+/// `name` with underscores as spaces, single spaces between words, and
+/// every word starting with a capital; the other letters stay as written.
+fn title_case(name: &str) -> String {
+    let words = name.replace('_', " ");
+    let mut title = String::with_capacity(words.len());
+    for word in words.split_whitespace() {
+        if !title.is_empty() {
+            title.push(' ');
+        }
+        // A letter starts a word unless a letter, digit or apostrophe
+        // comes before it: "hi-hat" and "(drums" capitalize too.
+        let mut in_word = false;
+        for c in word.chars() {
+            if c.is_alphabetic() && !in_word {
+                title.extend(c.to_uppercase());
+            } else {
+                title.push(c);
+            }
+            in_word = c.is_alphanumeric() || c == '\'';
+        }
+    }
+    title
+}
+
+/// The icon (a file of `assets/icons` without `.svg`) a stem's strip
+/// draws, after the design canvas's Mixer artboard: the metronome for a
+/// click, the speech bubble for a guide, else the instrument its part names
+/// ([`INSTRUMENTS`]), else the one its id names, else a note.
+pub fn stem_icon(role: StemRole, part: &str, id: &str) -> &'static str {
+    match role {
+        StemRole::Click => "metronome",
+        StemRole::Guide => "speech",
+        StemRole::Track => instrument_icon(part)
+            .or_else(|| instrument_icon(id))
+            .unwrap_or("note"),
+    }
+}
+
+/// The icon a bus's strip draws, after the design canvas's bus mixer.
+pub fn bus_icon(bus: Bus) -> &'static str {
+    match bus {
+        Bus::ClickGuide => "headphones",
+        Bus::Drums => "drum",
+        Bus::Bass => "bass",
+        Bus::KeysPads => "piano",
+        Bus::Guitars => "electric-guitar",
+        Bus::Vocals => "mic",
+    }
+}
+
+/// How much a word of [`INSTRUMENTS`] says about a stem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Weight {
+    /// The word names an instrument: the first one decides.
+    Instrument,
+    /// The word is generic (loop, fx, acoustic): it decides only when no
+    /// instrument is named.
+    Generic,
+}
+
+/// The words that pick a stem's icon, lowercase without accents, in
+/// English and Spanish, after the buses' rules table (`domain::bus`).
+/// Unlike that table, the first instrument word decides: a part names the
+/// instrument first ("Synth Bass" is a synth, "Bass DI" a bass).
+const INSTRUMENTS: &[(&[&str], &str, Weight)] = &[
+    (
+        &[
+            "click",
+            "clk",
+            "metronome",
+            "count",
+            "clic",
+            "metronomo",
+            "cuenta",
+        ],
+        "metronome",
+        Weight::Instrument,
+    ),
+    (&["guide", "cue", "guia"], "speech", Weight::Instrument),
+    (
+        &[
+            "drum",
+            "kit",
+            "kick",
+            "kik",
+            "snare",
+            "snr",
+            "hat",
+            "hihat",
+            "hh",
+            "tom",
+            "overhead",
+            "cymbal",
+            "timpani",
+            "bateria",
+            "bombo",
+            "caja",
+            "redoblante",
+            "platillo",
+        ],
+        "drum",
+        Weight::Instrument,
+    ),
+    (
+        &[
+            "perc",
+            "percussion",
+            "percusion",
+            "shaker",
+            "tamb",
+            "tambourine",
+            "conga",
+            "bongo",
+            "cajon",
+            "timbale",
+            "cowbell",
+            "clap",
+            "snap",
+        ],
+        "maraca",
+        Weight::Instrument,
+    ),
+    (&["bass", "bassline", "bajo"], "bass", Weight::Instrument),
+    (
+        &[
+            "synth",
+            "synthbass",
+            "sub",
+            "subbass",
+            "pad",
+            "sinte",
+            "sintetizador",
+            "sintetizadores",
+            "colchon",
+            "colchones",
+        ],
+        "sine",
+        Weight::Instrument,
+    ),
+    (
+        &[
+            "keys",
+            "keyboard",
+            "kbd",
+            "piano",
+            "pno",
+            "rhodes",
+            "wurli",
+            "wurlitzer",
+            "organ",
+            "hammond",
+            "ep",
+            "clav",
+            "mellotron",
+            "accordion",
+            "teclado",
+            "organo",
+        ],
+        "piano",
+        Weight::Instrument,
+    ),
+    (
+        &[
+            "string",
+            "orchestra",
+            "orch",
+            "violin",
+            "viola",
+            "cello",
+            "cuerda",
+            "violines",
+            "chelo",
+        ],
+        "violin",
+        Weight::Instrument,
+    ),
+    (
+        &["guitar", "gtr", "eg", "guitarra", "requinto"],
+        "electric-guitar",
+        Weight::Instrument,
+    ),
+    (
+        &[
+            "ag", "banjo", "mandolin", "mando", "ukulele", "uke", "dobro", "charango",
+        ],
+        "acoustic-guitar",
+        Weight::Instrument,
+    ),
+    (
+        &["bgv", "bv", "choir", "coro", "voces"],
+        "voices",
+        Weight::Instrument,
+    ),
+    (
+        &["vocal", "vox", "voc", "voice", "singer", "voz"],
+        "mic",
+        Weight::Instrument,
+    ),
+    (&["room"], "drum", Weight::Generic),
+    (
+        &["loop", "seq", "sequence", "secuencia", "beat", "arp"],
+        "loop",
+        Weight::Generic,
+    ),
+    (
+        &[
+            "ambient",
+            "ambience",
+            "atmos",
+            "atmosphere",
+            "texture",
+            "drone",
+            "swell",
+        ],
+        "sine",
+        Weight::Generic,
+    ),
+    (
+        &["fx", "sfx", "riser", "sweep", "impact", "noise"],
+        "sparkle",
+        Weight::Generic,
+    ),
+    (&ACOUSTIC, "acoustic-guitar", Weight::Generic),
+    (
+        &["electric", "electrica", "electrico"],
+        "electric-guitar",
+        Weight::Generic,
+    ),
+    (
+        &["harmony", "harmonies", "armonia"],
+        "voices",
+        Weight::Generic,
+    ),
+    (&["spoken", "speech"], "speech", Weight::Generic),
+];
+
+/// Words that make a guitar acoustic ("Acoustic Guitar", "AcGtr").
+const ACOUSTIC: [&str; 6] = ["acoustic", "ac", "acustica", "acustico", "nylon", "steel"];
+
+/// The icon of the instrument `name` names: its first instrument word's,
+/// else its first generic word's; `None` when it names none.
+fn instrument_icon(name: &str) -> Option<&'static str> {
+    let words = icon_words(name);
+    let acoustic = words.iter().any(|word| ACOUSTIC.contains(&word.as_str()));
+    let mut generic = None;
+    for word in &words {
+        match icon_rule(word) {
+            Some(("electric-guitar", Weight::Instrument)) if acoustic => {
+                return Some("acoustic-guitar");
+            }
+            Some((icon, Weight::Instrument)) => return Some(icon),
+            Some((icon, Weight::Generic)) => {
+                generic.get_or_insert(icon);
+            }
+            None => {}
+        }
+    }
+    generic
+}
+
+/// The icon and weight of `word`, also tried without a final `s`
+/// ("Strings", "BGVs").
+fn icon_rule(word: &str) -> Option<(&'static str, Weight)> {
+    let find = |word: &str| {
+        INSTRUMENTS
+            .iter()
+            .find(|(words, _, _)| words.contains(&word))
+            .map(|&(_, icon, weight)| (icon, weight))
+    };
+    find(word).or_else(|| word.strip_suffix('s').and_then(find))
+}
+
+/// The lowercase words of `name` without accents: runs of letters, also
+/// split where a lowercase letter meets an uppercase one ("AcGtr" is "ac
+/// gtr"), as the buses' rules table reads names.
+fn icon_words(name: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut previous_lowercase = false;
+    for c in name.chars() {
+        let starts_word = !c.is_alphabetic() || (previous_lowercase && c.is_uppercase());
+        if starts_word && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        if c.is_alphabetic() {
+            current.extend(c.to_lowercase().map(|c| match c {
+                'á' | 'à' | 'ä' | 'â' => 'a',
+                'é' | 'è' | 'ë' | 'ê' => 'e',
+                'í' | 'ì' | 'ï' | 'î' => 'i',
+                'ó' | 'ò' | 'ö' | 'ô' => 'o',
+                'ú' | 'ù' | 'ü' | 'û' => 'u',
+                'ñ' => 'n',
+                other => other,
+            }));
+        }
+        previous_lowercase = c.is_lowercase();
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
 /// The two layers of the Mixer screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
@@ -108,8 +422,10 @@ pub enum Layer {
 pub struct StemStrip {
     /// Index of the stem, in package order; its commands take it.
     pub index: usize,
-    /// The stem's name.
+    /// The stem's name ([`stem_name`]).
     pub name: String,
+    /// The icon its strip draws ([`stem_icon`]).
+    pub icon: &'static str,
     /// The bus it plays on.
     pub bus: Bus,
     /// Whether that is the bus the rules table gives it.
@@ -136,6 +452,8 @@ pub struct BusStrip {
     pub bus: Bus,
     /// Its name.
     pub name: &'static str,
+    /// The icon its strip draws ([`bus_icon`]).
+    pub icon: &'static str,
     /// Where it plays, from the routing in use ([`output_text`]).
     pub output: String,
     /// Its volume.
@@ -151,7 +469,7 @@ pub struct BusStrip {
 /// The master strip.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MasterStrip {
-    /// Where it plays: "All".
+    /// Where it plays: "Out All".
     pub output: String,
     /// Its volume.
     pub volume: Volume,
@@ -166,8 +484,19 @@ pub struct MasterStrip {
 pub struct MixerScreen {
     /// The song's title.
     pub title: String,
-    /// The arrangement whose mix it is, such as "Arrangement: default".
+    /// Its place in the setlist playing, such as "Song 2 of 5"; `None` for
+    /// a song opened alone.
+    pub position: Option<String>,
+    /// The arrangement whose mix it is, by the name the library gives it,
+    /// such as "Arrangement: Default"; by its id for a song opened alone,
+    /// whose session knows no name: "Arrangement: default".
     pub arrangement: String,
+    /// Time in the arrangement, such as "01:25".
+    pub time: String,
+    /// The arrangement's length, such as "05:14".
+    pub total: String,
+    /// Whether the song plays (or starts): play/pause shows pause.
+    pub playing: bool,
     /// The layer on show.
     pub layer: Layer,
     /// Such as "8 stems · tap a bus to reassign".
@@ -395,6 +724,17 @@ impl MixerPage {
         let show = show?;
         let mixer = &show.snapshot().mixer;
         let song = show.song();
+        // Stems that share a part ("EG 1" and "EG 2" both play "electric
+        // guitar") are named by their ids, which tell them apart.
+        let shares_part = |part: &str| {
+            let part = part.trim().to_lowercase();
+            mixer
+                .stems
+                .iter()
+                .filter(|other| other.part.trim().to_lowercase() == part)
+                .count()
+                > 1
+        };
         let stems: Vec<StemStrip> = mixer
             .stems
             .iter()
@@ -403,7 +743,12 @@ impl MixerPage {
                 let mix = mixer.mix.stem(&view.id);
                 StemStrip {
                     index,
-                    name: view.id.clone(),
+                    name: if shares_part(&view.part) {
+                        title_case(&view.id)
+                    } else {
+                        stem_name(&view.part, &view.id)
+                    },
+                    icon: stem_icon(view.role, &view.part, &view.id),
                     bus: view.bus,
                     default_bus: mix.bus_override().is_none(),
                     volume: mix.volume,
@@ -422,6 +767,7 @@ impl MixerPage {
                 BusStrip {
                     bus,
                     name: bus.name(),
+                    icon: bus_icon(bus),
                     output: output_text(mixer.routing.destination(bus)),
                     volume: level.volume,
                     db: db_text(level.volume),
@@ -445,9 +791,21 @@ impl MixerPage {
             .chain(self.mix_problem.clone())
             .chain(self.bus_problem.clone())
             .collect();
+        // The Perform screen's clock, "01:25 / 05:14", read in two parts.
+        let perform = PerformView::new(show.snapshot(), song);
+        let (time, total) = perform
+            .clock
+            .split_once(" / ")
+            .unwrap_or((perform.clock.as_str(), ""));
         Some(MixerScreen {
             title: song.title.clone(),
-            arrangement: format!("Arrangement: {}", song.arrangement),
+            position: show
+                .setlist()
+                .map(|setlist| format!("Song {}", setlist.view().position)),
+            arrangement: format!("Arrangement: {}", arrangement_name(show)),
+            time: time.to_owned(),
+            total: total.to_owned(),
+            playing: perform.transport.playing,
             layer: self.layer,
             summary: format!(
                 "{} stem{} · tap a bus to reassign",
@@ -460,7 +818,7 @@ impl MixerPage {
             stems,
             buses,
             master: MasterStrip {
-                output: "All".to_owned(),
+                output: "Out All".to_owned(),
                 volume: master,
                 db: db_text(master),
                 fader: fader_position(master),
@@ -469,6 +827,30 @@ impl MixerPage {
             bus_menu: self.bus_menu,
         })
     }
+}
+
+/// The name of the arrangement `show` plays: as the library's listing names
+/// it for a setlist's song, else its id.
+fn arrangement_name(show: &Show) -> String {
+    let playing = &show.song().arrangement;
+    show.setlist()
+        .and_then(|setlist| {
+            let item = setlist
+                .session
+                .info()
+                .items
+                .get(setlist.snapshot.setlist.current)?;
+            let SetlistItem::Song(song) = &item.item else {
+                return None;
+            };
+            let entry = setlist.catalog.song(&song.song)?;
+            entry
+                .arrangements
+                .iter()
+                .find(|arrangement| &arrangement.id == playing)
+                .map(|arrangement| arrangement.name.clone())
+        })
+        .unwrap_or_else(|| playing.clone())
 }
 
 /// A song's mix not saved yet, carried into a session that opens the same
