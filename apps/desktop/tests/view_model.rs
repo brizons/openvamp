@@ -137,7 +137,6 @@ fn song_map_playhead_follows_the_position_in_the_arrangement() {
     // 2 s of intro plus 0.5 s into the verse, of 7 s.
     let view = PerformView::new(&snapshot(), &song());
     close(view.map.playhead, 2.5 / 7.0);
-    assert_eq!(view.clock, "00:02 / 00:07");
     assert_eq!(view.bar_beat, "Bar 3 · beat 2");
 
     // A repeated or jumped-to section places the playhead by position, not
@@ -1273,6 +1272,15 @@ fn the_device_chip_names_the_device_its_outputs_buffer_and_latency() {
     let device = PerformView::new(&snapshot, &song()).device;
     assert_eq!(device.meta, "Disconnected");
     assert_eq!(device.level, Level::Error);
+}
+
+#[test]
+fn the_clock_gives_the_time_and_the_arrangement_length_apart() {
+    // 2.5 s into the arrangement, of 7 s; the Mixer header shows the same
+    // two without reading one text in two.
+    let view = PerformView::new(&snapshot(), &song());
+    assert_eq!(view.time, "00:02");
+    assert_eq!(view.total, "00:07");
 }
 
 #[test]

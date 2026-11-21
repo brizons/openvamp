@@ -49,8 +49,15 @@ const METER_RADIUS: f32 = 3.0;
 /// The height of a meter's hold tick.
 const HOLD_TICK_HEIGHT: f32 = 2.0;
 
-/// The opacity of a control that does nothing now.
+/// The opacity of a control that does nothing now, and of a muted bus's
+/// meters and fader.
 const DISABLED_OPACITY: f32 = 0.45;
+
+/// The opacity of a silenced stem's meter and fader ([`StemStrip::silenced`]:
+/// muted, its bus or the master silent or muted, or another stem soloed).
+/// It is a shade under [`DISABLED_OPACITY`] as the Mixer screen has drawn
+/// it since it was added; no design rule ties or separates the two.
+const SILENCED_OPACITY: f32 = 0.4;
 
 /// The least height of a strip's meters and fader on the Mixer screen.
 const FADER_ZONE_MIN_HEIGHT: f32 = 120.0;
@@ -587,7 +594,7 @@ fn stem_strip(stem: &StemStrip, menu: bool, cx: &mut Context<Perform>) -> AnyEle
         bus_choices(stem, cx).into_any_element()
     } else {
         fader_zone(3., FADER_ZONE_MIN_HEIGHT)
-            .when(stem.silenced, |zone| zone.opacity(0.4))
+            .when(stem.silenced, |zone| zone.opacity(SILENCED_OPACITY))
             .child(meter(stem.meter, STEM_METER_WIDTH, STEM_METER_GREEN_UNTIL))
             .child(fader(FaderTarget::Stem(index), stem.fader, false, cx))
             .into_any_element()

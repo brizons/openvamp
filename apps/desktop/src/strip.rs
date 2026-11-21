@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use app::{DeviceStatus, RateFallback, SetlistCommandError, SetlistInfo, SetlistSnapshot};
 use domain::{SetlistItem, Transition};
 
-use crate::catalog::{Catalog, transition_name, transition_short};
+use crate::catalog::{Audience, Catalog, transition_name, transition_short};
 
 /// Where an item stands in the setlist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,7 +124,7 @@ impl SetlistView {
                     index,
                     number: (index + 1).to_string(),
                     title: catalog.title(&item.item),
-                    meta: catalog.meta(&item.item),
+                    meta: catalog.meta(&item.item, Audience::Strip),
                     click: matches!(item.item, SetlistItem::Click(_)),
                     state: match index.cmp(&state.current) {
                         Ordering::Less => ItemState::Played,

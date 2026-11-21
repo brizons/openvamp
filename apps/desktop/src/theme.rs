@@ -189,8 +189,14 @@ pub fn load_fonts(cx: &mut gpui::App) {
     }
 }
 
-/// The icons, by the path [`gpui::svg`] asks for.
+/// The icons, by the path [`gpui::svg`] asks for ([`icon_path`]).
 pub struct Icons;
+
+/// The path [`Icons`] carries the icon `name` at (a file of `assets/icons`
+/// without `.svg`).
+pub fn icon_path(name: &str) -> SharedString {
+    SharedString::from(format!("icons/{name}.svg"))
+}
 
 const ICONS: &[(&str, &[u8])] = &[
     (
@@ -416,5 +422,24 @@ impl AssetSource for Icons {
             .filter(|(name, _)| name.starts_with(path))
             .map(|(name, _)| SharedString::from(*name))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::AssetSource;
+    use openvamp_desktop::{mixer, view};
+
+    use super::{Icons, icon_path};
+
+    #[test]
+    fn every_icon_a_stem_bus_or_section_can_name_is_registered() {
+        for name in mixer::strip_icons().chain(view::section_icons()) {
+            let path = icon_path(name);
+            assert!(
+                Icons.load(&path).unwrap().is_some(),
+                "{path} is not in ICONS"
+            );
+        }
     }
 }

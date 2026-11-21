@@ -11,7 +11,7 @@ use domain::{
 };
 use library::{ArrangementEntry, Library, SetlistError, SongEntry, TrashFn};
 
-use crate::catalog::Catalog;
+use crate::catalog::{Audience, Catalog};
 use crate::editor::{Edit, SetlistEditor};
 use crate::line_edit::{LineEdit, LineKey, LineOutcome};
 use crate::reorder::{Half, drop_index, drop_slot};
@@ -866,7 +866,6 @@ impl LibraryPage {
                 .filter(|problem| item_of(problem).is_none())
                 .map(ToString::to_string)
                 .collect(),
-            playing: playing == Some(editor.file()),
             on_perform: (playing == Some(editor.file())).then(|| ON_PERFORM.to_owned()),
             remove: if armed {
                 ARMED_LABEL.to_owned()
@@ -902,7 +901,7 @@ impl LibraryPage {
             number: (index + 1).to_string(),
             title: self.catalog.title(item),
             // The arrangement has a column of its own in the editor.
-            meta: self.catalog.meta_without_arrangement(item),
+            meta: self.catalog.meta(item, Audience::Editor),
             click: matches!(item, SetlistItem::Click(_)),
             arrangement,
             transition: item.transition(),
@@ -1251,11 +1250,9 @@ pub struct EditorView {
     pub rows: Vec<EditorRow>,
     /// Rules the setlist as a whole breaks.
     pub problems: Vec<String>,
-    /// Whether it is open on the Perform screen, which plays it as it was
-    /// when opened.
-    pub playing: bool,
-    /// The line above the name while it is open on the Perform screen:
-    /// [`ON_PERFORM`].
+    /// The line above the name while it is open on the Perform screen,
+    /// which plays it as it was when opened: [`ON_PERFORM`]; `None` while
+    /// it is not.
     pub on_perform: Option<String>,
     /// The remove control: "Remove", or [`ARMED_LABEL`] once armed.
     pub remove: String,

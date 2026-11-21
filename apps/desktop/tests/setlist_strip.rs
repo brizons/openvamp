@@ -13,7 +13,7 @@ use app::{
 use domain::{ClickItem, SetlistItem, SongItem, TimeSignature, Transition};
 use library::{ArrangementEntry, PositionEntry, SongEntry};
 use openvamp_desktop::action::{UiAction, command_for, setlist_command_for};
-use openvamp_desktop::catalog::Catalog;
+use openvamp_desktop::catalog::{Audience, Catalog};
 use openvamp_desktop::keys::{KeyAction, KeyPress, Mods, key_down};
 use openvamp_desktop::show::Source;
 use openvamp_desktop::strip::{ItemState, SetlistView, StripItem, TransitionChip};
@@ -271,6 +271,40 @@ fn the_strip_shows_every_item_with_the_current_and_next_one_and_each_transition(
                 transition: None,
             },
         ]
+    );
+}
+
+#[test]
+fn a_meta_line_says_what_its_audience_has_room_for() {
+    let catalog = catalog();
+    let item = SetlistItem::Song(SongItem {
+        arrangement: "long".to_owned(),
+        fade_out: true,
+        ..SongItem::new("Hymns/Gates.song")
+    });
+    // The strip names the arrangement and has no room for the stem count.
+    assert_eq!(
+        catalog.meta(&item, Audience::Strip),
+        "A · 132 BPM · Long ending · fade-out"
+    );
+    // The editor shows the arrangement in a column of its own and ends
+    // with the stem count, as the design's line does.
+    assert_eq!(
+        catalog.meta(&item, Audience::Editor),
+        "A · 132 BPM · fade-out · 4 stems"
+    );
+    // An arrangement the song lacks: the strip names it as stored.
+    let missing = SetlistItem::Song(SongItem {
+        arrangement: "gone".to_owned(),
+        ..SongItem::new("Hymns/Gates.song")
+    });
+    assert_eq!(
+        catalog.meta(&missing, Audience::Strip),
+        "A · 132 BPM · arrangement \"gone\""
+    );
+    assert_eq!(
+        catalog.meta(&missing, Audience::Editor),
+        "A · 132 BPM · 4 stems"
     );
 }
 

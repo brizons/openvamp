@@ -103,23 +103,45 @@ fn section_names(positions: &[PositionInfo]) -> Vec<String> {
 }
 
 /// The icon (a file of `assets/icons` without `.svg`) a section shows on
-/// its pad and on the Now and Next cards, after the design canvas.
+/// its pad and on the Now and Next cards, after the design canvas: its
+/// family's (`SECTION_ICONS`), else a note.
 pub fn section_icon(label: &str) -> &'static str {
-    match first_word(label) {
-        "Count-off" => "metronome",
-        "Intro" => "enter",
-        "Verse" => "lines",
-        "Pre-chorus" => "rise",
-        "Chorus" | "Post-chorus" => "star",
-        "Bridge" | "Breakdown" => "bridge",
-        "Tag" => "tag",
-        "Vamp" => "loop",
-        "Turnaround" => "turn",
-        "Outro" => "exit",
-        "Ending" => "flag",
-        _ => "note",
-    }
+    let word = first_word(label);
+    SECTION_ICONS
+        .iter()
+        .find(|&&(first, _)| first == word)
+        .map_or(OTHER_SECTION_ICON, |&(_, icon)| icon)
 }
+
+/// Every icon [`section_icon`] can return, and the end of the song's on
+/// the Next card, for the app to carry each one.
+pub fn section_icons() -> impl Iterator<Item = &'static str> {
+    SECTION_ICONS
+        .iter()
+        .map(|&(_, icon)| icon)
+        .chain([OTHER_SECTION_ICON, END_ICON])
+}
+
+/// The icon of each section family, by the first word of its label.
+const SECTION_ICONS: &[(&str, &str)] = &[
+    ("Count-off", "metronome"),
+    ("Intro", "enter"),
+    ("Verse", "lines"),
+    ("Pre-chorus", "rise"),
+    ("Chorus", "star"),
+    ("Post-chorus", "star"),
+    ("Bridge", "bridge"),
+    ("Breakdown", "bridge"),
+    ("Tag", "tag"),
+    ("Vamp", "loop"),
+    ("Turnaround", "turn"),
+    ("Outro", "exit"),
+    ("Ending", "flag"),
+];
+
+/// The icon of a section whose family has none of its own (Instrumental,
+/// Interlude).
+const OTHER_SECTION_ICON: &str = "note";
 
 /// The icon of the end of the song on the Next card.
 const END_ICON: &str = "flag";
@@ -464,8 +486,10 @@ pub struct PerformView {
     pub device: DeviceChip,
     /// The transport.
     pub transport: TransportView,
-    /// Time in the arrangement and its length, such as "01:25 / 05:14".
-    pub clock: String,
+    /// Time in the arrangement, such as "01:25".
+    pub time: String,
+    /// The arrangement's length, such as "05:14".
+    pub total: String,
     /// Bar and beat, such as "Bar 38 · beat 2".
     pub bar_beat: String,
     /// The song map.
@@ -532,11 +556,8 @@ impl PerformView {
             header: song_header(song, facts),
             device: device_chip(snapshot),
             transport: transport_view(snapshot.transport),
-            clock: format!(
-                "{} / {}",
-                clock(timeline.elapsed, song.sample_rate),
-                clock(timeline.total, song.sample_rate)
-            ),
+            time: clock(timeline.elapsed, song.sample_rate),
+            total: clock(timeline.total, song.sample_rate),
             bar_beat: format!("Bar {} · beat {}", snapshot.bar, snapshot.beat),
             map: song_map(snapshot, song, &timeline, &names, &abbreviations, &bars),
             now: NowCard {

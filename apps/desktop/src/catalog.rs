@@ -64,25 +64,16 @@ impl Catalog {
         }
     }
 
-    /// What an item plays, in one line: for a song its key, tempo,
-    /// arrangement, start and end and fade-out ("A · 132 BPM · Default"),
-    /// for a click-only tile its tempo, meter and bar count ("70 BPM · 6/8 ·
-    /// 8 bars").
-    pub fn meta(&self, item: &SetlistItem) -> String {
-        self.describe(item, Arrangement::Named)
-    }
-
-    /// [`Self::meta`] without the song's arrangement, for a list that shows
-    /// the arrangement in a column of its own, and ending with the song's
-    /// stem count: "A · 132 BPM · 14 stems", or "—" when there is nothing
-    /// else to say (a song the library lacks).
-    pub fn meta_without_arrangement(&self, item: &SetlistItem) -> String {
-        self.describe(item, Arrangement::Left)
-    }
-
-    fn describe(&self, item: &SetlistItem, arrangement: Arrangement) -> String {
+    /// What an item plays, in one line, as `audience` has room for: for a
+    /// song its key, tempo, arrangement ([`Audience::Strip`] only), start
+    /// and end, fade-out and stem count ([`Audience::Editor`] only), such
+    /// as "A · 132 BPM · Default" on the strip and "A · 132 BPM · 14
+    /// stems" in the editor, or "—" when there is nothing to say (a song
+    /// the library lacks, in the editor); for a click-only tile its tempo,
+    /// meter and bar count ("70 BPM · 6/8 · 8 bars").
+    pub fn meta(&self, item: &SetlistItem, audience: Audience) -> String {
         match item {
-            SetlistItem::Song(song) => self.song_meta(song, arrangement),
+            SetlistItem::Song(song) => self.song_meta(song, audience),
             SetlistItem::Click(click) => {
                 let meter = click.time_signature;
                 let length = match click.bars {
@@ -98,7 +89,7 @@ impl Catalog {
         }
     }
 
-    fn song_meta(&self, item: &SongItem, named: Arrangement) -> String {
+    fn song_meta(&self, item: &SongItem, audience: Audience) -> String {
         let mut parts = Vec::new();
         let entry = self.song(&item.song);
         let arrangement = entry.and_then(|entry| {
@@ -109,10 +100,10 @@ impl Catalog {
                 .iter()
                 .find(|arrangement| arrangement.id == item.arrangement)
         });
-        let shown = named == Arrangement::Named;
+        let named = audience.names_arrangement();
         match arrangement {
             Some(arrangement) => {
-                if shown {
+                if named {
                     parts.push(arrangement.name.clone());
                 }
                 if let Some(range) = range_labels(item, arrangement) {
@@ -120,7 +111,7 @@ impl Catalog {
                 }
             }
             None => {
-                if shown {
+                if named {
                     parts.push(format!("arrangement \"{}\"", item.arrangement));
                 }
                 if item.start_position.is_some() || item.end_position.is_some() {
@@ -131,9 +122,7 @@ impl Catalog {
         if item.fade_out {
             parts.push("fade-out".to_owned());
         }
-        // The editor's line ends with the stem count, as the design's does;
-        // the strip's has no room for it.
-        if let (Some(entry), false) = (entry, shown) {
+        if let Some(entry) = entry.filter(|_| audience.counts_stems()) {
             parts.push(match entry.stems {
                 1 => "1 stem".to_owned(),
                 stems => format!("{stems} stems"),
@@ -179,13 +168,30 @@ fn range_numbers(item: &SongItem) -> String {
     }
 }
 
-/// Whether a song's meta line names its arrangement.
+/// Who reads an item's meta line ([`Catalog::meta`]), which decides what it
+/// has room for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Arrangement {
-    /// It does: the strip shows nothing else about the arrangement.
-    Named,
-    /// It does not: a column of its own shows it.
-    Left,
+pub enum Audience {
+    /// The Perform screen's setlist strip: the line names the song's
+    /// arrangement, since the strip shows nothing else about it, and has
+    /// no room for its stem count.
+    Strip,
+    /// The Library's setlist editor, which shows the arrangement in a
+    /// column of its own: the line ends with the song's stem count, as the
+    /// design's does.
+    Editor,
+}
+
+impl Audience {
+    /// Whether a song's line names its arrangement.
+    fn names_arrangement(self) -> bool {
+        self == Self::Strip
+    }
+
+    /// Whether a song's line ends with its stem count.
+    fn counts_stems(self) -> bool {
+        self == Self::Editor
+    }
 }
 
 /// A song folder's name without `.song`: `Hymns/Example.song` gives

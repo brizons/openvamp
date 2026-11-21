@@ -583,6 +583,29 @@ fn a_strip_draws_the_instrument_its_part_names() {
 }
 
 #[test]
+fn an_acoustic_word_makes_only_a_guitar_acoustic() {
+    let track = |part: &str| stem_icon(StemRole::Track, part, "stem");
+    for (part, icon) in [
+        // A guitar word with an acoustic word anywhere in the name.
+        ("Acoustic Gtr", "acoustic-guitar"),
+        ("Nylon Guitar", "acoustic-guitar"),
+        ("Guitarra Acústica", "acoustic-guitar"),
+        ("Requinto Acústico", "acoustic-guitar"),
+        // Without one, the electric guitar.
+        ("Guitar", "electric-guitar"),
+        ("Electric Guitar", "electric-guitar"),
+        // Another instrument stays itself.
+        ("Acoustic Piano", "piano"),
+        ("Acoustic Bass", "bass"),
+        ("Steel Drums", "drum"),
+        // An acoustic word alone is generic: the acoustic guitar.
+        ("Acoustic", "acoustic-guitar"),
+    ] {
+        assert_eq!(track(part), icon, "{part}");
+    }
+}
+
+#[test]
 fn the_stems_layer_names_and_draws_each_stem_after_its_part() {
     let bench = Bench::new();
 

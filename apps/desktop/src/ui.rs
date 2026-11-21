@@ -466,10 +466,6 @@ fn header_button(id: &'static str, cx: &mut Context<Perform>, intent: Intent) ->
 /// The time and the length of the arrangement, and the bar and beat, with
 /// what the transport is doing while it changes state.
 fn clock(view: &PerformView) -> impl IntoElement {
-    let (time, total) = view
-        .clock
-        .split_once(" / ")
-        .unwrap_or((view.clock.as_str(), ""));
     let bar = match &view.transport.note {
         Some(note) => format!("{} · {note}", view.bar_beat),
         None => view.bar_beat.clone(),
@@ -490,13 +486,13 @@ fn clock(view: &PerformView) -> impl IntoElement {
                     div()
                         .text_size(px(22.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(time.to_owned()),
+                        .child(view.time.clone()),
                 )
                 .child(
                     div()
                         .text_size(px(15.))
                         .text_color(theme::text_faint())
-                        .child(format!("\u{a0}/ {total}")),
+                        .child(format!("\u{a0}/ {}", view.total)),
                 ),
         )
         .child(
@@ -1917,7 +1913,7 @@ impl Element for OneLineText {
 
 pub(crate) fn icon(name: &str, color: Rgba, size: f32) -> impl IntoElement {
     svg()
-        .path(SharedString::from(format!("icons/{name}.svg")))
+        .path(theme::icon_path(name))
         .flex_none()
         .size(px(size))
         .text_color(color)

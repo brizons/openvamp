@@ -553,9 +553,9 @@ fn the_editor_says_when_the_setlist_is_the_one_on_perform() {
     let page = LibraryPage::open(dir.path(), Some(&file)).unwrap();
 
     let view = page.view(Some(&file));
-    assert!(view.editor.unwrap().playing);
+    assert!(view.editor.unwrap().on_perform.is_some());
     assert!(view.setlists[0].playing);
-    assert!(!page.view(None).editor.unwrap().playing);
+    assert!(page.view(None).editor.unwrap().on_perform.is_none());
     assert_eq!(page.view(None).editor.unwrap().summary, "No items yet");
 }
 
@@ -1101,7 +1101,7 @@ fn the_setlist_on_perform_is_refused_whatever_case_it_was_opened_in() {
     assert_eq!(playing, "B.setlist.json", "the name as the folder lists it");
     let view = page.view(Some(&playing));
     assert!(view.setlists[1].playing);
-    assert!(view.editor.unwrap().playing);
+    assert!(view.editor.unwrap().on_perform.is_some());
 }
 
 #[test]

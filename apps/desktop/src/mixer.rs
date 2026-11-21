@@ -158,11 +158,36 @@ pub fn bus_icon(bus: Bus) -> &'static str {
     }
 }
 
+/// Every icon [`stem_icon`] and [`bus_icon`] can return, for the app to
+/// carry each one.
+pub fn strip_icons() -> impl Iterator<Item = &'static str> {
+    let roles =
+        [StemRole::Click, StemRole::Guide, StemRole::Track].map(|role| stem_icon(role, "", ""));
+    let instruments = INSTRUMENTS.iter().flat_map(|&(_, icon, weight)| {
+        let acoustic = match weight {
+            Weight::Electric { acoustic } => Some(acoustic),
+            Weight::Instrument | Weight::Generic => None,
+        };
+        std::iter::once(icon).chain(acoustic)
+    });
+    roles
+        .into_iter()
+        .chain(instruments)
+        .chain(Bus::ALL.map(bus_icon))
+}
+
 /// How much a word of [`INSTRUMENTS`] says about a stem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Weight {
     /// The word names an instrument: the first one decides.
     Instrument,
+    /// The word names an electric instrument: the first one decides, as
+    /// the `acoustic` icon when an acoustic word ([`ACOUSTIC`]) is anywhere
+    /// in the name too ("Acoustic Guitar", "AcGtr").
+    Electric {
+        /// The icon of the instrument's acoustic kind.
+        acoustic: &'static str,
+    },
     /// The word is generic (loop, fx, acoustic): it decides only when no
     /// instrument is named.
     Generic,
@@ -287,7 +312,9 @@ const INSTRUMENTS: &[(&[&str], &str, Weight)] = &[
     (
         &["guitar", "gtr", "eg", "guitarra", "requinto"],
         "electric-guitar",
-        Weight::Instrument,
+        Weight::Electric {
+            acoustic: "acoustic-guitar",
+        },
     ),
     (
         &[
@@ -344,21 +371,23 @@ const INSTRUMENTS: &[(&[&str], &str, Weight)] = &[
     (&["spoken", "speech"], "speech", Weight::Generic),
 ];
 
-/// Words that make a guitar acoustic ("Acoustic Guitar", "AcGtr").
+/// Words that make an electric instrument ([`Weight::Electric`]) acoustic:
+/// "Acoustic Guitar", "AcGtr".
 const ACOUSTIC: [&str; 6] = ["acoustic", "ac", "acustica", "acustico", "nylon", "steel"];
 
-/// The icon of the instrument `name` names: its first instrument word's,
-/// else its first generic word's; `None` when it names none.
+/// The icon of the instrument `name` names: its first instrument word's
+/// (an electric one's acoustic kind when an acoustic word is in `name`
+/// too), else its first generic word's; `None` when it names none.
 fn instrument_icon(name: &str) -> Option<&'static str> {
     let words = icon_words(name);
-    let acoustic = words.iter().any(|word| ACOUSTIC.contains(&word.as_str()));
+    let has_acoustic_word = words.iter().any(|word| ACOUSTIC.contains(&word.as_str()));
     let mut generic = None;
     for word in &words {
         match icon_rule(word) {
-            Some(("electric-guitar", Weight::Instrument)) if acoustic => {
-                return Some("acoustic-guitar");
+            Some((_, Weight::Electric { acoustic })) if has_acoustic_word => {
+                return Some(acoustic);
             }
-            Some((icon, Weight::Instrument)) => return Some(icon),
+            Some((icon, Weight::Instrument | Weight::Electric { .. })) => return Some(icon),
             Some((icon, Weight::Generic)) => {
                 generic.get_or_insert(icon);
             }
@@ -990,20 +1019,17 @@ impl MixerPage {
             .chain(self.mix_problem.clone())
             .chain(self.bus_problem.clone())
             .collect();
-        // The Perform screen's clock, "01:25 / 05:14", read in two parts.
+        // The time, the length and the transport, as the Perform screen
+        // shows them.
         let perform = PerformView::new(show.snapshot(), song);
-        let (time, total) = perform
-            .clock
-            .split_once(" / ")
-            .unwrap_or((perform.clock.as_str(), ""));
         Some(MixerScreen {
             title: song.title.clone(),
             position: show
                 .setlist()
                 .map(|setlist| format!("Song {}", setlist.view().position)),
             arrangement: format!("Arrangement: {}", arrangement_name(show)),
-            time: time.to_owned(),
-            total: total.to_owned(),
+            time: perform.time,
+            total: perform.total,
             playing: perform.transport.playing,
             layer: self.layer,
             summary: format!(
