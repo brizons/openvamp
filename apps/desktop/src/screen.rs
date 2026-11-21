@@ -2,9 +2,9 @@
 //! that plays, polls it on a timer, turns pointer and key events into
 //! view-model actions, and hands a [`PerformView`] (and, for a setlist, a
 //! [`openvamp_desktop::strip::SetlistView`]) to the presentational code in
-//! [`crate::ui`], with the song's [`SongFacts`] read from its `song.json`.
+//! [`crate::ui`], with the song's [`SongFacts`] read from its `song.json`
+//! on a background thread ([`openvamp_desktop::facts`]).
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -21,6 +21,7 @@ use library::ConfigStore;
 use openvamp_desktop::action::{Intent, Page, UiAction, disarms_removal};
 use openvamp_desktop::audio_settings::AudioSettings;
 use openvamp_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_request};
+use openvamp_desktop::facts::{self, FactsCache};
 use openvamp_desktop::hold::PanicHold;
 use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, Typed, is_panic_key, typed};
 use openvamp_desktop::library_page::{Dragged, LibraryPage, Opened, library_to_open};
@@ -68,9 +69,9 @@ pub struct Perform {
     mixer: MixerPage,
     /// The Audio output screen's own state.
     output: OutputPage,
-    /// The facts of the last song folder read, which the song header and
-    /// the bars on Perform show: read once per song, not on every frame.
-    facts: Option<(PathBuf, SongFacts)>,
+    /// The facts of the song folders read, which the song header and the
+    /// bars on Perform show; never read while drawing.
+    facts: FactsCache,
     _poll: Task<()>,
     _quit: Subscription,
     _deactivated: Subscription,
@@ -117,7 +118,7 @@ impl Perform {
             settings: AudioSettings::load(ConfigStore::from_environment()),
             mixer: MixerPage::new(),
             output: OutputPage::new(),
-            facts: None,
+            facts: FactsCache::new(),
             _poll: poll,
             _quit: quit,
             _deactivated: deactivated,
@@ -234,6 +235,8 @@ impl Perform {
                 // What plays closed: a buffer size or routing waiting for
                 // its device is not kept.
                 self.output.song_closed();
+                // Its song.json may have changed: read every folder again.
+                self.facts.forget();
                 self.hold = PanicHold::new();
                 self.problems = replaced.problems();
                 for problem in &self.problems {
@@ -262,11 +265,12 @@ impl Perform {
         cx.notify();
     }
 
-    /// One turn of the timer: moves the session on and fires a panic hold
-    /// that is complete. It asks for a frame while a hold fills, the song
-    /// moves or a meter reads above silence ([`needs_frames`]); otherwise
-    /// only when the turn changed what the screens show, so a still screen
-    /// with every meter at 0 draws nothing.
+    /// One turn of the timer: moves the session on, fires a panic hold
+    /// that is complete, and starts reading the facts of a song that shows
+    /// when they are wanted ([`Self::read_facts`]). It asks for a frame
+    /// while a hold fills, the song moves or a meter reads above silence
+    /// ([`needs_frames`]); otherwise only when the turn changed what the
+    /// screens show, so a still screen with every meter at 0 draws nothing.
     fn tick(&mut self, cx: &mut Context<Self>) {
         let counting = self.hold.is_counting();
         let now = Instant::now();
@@ -299,6 +303,32 @@ impl Perform {
         if counting || changed || needs_frames(show.snapshot()) {
             cx.notify();
         }
+        self.read_facts(cx);
+    }
+
+    /// Starts reading the facts of the song on show when the cache wants
+    /// them ([`FactsCache::start_read`]), on the background executor, so a
+    /// volume slow to answer holds up no frame and no control; the screen
+    /// draws again when they arrive. A click-only tile has none to read.
+    fn read_facts(&mut self, cx: &mut Context<Self>) {
+        let Some((folder, _)) = self.loaded.as_ref().and_then(Show::mix_file) else {
+            return;
+        };
+        if !self.facts.start_read(&folder, Instant::now()) {
+            return;
+        }
+        let read = cx.background_executor().spawn({
+            let folder = folder.clone();
+            async move { facts::read(&folder) }
+        });
+        cx.spawn(async move |this, cx| {
+            let read = read.await;
+            let _ = this.update(cx, |screen, cx| {
+                screen.facts.finish(folder, read, Instant::now());
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Carries out what the presentational code or a key asks for; while
@@ -495,28 +525,18 @@ impl Perform {
         }
     }
 
-    /// What the song playing's `song.json` says, read once per song folder;
-    /// for a setlist's click-only tile, its tempo and meter. Nothing when
-    /// the file cannot be read: the screen then shows what the session
-    /// says.
-    fn song_facts(&mut self) -> SongFacts {
+    /// What the song playing's `song.json` says, as far as it has been read
+    /// ([`FactsCache::facts`]); for a setlist's click-only tile, its tempo
+    /// and meter. It reads nothing: until the facts arrive, or while they
+    /// cannot be read, the screen shows what the session says.
+    fn song_facts(&self) -> SongFacts {
         let Some(show) = &self.loaded else {
             return SongFacts::default();
         };
-        let Some((folder, _)) = show.mix_file() else {
-            return current_click(show).unwrap_or_default();
-        };
-        if let Some((read, facts)) = &self.facts
-            && *read == folder
-        {
-            return facts.clone();
+        match show.mix_file() {
+            Some((folder, _)) => self.facts.facts(&folder),
+            None => current_click(show).unwrap_or_default(),
         }
-        let facts = fs::read_to_string(folder.join(library::MANIFEST_FILE))
-            .ok()
-            .and_then(|json| SongFacts::from_manifest(&json))
-            .unwrap_or_default();
-        self.facts = Some((folder, facts.clone()));
-        facts
     }
 
     /// The setlist playing, when one does.

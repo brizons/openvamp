@@ -5,7 +5,8 @@
 //!
 //! This library holds everything the screens decide without drawing, so it
 //! is tested without a window: [`view`] maps a [`app::Snapshot`] to what the
-//! Perform screen shows, [`strip`] maps a [`app::SetlistSnapshot`] to the
+//! Perform screen shows, [`facts`] reads the song facts it adds off the
+//! screen's drawing, [`strip`] maps a [`app::SetlistSnapshot`] to the
 //! setlist strip and its problems, [`catalog`] names a setlist's items from
 //! the library's songs, [`action`] maps a control to the [`app::Command`] or
 //! [`app::SetlistCommand`] it sends, [`hold`] times the hold-to-panic
@@ -26,6 +27,7 @@ pub mod audio_settings;
 pub mod catalog;
 pub mod editor;
 pub mod ending;
+pub mod facts;
 pub mod hold;
 pub mod keys;
 pub mod library_page;

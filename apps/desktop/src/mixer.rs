@@ -101,9 +101,10 @@ pub fn output_text(destination: Destination) -> String {
 }
 
 /// A stem's name on its strip: its part, else its id when the part is
-/// blank, in [`title_case`] ("synth bass" is "Synth Bass", "BGVs" stays
-/// "BGVs", "hi-hat" is "Hi-Hat"). The screen names a stem whose part
-/// another stem shares by its id.
+/// blank, in title case, every word starting with a capital and the other
+/// letters as written ("synth bass" is "Synth Bass", "BGVs" stays "BGVs",
+/// "hi-hat" is "Hi-Hat"). The screen names a stem whose part another stem
+/// shares by its id.
 pub fn stem_name(part: &str, id: &str) -> String {
     title_case(if part.trim().is_empty() { id } else { part })
 }
@@ -135,7 +136,8 @@ fn title_case(name: &str) -> String {
 /// The icon (a file of `assets/icons` without `.svg`) a stem's strip
 /// draws, after the design canvas's Mixer artboard: the metronome for a
 /// click, the speech bubble for a guide, else the instrument its part names
-/// ([`INSTRUMENTS`]), else the one its id names, else a note.
+/// (by the table of instrument words, English and Spanish), else the one
+/// its id names, else a note.
 pub fn stem_icon(role: StemRole, part: &str, id: &str) -> &'static str {
     match role {
         StemRole::Click => "metronome",

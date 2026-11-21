@@ -1,16 +1,17 @@
 //! What the Perform screen shows, mapped from a session [`Snapshot`] and the
 //! open song (S6): the song map with the playhead and the queued jump, the
 //! section pads with Now and Next, the transport, the fade, the jump
-//! timing, loop and infinite, and the status area. The design canvas's
-//! Main artboard adds what the song's `song.json` says ([`SongFacts`]): its
-//! key, tempo and meter in the song header, and the bars each section
-//! lasts on the map, the pads and the Now and Next cards.
+//! timing, loop and infinite, the device chip, and what the notes say about
+//! the device and the song. The design canvas's Main artboard adds what the
+//! song's `song.json` says ([`SongFacts`]): its key, tempo and meter in the
+//! song header, and the bars each section lasts on the map, the pads and
+//! the Now and Next cards.
 
 use app::{
     DeviceStatus, FadeState, JumpKind, JumpTiming, LoadError, LossReason, OpenError, PositionInfo,
     Snapshot, SongInfo, TransportState,
 };
-use domain::{DEFAULT_ARRANGEMENT_ID, SongPackage};
+use domain::{DEFAULT_ARRANGEMENT_ID, ManifestError, SongPackage};
 
 use crate::action::is_playing;
 
@@ -80,16 +81,16 @@ pub fn short_label(label: &str) -> String {
 /// The names of `positions` on the song map, the pads and the Now and Next
 /// cards, where a section without a number that plays more than once is
 /// numbered by its turn: "Chorus" twice is "Chorus 1" and "Chorus 2", as
-/// the design canvas writes them.
+/// the design canvas writes them. A tag is the exception: "Tag" twice stays
+/// "Tag" both times.
 fn section_names(positions: &[PositionInfo]) -> Vec<String> {
     positions
         .iter()
         .enumerate()
         .map(|(index, info)| {
             let label = info.label.as_str();
-            let numbered = label.len() > first_word(label).len();
             let repeats = positions.iter().filter(|p| p.label == label).count() > 1;
-            if numbered || !repeats {
+            if ends_in_number(label) || !repeats || label == "Tag" {
                 return label.to_owned();
             }
             let turn = positions[..index]
@@ -157,6 +158,13 @@ fn bars_text(bars: u64) -> String {
 
 fn first_word(label: &str) -> &str {
     label.split(' ').next().unwrap_or(label)
+}
+
+/// Whether `label`'s last word is a number, as in "Verse 2".
+fn ends_in_number(label: &str) -> bool {
+    label
+        .rsplit_once(' ')
+        .is_some_and(|(_, last)| last.parse::<u32>().is_ok())
 }
 
 /// One arrangement position on the song map.
@@ -298,7 +306,7 @@ pub struct FadeButton {
     pub active: bool,
 }
 
-/// How serious a status line is.
+/// How the device chip's dot reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
     /// All is well.
@@ -309,20 +317,21 @@ pub enum Level {
     Error,
 }
 
-/// The status area: the device, underruns, the last problem, and the song
-/// package's warnings, in the `app` API's own words.
+/// What the notes under the strip say about the device and the song, in
+/// the `app` API's own words; all `None` and empty while all is well. The
+/// device itself and its underruns are on the header's [`DeviceChip`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusView {
-    /// The device and its stream, or why there is none.
-    pub device: String,
-    /// Whether the device plays.
-    pub device_level: Level,
-    /// Underruns so far, such as "Underruns: 0".
-    pub underruns: String,
+    /// Why the device plays nothing: no device, or one that cannot be
+    /// opened again or refuses new settings; `None` while it plays.
+    pub device_problem: Option<String>,
     /// The last problem ([`Snapshot::last_error`]), as the `app` API words it.
     pub last_error: Option<String>,
     /// Findings in the song package that do not block playback.
     pub warnings: Vec<String>,
+    /// Why the song header has no key, tempo or meter: its `song.json`
+    /// could not be read ([`SongFacts::unread`]).
+    pub facts_problem: Option<String>,
 }
 
 /// The header's device chip: the device, its outputs, buffer and latency.
@@ -357,7 +366,8 @@ pub struct SongHeader {
 /// What a song's `song.json` (or a click-only tile) says that the session
 /// does not: its key, tempo and meter, its arrangements' names, and how
 /// long a bar lasts, which counts the bars of a section no other starts
-/// after.
+/// after. Empty until the file is read (`crate::facts`), and with
+/// [`Self::unread`] while it cannot be.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SongFacts {
     /// Key, such as "G".
@@ -371,13 +381,22 @@ pub struct SongFacts {
     /// From each tempo or time-signature change on (its source frame), the
     /// seconds a bar lasts; in source order.
     pub bar_seconds: Vec<(u64, f64)>,
+    /// Why the song's `song.json` could not be read, the note the notes
+    /// show while it cannot; the other facts are then empty.
+    pub unread: Option<String>,
 }
 
 impl SongFacts {
     /// The facts of the `song.json` manifest `json`; `None` when it does not
-    /// parse ([`SongPackage::from_json`]).
+    /// parse ([`Self::parse`]).
     pub fn from_manifest(json: &str) -> Option<Self> {
-        let package = SongPackage::from_json(json).ok()?;
+        Self::parse(json).ok()
+    }
+
+    /// The facts of the `song.json` manifest `json`, or why it does not
+    /// parse ([`SongPackage::from_json`]).
+    pub fn parse(json: &str) -> Result<Self, ManifestError> {
+        let package = SongPackage::from_json(json)?;
         let mut changes: Vec<u64> = package
             .tempo_map
             .iter()
@@ -396,7 +415,7 @@ impl SongFacts {
                 (bpm > 0.0).then(|| (at, 60.0 / bpm * f64::from(meter.numerator)))
             })
             .collect();
-        Some(Self {
+        Ok(Self {
             key: package.key.clone(),
             bpm: package.tempo_map.first().map(|point| point.bpm),
             meter: package
@@ -409,6 +428,7 @@ impl SongFacts {
                 .map(|arrangement| (arrangement.id.clone(), arrangement.name.clone()))
                 .collect(),
             bar_seconds,
+            unread: None,
         })
     }
 
@@ -425,6 +445,7 @@ impl SongFacts {
             } else {
                 Vec::new()
             },
+            unread: None,
         }
     }
 
@@ -478,8 +499,6 @@ pub fn pad_grid(width: f32, pads: usize) -> PadGrid {
 pub struct PerformView {
     /// Song title.
     pub title: String,
-    /// Artist and arrangement.
-    pub subtitle: String,
     /// The line under the title: key, tempo, meter and arrangement.
     pub header: SongHeader,
     /// The header's device chip.
@@ -508,7 +527,7 @@ pub struct PerformView {
     pub infinite: bool,
     /// The fade button.
     pub fade: FadeButton,
-    /// The status area.
+    /// What the notes say about the device and the song.
     pub status: StatusView,
 }
 
@@ -525,10 +544,6 @@ impl PerformView {
         let timeline = Timeline::new(snapshot, song);
         let next = next_position(snapshot, song);
         let queued_target = snapshot.queued.as_ref().map(|queued| queued.target);
-        let subtitle = match &song.artist {
-            Some(artist) => format!("{artist} · arrangement \"{}\"", song.arrangement),
-            None => format!("arrangement \"{}\"", song.arrangement),
-        };
         let bars = position_bars(song, facts);
         let names = section_names(&song.positions);
         let abbreviations: Vec<String> = names.iter().map(|name| short_label(name)).collect();
@@ -552,7 +567,6 @@ impl PerformView {
         let bars_left = bars_left(snapshot, song, &bars);
         Self {
             title: song.title.clone(),
-            subtitle,
             header: song_header(song, facts),
             device: device_chip(snapshot),
             transport: transport_view(snapshot.transport),
@@ -586,7 +600,7 @@ impl PerformView {
             live_loop: snapshot.live_loop(),
             infinite: snapshot.infinite,
             fade: fade_button(snapshot),
-            status: status_view(snapshot, song),
+            status: status_view(snapshot, song, facts),
         }
     }
 }
@@ -912,50 +926,39 @@ fn fade_button(snapshot: &Snapshot) -> FadeButton {
     }
 }
 
-fn status_view(snapshot: &Snapshot, song: &SongInfo) -> StatusView {
-    let (device, device_level) = match &snapshot.device {
-        DeviceStatus::Connected(info) => (
-            format!(
-                "{} · {} Hz · {} frames · {:.1} ms",
-                info.device,
-                info.sample_rate,
-                info.buffer_frames,
-                info.latency().as_secs_f64() * 1_000.0
-            ),
-            Level::Ok,
-        ),
+/// What the notes say: why the device plays nothing, the last problem, the
+/// package's warnings, and why `facts` are missing.
+fn status_view(snapshot: &Snapshot, song: &SongInfo, facts: &SongFacts) -> StatusView {
+    let device_problem = match &snapshot.device {
+        DeviceStatus::Connected(_) => None,
         // The session closed the stream for new settings (a buffer size,
         // more outputs, another rate): the device is there and refuses them.
         DeviceStatus::Disconnected {
             device,
             reason: LossReason::Reconfigured,
             reopen_error: Some(error),
-        } => (
-            format!("Paused: \"{device}\" refuses the new settings ({error})"),
-            Level::Error,
-        ),
+        } => Some(format!(
+            "Paused: \"{device}\" refuses the new settings ({error})"
+        )),
         DeviceStatus::Disconnected {
             device,
             reopen_error: Some(error),
             ..
-        } => (
-            format!("No device: \"{device}\" (cannot open it again: {error})"),
-            Level::Error,
-        ),
+        } => Some(format!(
+            "No device: \"{device}\" (cannot open it again: {error})"
+        )),
         DeviceStatus::Disconnected { device, reason, .. } => {
-            (format!("No device: \"{device}\" ({reason})"), Level::Error)
+            Some(format!("No device: \"{device}\" ({reason})"))
         }
-        DeviceStatus::PlayerLost { device } => (
-            format!("No device: \"{device}\" (the output kept the player; open the song again)"),
-            Level::Error,
-        ),
+        DeviceStatus::PlayerLost { device } => Some(format!(
+            "No device: \"{device}\" (the output kept the player; open the song again)"
+        )),
     };
     StatusView {
-        device,
-        device_level,
-        underruns: format!("Underruns: {}", snapshot.underruns),
+        device_problem,
         last_error: snapshot.last_error.as_ref().map(ToString::to_string),
         warnings: song.warnings.clone(),
+        facts_problem: facts.unread.clone(),
     }
 }
 

@@ -53,32 +53,84 @@ const MAIN_PADDING: f32 = 16.0;
 /// The room between the parts of a screen, in points.
 const MAIN_GAP: f32 = 12.0;
 
+/// The border of a panel drawn with `border_1`, in points, on each side.
+const PANEL_BORDER: f32 = 1.0;
+
 /// The header's height, its line under it included.
 const HEADER_HEIGHT: f32 = 60.0;
 
 /// The setlist strip's height.
 const STRIP_HEIGHT: f32 = 84.0;
 
-/// The now-playing panel's height above the compact mixer, as on the
-/// design canvas: the title row, the song map, the section controls and one
-/// row of pads.
-const NOW_PLAYING_HEIGHT: f32 = 364.0;
-
-/// The now-playing panel's padding and border, in points.
+/// The now-playing panel's padding, in points, inside its border.
 const PANEL_PADDING: f32 = 14.0;
+
+/// The room between the rows of the now-playing panel, in points.
+const PANEL_GAP: f32 = 12.0;
+
+/// The now-playing panel's first row: the title and its facts, Now and
+/// Next.
+const TITLE_ROW_HEIGHT: f32 = 60.0;
+
+/// The song map's row of section blocks.
+const MAP_BLOCKS_HEIGHT: f32 = 28.0;
+
+/// The song map's track under the blocks, with the playhead.
+const MAP_TRACK_HEIGHT: f32 = 50.0;
+
+/// The song map's bar ruler under the track.
+const MAP_RULER_HEIGHT: f32 = 14.0;
+
+/// The room between the song map's blocks, track and ruler, in points.
+const MAP_GAP: f32 = 6.0;
+
+/// The song map: its blocks, track and ruler.
+const SONG_MAP_HEIGHT: f32 =
+    MAP_BLOCKS_HEIGHT + MAP_TRACK_HEIGHT + MAP_RULER_HEIGHT + 2.0 * MAP_GAP;
+
+/// The section controls' row: Jump at, Loop section and Infinite.
+const SECTION_CONTROLS_HEIGHT: f32 = 34.0;
 
 /// The pads' area in the now-playing panel above the compact mixer: one row
 /// of pads, the rest scrolls.
 const PADS_HEIGHT: f32 = 100.0;
 
+/// The now-playing panel's height above the compact mixer, as on the
+/// design canvas (364 points): the title row, the song map, the section
+/// controls and one row of pads, with the room between them and the
+/// panel's padding and border.
+const NOW_PLAYING_HEIGHT: f32 = TITLE_ROW_HEIGHT
+    + SONG_MAP_HEIGHT
+    + SECTION_CONTROLS_HEIGHT
+    + PADS_HEIGHT
+    + 3.0 * PANEL_GAP
+    + 2.0 * (PANEL_PADDING + PANEL_BORDER);
+
 /// The least height the compact mixer needs for its bus strips; with less
 /// room it stays off Perform (the Mixer screen has it all).
 const COMPACT_MIXER_MIN_HEIGHT: f32 = 272.0;
 
-/// A line of notes or problems, in points, to estimate their room.
-const NOTE_LINE_HEIGHT: f32 = 18.0;
+/// The size of a square button, such as the one that hides the problems.
+const SQUARE_BUTTON_SIZE: f32 = 48.0;
 
-/// The notes panel's tallest, in points; more lines scroll.
+/// The problems' padding above and below their lines, in points.
+const PROBLEMS_PADDING_Y: f32 = 10.0;
+
+/// The notes' padding above and below their lines, in points.
+const NOTES_PADDING_Y: f32 = 8.0;
+
+/// The type size of a line of problems or notes.
+const NOTE_TEXT_SIZE: f32 = 13.0;
+
+/// A line of problems or notes, in points, as drawn: about the default
+/// line of [`NOTE_TEXT_SIZE`] type (1.618 em).
+const NOTE_LINE_HEIGHT: f32 = 21.0;
+
+/// The room between lines of problems or notes, in points.
+const NOTE_GAP: f32 = 4.0;
+
+/// The notes panel's tallest, its padding and border included, in points;
+/// more lines scroll.
 const NOTES_MAX_HEIGHT: f32 = 110.0;
 
 /// The window's root: background, type, and the keyboard focus; the side
@@ -173,10 +225,12 @@ pub fn perform(
             &notes,
         ) >= COMPACT_MIXER_MIN_HEIGHT
     });
-    // The pads' row: the window less the navigation, the screen's padding
-    // and the panel's.
-    let row =
-        f32::from(viewport.width) - NAV_WIDTH - 2.0 * MAIN_PADDING - 2.0 * PANEL_PADDING - 2.0;
+    // The pads' row: the window less the navigation, the screen's padding,
+    // and the panel's padding and border.
+    let row = f32::from(viewport.width)
+        - NAV_WIDTH
+        - 2.0 * MAIN_PADDING
+        - 2.0 * (PANEL_PADDING + PANEL_BORDER);
     let grid = pad_grid(row, view.pads.len());
     div()
         .flex_1()
@@ -200,27 +254,37 @@ pub fn perform(
 
 /// The room the compact mixer would get in a window `height` points tall,
 /// under the header, the problems, the strip with a setlist, the notes and
-/// the now-playing panel.
+/// the now-playing panel, each with the room after it. A line of problems
+/// or notes counts as one line, even when it wraps.
 fn mixer_room(height: f32, setlist: bool, problems: &[String], notes: &[Note]) -> f32 {
-    let block = |lines: usize, max: f32| {
-        if lines == 0 {
-            0.0
-        } else {
-            (lines as f32 * NOTE_LINE_HEIGHT + 22.0).min(max) + MAIN_GAP
-        }
+    let lines =
+        |count: usize| count as f32 * NOTE_LINE_HEIGHT + count.saturating_sub(1) as f32 * NOTE_GAP;
+    // The problems are at least as tall as the button that hides them.
+    let problems = if problems.is_empty() {
+        0.0
+    } else {
+        lines(problems.len()).max(SQUARE_BUTTON_SIZE)
+            + 2.0 * (PROBLEMS_PADDING_Y + PANEL_BORDER)
+            + MAIN_GAP
     };
     let strip = if setlist {
         STRIP_HEIGHT + MAIN_GAP
     } else {
         0.0
     };
+    let notes = if notes.is_empty() {
+        0.0
+    } else {
+        (lines(notes.len()) + 2.0 * (NOTES_PADDING_Y + PANEL_BORDER)).min(NOTES_MAX_HEIGHT)
+            + MAIN_GAP
+    };
     height
         - 2.0 * MAIN_PADDING
         - HEADER_HEIGHT
         - MAIN_GAP
-        - block(problems.len(), f32::INFINITY)
+        - problems
         - strip
-        - block(notes.len(), NOTES_MAX_HEIGHT)
+        - notes
         - NOW_PLAYING_HEIGHT
         - MAIN_GAP
 }
@@ -234,19 +298,20 @@ fn problem_banner(problems: &[String], cx: &mut Context<Perform>) -> impl IntoEl
         .items_center()
         .gap(px(12.))
         .px(px(14.))
-        .py(px(10.))
+        .py(px(PROBLEMS_PADDING_Y))
         .bg(theme::danger_bg())
         .border_1()
         .border_color(theme::danger())
         .rounded(px(14.))
-        .text_size(px(13.))
+        .text_size(px(NOTE_TEXT_SIZE))
+        .line_height(px(NOTE_LINE_HEIGHT))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .gap(px(4.))
+                .gap(px(NOTE_GAP))
                 .text_color(theme::danger_text())
                 .children(problems.iter().map(|line| div().child(line.clone()))),
         )
@@ -657,7 +722,7 @@ fn now_playing(
     let panel = div()
         .flex()
         .flex_col()
-        .gap(px(12.))
+        .gap(px(PANEL_GAP))
         .p(px(PANEL_PADDING))
         .bg(theme::surface())
         .border_1()
@@ -671,7 +736,7 @@ fn now_playing(
     panel
         .child(
             div()
-                .h(px(60.))
+                .h(px(TITLE_ROW_HEIGHT))
                 .flex_none()
                 .flex()
                 .gap(px(12.))
@@ -882,7 +947,7 @@ fn next_card(next: &NextCard, cx: &mut Context<Perform>) -> impl IntoElement {
 /// track under the sections shows their colors.
 fn song_map(map: &SongMap) -> impl IntoElement {
     let strip = div()
-        .h(px(28.))
+        .h(px(MAP_BLOCKS_HEIGHT))
         .flex_none()
         .flex()
         .children(map.blocks.iter().map(|block| {
@@ -918,7 +983,7 @@ fn song_map(map: &SongMap) -> impl IntoElement {
         }));
     let track = div()
         .relative()
-        .h(px(50.))
+        .h(px(MAP_TRACK_HEIGHT))
         .flex_none()
         .flex()
         .children(map.blocks.iter().map(|block| {
@@ -982,7 +1047,7 @@ fn song_map(map: &SongMap) -> impl IntoElement {
                 .bg(theme::text()),
         );
     let ruler = div()
-        .h(px(14.))
+        .h(px(MAP_RULER_HEIGHT))
         .flex_none()
         .flex()
         .font_family(theme::MONO)
@@ -1000,7 +1065,7 @@ fn song_map(map: &SongMap) -> impl IntoElement {
         .flex_none()
         .flex()
         .flex_col()
-        .gap(px(6.))
+        .gap(px(MAP_GAP))
         .child(strip)
         .child(track)
         .child(ruler)
@@ -1009,7 +1074,7 @@ fn song_map(map: &SongMap) -> impl IntoElement {
 fn section_controls(view: &PerformView, cx: &mut Context<Perform>) -> impl IntoElement {
     let sections = view.pads.len();
     div()
-        .h(px(34.))
+        .h(px(SECTION_CONTROLS_HEIGHT))
         .flex_none()
         .flex()
         .items_center()
@@ -1523,9 +1588,9 @@ struct Note {
 }
 
 /// What needs a look, one line each: a crossfade under way and the
-/// setlist's problems; the device that does not play, the last problem and
-/// the song package's warnings. Nothing when all is well, as on the design
-/// canvas.
+/// setlist's problems; the device that does not play, the last problem,
+/// the song package's warnings, and why the song header misses its key,
+/// tempo and meter. Nothing when all is well, as on the design canvas.
 fn notes(view: &PerformView, setlist: Option<&SetlistView>) -> Vec<Note> {
     let note = |text: String, color: Rgba, strong: bool| Note {
         text,
@@ -1548,9 +1613,12 @@ fn notes(view: &PerformView, setlist: Option<&SetlistView>) -> Vec<Note> {
         );
     }
     let status = &view.status;
-    if status.device_level == Level::Error {
-        notes.push(note(status.device.clone(), theme::danger(), true));
-    }
+    notes.extend(
+        status
+            .device_problem
+            .iter()
+            .map(|problem| note(problem.clone(), theme::danger(), true)),
+    );
     notes.extend(
         status
             .last_error
@@ -1562,6 +1630,12 @@ fn notes(view: &PerformView, setlist: Option<&SetlistView>) -> Vec<Note> {
             .warnings
             .iter()
             .map(|warning| note(format!("Warning: {warning}"), theme::text_muted(), false)),
+    );
+    notes.extend(
+        status
+            .facts_problem
+            .iter()
+            .map(|problem| note(problem.clone(), theme::queued(), false)),
     );
     notes
 }
@@ -1575,14 +1649,15 @@ fn notes_panel(notes: &[Note]) -> impl IntoElement {
         .overflow_y_scroll()
         .flex()
         .flex_col()
-        .gap(px(4.))
+        .gap(px(NOTE_GAP))
         .px(px(14.))
-        .py(px(8.))
+        .py(px(NOTES_PADDING_Y))
         .rounded(px(12.))
         .bg(theme::surface())
         .border_1()
         .border_color(theme::border())
-        .text_size(px(13.))
+        .text_size(px(NOTE_TEXT_SIZE))
+        .line_height(px(NOTE_LINE_HEIGHT))
         .children(notes.iter().map(|note| {
             div()
                 .text_color(note.color)
@@ -1644,7 +1719,7 @@ pub(crate) fn square_button(
     intent: Intent,
 ) -> Stateful<Div> {
     button(id, cx, intent)
-        .size(px(48.))
+        .size(px(SQUARE_BUTTON_SIZE))
         .justify_center()
         .bg(theme::raised())
         .border_1()

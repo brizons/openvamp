@@ -1,7 +1,7 @@
 //! S6: the Perform screen's view-model, without a window. One test per
 //! element: song map, queued-jump marker, Now/Next, pads, transport, fade,
-//! hold-to-panic, jump timing, loop and infinite, the status area, and the
-//! keys.
+//! hold-to-panic, jump timing, loop and infinite, what the notes say about
+//! the device and the song, and the keys.
 
 use std::time::{Duration, Instant};
 
@@ -489,16 +489,16 @@ fn loop_section_and_infinite_toggle_from_their_state() {
 }
 
 #[test]
-fn status_area_shows_the_device_underruns_and_the_last_error_in_the_apps_words() {
+fn the_notes_say_why_the_device_plays_nothing_and_the_last_error_in_the_apps_words() {
     let mut song = song();
     song.warnings = vec!["stem \"pad\" is silent".to_owned()];
     let mut snapshot = snapshot();
+    // The device plays: nothing to say of it (the header's chip names it).
     let status = PerformView::new(&snapshot, &song).status;
-    assert_eq!(status.device, "Speakers · 48000 Hz · 256 frames · 5.3 ms");
-    assert_eq!(status.device_level, Level::Ok);
-    assert_eq!(status.underruns, "Underruns: 0");
+    assert_eq!(status.device_problem, None);
     assert_eq!(status.last_error, None);
     assert_eq!(status.warnings, ["stem \"pad\" is silent"]);
+    assert_eq!(status.facts_problem, None);
 
     let error = RuntimeError::JumpWaiting {
         section: "Chorus".to_owned(),
@@ -519,12 +519,10 @@ fn status_area_shows_the_device_underruns_and_the_last_error_in_the_apps_words()
         )
     );
     assert_eq!(status.last_error, Some(error.to_string()));
-    assert_eq!(status.underruns, "Underruns: 3");
     assert_eq!(
-        status.device,
-        "No device: \"Speakers\" (the device was unplugged)"
+        status.device_problem.as_deref(),
+        Some("No device: \"Speakers\" (the device was unplugged)")
     );
-    assert_eq!(status.device_level, Level::Error);
 
     let refused = OutputError::NoDevice;
     snapshot.device = DeviceStatus::Disconnected {
@@ -533,8 +531,10 @@ fn status_area_shows_the_device_underruns_and_the_last_error_in_the_apps_words()
         reopen_error: Some(refused.clone()),
     };
     assert_eq!(
-        PerformView::new(&snapshot, &song).status.device,
-        format!("No device: \"Speakers\" (cannot open it again: {refused})")
+        PerformView::new(&snapshot, &song).status.device_problem,
+        Some(format!(
+            "No device: \"Speakers\" (cannot open it again: {refused})"
+        ))
     );
     // The session closed the stream itself for new settings the device
     // refuses: the device is there.
@@ -550,8 +550,10 @@ fn status_area_shows_the_device_underruns_and_the_last_error_in_the_apps_words()
         reopen_error: Some(refused.clone()),
     };
     assert_eq!(
-        PerformView::new(&snapshot, &song).status.device,
-        format!("Paused: \"Speakers\" refuses the new settings ({refused})")
+        PerformView::new(&snapshot, &song).status.device_problem,
+        Some(format!(
+            "Paused: \"Speakers\" refuses the new settings ({refused})"
+        ))
     );
     snapshot.device = DeviceStatus::Disconnected {
         device: "Speakers".to_owned(),
@@ -559,15 +561,21 @@ fn status_area_shows_the_device_underruns_and_the_last_error_in_the_apps_words()
         reopen_error: None,
     };
     assert_eq!(
-        PerformView::new(&snapshot, &song).status.device,
-        "No device: \"Speakers\" (the stream closed to open again with new settings)"
+        PerformView::new(&snapshot, &song)
+            .status
+            .device_problem
+            .as_deref(),
+        Some("No device: \"Speakers\" (the stream closed to open again with new settings)")
     );
     snapshot.device = DeviceStatus::PlayerLost {
         device: "Speakers".to_owned(),
     };
     assert_eq!(
-        PerformView::new(&snapshot, &song).status.device,
-        "No device: \"Speakers\" (the output kept the player; open the song again)"
+        PerformView::new(&snapshot, &song)
+            .status
+            .device_problem
+            .as_deref(),
+        Some("No device: \"Speakers\" (the output kept the player; open the song again)")
     );
 }
 
@@ -1020,6 +1028,57 @@ fn now_next_pads_and_map_name_a_repeated_section_by_its_turn() {
 }
 
 #[test]
+fn a_tag_that_plays_more_than_once_stays_tag_on_the_map_the_pads_and_now_and_next() {
+    // Intro, Verse 1, Chorus, the Tag twice, Outro.
+    let mut song = bars_song();
+    let positions = song.positions.clone();
+    song.positions = [0, 1, 2, 5, 5, 6].map(|i| positions[i].clone()).to_vec();
+    let names = ["Intro", "Verse 1", "Chorus", "Tag", "Tag", "Outro"];
+    let shorts = ["In", "V1", "C", "Tag", "Tag", "Out"];
+
+    // The first Tag plays; the second one is next.
+    let mut snapshot = snapshot();
+    snapshot.position = 3;
+    snapshot.section = "Tag".to_owned();
+    snapshot.bar = 44;
+    snapshot.beat = 1;
+    snapshot.source_frame = song.positions[3].start_frame + BAR;
+    let view = PerformView::new(&snapshot, &song);
+    let pads: Vec<&str> = view.pads.iter().map(|p| p.label.as_str()).collect();
+    assert_eq!(pads, names);
+    let abbreviations: Vec<&str> = view.pads.iter().map(|p| p.abbr.as_str()).collect();
+    assert_eq!(abbreviations, shorts);
+    let blocks: Vec<&str> = view.map.blocks.iter().map(|b| b.label.as_str()).collect();
+    assert_eq!(blocks, names);
+    let blocks: Vec<&str> = view.map.blocks.iter().map(|b| b.short.as_str()).collect();
+    assert_eq!(blocks, shorts);
+    assert_eq!(view.now.name, "Tag");
+    assert_eq!(view.next.name, "Tag");
+}
+
+#[test]
+fn a_label_is_numbered_by_its_turn_unless_it_ends_in_a_number() {
+    let mut song = bars_song();
+    // A label of two words with no number, played twice.
+    song.positions[2].label = "Guitar solo".to_owned();
+    song.positions[4].label = "Guitar solo".to_owned();
+    let view = PerformView::new(&at_bar(1, 10), &song);
+    let pads: Vec<&str> = view.pads.iter().map(|p| p.label.as_str()).collect();
+    assert_eq!(
+        pads,
+        [
+            "Intro",
+            "Verse 1",
+            "Guitar solo 1",
+            "Turnaround",
+            "Guitar solo 2",
+            "Tag",
+            "Outro"
+        ]
+    );
+}
+
+#[test]
 fn each_section_family_has_the_design_canvas_icon() {
     let expected = [
         ("Count-off", "metronome"),
@@ -1231,6 +1290,24 @@ fn the_song_header_shows_key_tempo_meter_and_the_arrangement_by_name() {
 }
 
 #[test]
+fn the_notes_say_why_the_songs_facts_are_missing() {
+    let unread = SongFacts {
+        unread: Some("Key, tempo and meter missing: song.json: gone. Trying again.".to_owned()),
+        ..SongFacts::default()
+    };
+    let view = PerformView::with_facts(&at_bar(1, 10), &bars_song(), &unread);
+    assert_eq!(view.status.facts_problem, unread.unread);
+    assert_eq!(
+        (view.header.key, view.header.tempo, view.header.meter),
+        (None, None, None)
+    );
+
+    // Facts that were read leave nothing to say.
+    let view = PerformView::with_facts(&at_bar(1, 10), &bars_song(), &bars_facts());
+    assert_eq!(view.status.facts_problem, None);
+}
+
+#[test]
 fn the_device_chip_names_the_device_its_outputs_buffer_and_latency() {
     let mut snapshot = snapshot();
     let device = PerformView::new(&snapshot, &song()).device;
@@ -1257,7 +1334,7 @@ fn the_device_chip_names_the_device_its_outputs_buffer_and_latency() {
     assert_eq!(view.device.name, "Speakers");
     assert_eq!(view.device.meta, "Disconnected");
     assert_eq!(view.device.level, Level::Error);
-    assert_eq!(view.status.device_level, Level::Error);
+    assert!(view.status.device_problem.is_some());
     snapshot.device = DeviceStatus::Disconnected {
         device: "Speakers".to_owned(),
         reason: LossReason::Reconfigured,
