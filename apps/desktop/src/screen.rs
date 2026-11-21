@@ -2,13 +2,15 @@
 //! that plays, polls it on a timer, turns pointer and key events into
 //! view-model actions, and hands a [`PerformView`] (and, for a setlist, a
 //! [`openvamp_desktop::strip::SetlistView`]) to the presentational code in
-//! [`crate::ui`].
+//! [`crate::ui`], with the song's [`SongFacts`] read from its `song.json`.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use app::AudioOutput;
+use domain::SetlistItem;
 use gpui::{
     App, AppContext, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
     ModifiersChangedEvent, PathPromptOptions, PromptButton, PromptLevel, Render, Subscription,
@@ -26,7 +28,7 @@ use openvamp_desktop::mixer::{MixerAction, MixerPage, restore_mix, unsaved_mix};
 use openvamp_desktop::output_page::{OutputAction, OutputPage};
 use openvamp_desktop::reorder::Half;
 use openvamp_desktop::show::{LoadedSetlist, Show, Source, close, replace};
-use openvamp_desktop::view::PerformView;
+use openvamp_desktop::view::{PerformView, SongFacts};
 
 use crate::library_ui::{DraggedItem, DraggedSetlist};
 use crate::ui::DraggedTile;
@@ -63,6 +65,9 @@ pub struct Perform {
     mixer: MixerPage,
     /// The Audio output screen's own state.
     output: OutputPage,
+    /// The facts of the last song folder read, which the song header and
+    /// the bars on Perform show: read once per song, not on every frame.
+    facts: Option<(PathBuf, SongFacts)>,
     _poll: Task<()>,
     _quit: Subscription,
     _deactivated: Subscription,
@@ -109,6 +114,7 @@ impl Perform {
             settings: AudioSettings::load(ConfigStore::from_environment()),
             mixer: MixerPage::new(),
             output: OutputPage::new(),
+            facts: None,
             _poll: poll,
             _quit: quit,
             _deactivated: deactivated,
@@ -464,6 +470,30 @@ impl Perform {
         }
     }
 
+    /// What the song playing's `song.json` says, read once per song folder;
+    /// for a setlist's click-only tile, its tempo and meter. Nothing when
+    /// the file cannot be read: the screen then shows what the session
+    /// says.
+    fn song_facts(&mut self) -> SongFacts {
+        let Some(show) = &self.loaded else {
+            return SongFacts::default();
+        };
+        let Some((folder, _)) = show.mix_file() else {
+            return current_click(show).unwrap_or_default();
+        };
+        if let Some((read, facts)) = &self.facts
+            && *read == folder
+        {
+            return facts.clone();
+        }
+        let facts = fs::read_to_string(folder.join(library::MANIFEST_FILE))
+            .ok()
+            .and_then(|json| SongFacts::from_manifest(&json))
+            .unwrap_or_default();
+        self.facts = Some((folder, facts.clone()));
+        facts
+    }
+
     /// The setlist playing, when one does.
     fn loaded_setlist(&mut self) -> Option<&mut LoadedSetlist> {
         self.loaded.as_mut().and_then(Show::setlist_mut)
@@ -702,6 +732,26 @@ impl Perform {
     }
 }
 
+/// The facts of the click-only tile `show`'s setlist is on, when it is on
+/// one.
+fn current_click(show: &Show) -> Option<SongFacts> {
+    let setlist = show.setlist()?;
+    let item = setlist
+        .session
+        .info()
+        .items
+        .get(setlist.snapshot.setlist.current)?;
+    let SetlistItem::Click(click) = &item.item else {
+        return None;
+    };
+    let meter = click.time_signature;
+    Some(SongFacts::click(
+        click.bpm,
+        meter.numerator,
+        meter.denominator,
+    ))
+}
+
 /// The modifiers the keyboard rules read; Shift is left out.
 fn mods(modifiers: &Modifiers) -> Mods {
     Mods {
@@ -724,7 +774,12 @@ enum Pick {
 }
 
 impl Render for Perform {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let facts = if self.page == Page::Perform {
+            self.song_facts()
+        } else {
+            SongFacts::default()
+        };
         let body = match (self.page, &self.loaded) {
             (Page::Library, _) => match &self.library {
                 Some(library) => {
@@ -736,11 +791,14 @@ impl Render for Perform {
                 }
             },
             (Page::Perform, Some(show)) => {
-                let view = PerformView::new(show.snapshot(), show.song());
+                let view = PerformView::with_facts(show.snapshot(), show.song(), &facts);
                 let setlist = show.setlist().map(LoadedSetlist::view);
+                let mixer = self.mixer.view(Some(show));
                 ui::perform(
                     &view,
                     setlist.as_ref(),
+                    mixer.as_ref(),
+                    window.viewport_size(),
                     self.hold.fill(Instant::now()),
                     &self.problems,
                     cx,

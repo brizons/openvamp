@@ -202,10 +202,18 @@ const ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/arrangement.svg"),
     ),
     (
+        "icons/arrow-right.svg",
+        include_bytes!("../assets/icons/arrow-right.svg"),
+    ),
+    (
         "icons/back-to-start.svg",
         include_bytes!("../assets/icons/back-to-start.svg"),
     ),
     ("icons/bass.svg", include_bytes!("../assets/icons/bass.svg")),
+    (
+        "icons/bridge.svg",
+        include_bytes!("../assets/icons/bridge.svg"),
+    ),
     (
         "icons/check.svg",
         include_bytes!("../assets/icons/check.svg"),
@@ -234,7 +242,13 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/electric-guitar.svg",
         include_bytes!("../assets/icons/electric-guitar.svg"),
     ),
+    (
+        "icons/enter.svg",
+        include_bytes!("../assets/icons/enter.svg"),
+    ),
+    ("icons/exit.svg", include_bytes!("../assets/icons/exit.svg")),
     ("icons/fade.svg", include_bytes!("../assets/icons/fade.svg")),
+    ("icons/flag.svg", include_bytes!("../assets/icons/flag.svg")),
     (
         "icons/folder.svg",
         include_bytes!("../assets/icons/folder.svg"),
@@ -252,6 +266,10 @@ const ICONS: &[(&str, &[u8])] = &[
     (
         "icons/library.svg",
         include_bytes!("../assets/icons/library.svg"),
+    ),
+    (
+        "icons/lines.svg",
+        include_bytes!("../assets/icons/lines.svg"),
     ),
     ("icons/link.svg", include_bytes!("../assets/icons/link.svg")),
     ("icons/loop.svg", include_bytes!("../assets/icons/loop.svg")),
@@ -325,6 +343,7 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/reset.svg",
         include_bytes!("../assets/icons/reset.svg"),
     ),
+    ("icons/rise.svg", include_bytes!("../assets/icons/rise.svg")),
     (
         "icons/routing.svg",
         include_bytes!("../assets/icons/routing.svg"),
@@ -343,6 +362,10 @@ const ICONS: &[(&str, &[u8])] = &[
     ),
     ("icons/sine.svg", include_bytes!("../assets/icons/sine.svg")),
     (
+        "icons/sliders.svg",
+        include_bytes!("../assets/icons/sliders.svg"),
+    ),
+    (
         "icons/sparkle.svg",
         include_bytes!("../assets/icons/sparkle.svg"),
     ),
@@ -354,16 +377,19 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/speech.svg",
         include_bytes!("../assets/icons/speech.svg"),
     ),
+    ("icons/star.svg", include_bytes!("../assets/icons/star.svg")),
     ("icons/stay.svg", include_bytes!("../assets/icons/stay.svg")),
     (
         "icons/stems.svg",
         include_bytes!("../assets/icons/stems.svg"),
     ),
     ("icons/stop.svg", include_bytes!("../assets/icons/stop.svg")),
+    ("icons/tag.svg", include_bytes!("../assets/icons/tag.svg")),
     (
         "icons/trash.svg",
         include_bytes!("../assets/icons/trash.svg"),
     ),
+    ("icons/turn.svg", include_bytes!("../assets/icons/turn.svg")),
     ("icons/up.svg", include_bytes!("../assets/icons/up.svg")),
     (
         "icons/violin.svg",
@@ -373,6 +399,7 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/voices.svg",
         include_bytes!("../assets/icons/voices.svg"),
     ),
+    ("icons/wave.svg", include_bytes!("../assets/icons/wave.svg")),
 ];
 
 impl AssetSource for Icons {

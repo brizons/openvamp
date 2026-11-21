@@ -5,14 +5,15 @@
 //! double click returns a fader to 0 dB. Every fader has its meter slot
 //! beside it, empty: the engine reports no levels yet (T6b fills them).
 //! The arrangement chip draws as the design's dropdown but picks nothing
-//! yet: the app cannot switch arrangements.
+//! yet: the app cannot switch arrangements. The Perform screen shows the
+//! buses layer's strips compactly under its pads ([`compact_mixer`]).
 
 use domain::Bus;
 use gpui::{
     AnyElement, ClickEvent, Context, Div, DragMoveEvent, ElementId, FontWeight, IntoElement,
     Render, Rgba, SharedString, Stateful, Window, div, prelude::*, px, relative,
 };
-use openvamp_desktop::action::{Intent, UiAction};
+use openvamp_desktop::action::{Intent, Page, UiAction};
 use openvamp_desktop::mixer::{
     BusStrip, FADER_CAP_HEIGHT, FADER_CAP_WIDTH, FADER_PADDING, Layer, MasterStrip, MixerAction,
     MixerScreen, StemStrip, fader_drag_position,
@@ -40,6 +41,13 @@ const BUS_METER_WIDTH: f32 = 6.0;
 
 /// The opacity of a control that does nothing now.
 const DISABLED_OPACITY: f32 = 0.45;
+
+/// The least height of a strip's meters and fader on the Mixer screen.
+const FADER_ZONE_MIN_HEIGHT: f32 = 120.0;
+
+/// The least height of a bus strip's meters and fader in the compact mixer
+/// on the Perform screen, which gets the room the pads leave.
+const COMPACT_FADER_ZONE_MIN_HEIGHT: f32 = 40.0;
 
 /// What a fader sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,12 +138,7 @@ pub fn mixer(view: &MixerScreen, cx: &mut Context<Perform>) -> impl IntoElement 
                 .collect(),
             6.,
         ),
-        Layer::Buses => {
-            let mut strips: Vec<AnyElement> =
-                view.buses.iter().map(|bus| bus_strip(bus, cx)).collect();
-            strips.push(master_strip(&view.master, cx));
-            (strips, 8.)
-        }
+        Layer::Buses => (bus_strips(view, FADER_ZONE_MIN_HEIGHT, cx), 8.),
     };
     div()
         .flex_1()
@@ -180,6 +183,111 @@ pub fn mixer(view: &MixerScreen, cx: &mut Context<Perform>) -> impl IntoElement 
                         .children(strips),
                 ),
         )
+}
+
+/// A strip per bus and the master's, with meters and faders at least
+/// `zone` points tall.
+fn bus_strips(view: &MixerScreen, zone: f32, cx: &mut Context<Perform>) -> Vec<AnyElement> {
+    let mut strips: Vec<AnyElement> = view
+        .buses
+        .iter()
+        .map(|bus| bus_strip(bus, zone, cx))
+        .collect();
+    strips.push(master_strip(&view.master, zone, cx));
+    strips
+}
+
+/// The design canvas's bus mixer at the bottom of the Perform screen: the
+/// buses layer's strips, the Buses | Stems control, whose Stems opens the
+/// Mixer screen on its stems, and the device's outputs.
+pub(crate) fn compact_mixer(view: &MixerScreen, cx: &mut Context<Perform>) -> impl IntoElement {
+    let segment = |id: &'static str, icon_name: &'static str, label: &'static str, on: bool| {
+        let color = if on {
+            theme::text()
+        } else {
+            theme::text_muted()
+        };
+        div()
+            .id(id)
+            .h(px(28.))
+            .px(px(12.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .rounded(px(7.))
+            .text_size(px(13.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(color)
+            .when(on, |item| item.bg(theme::segment()))
+            .child(icon(icon_name, color, 14.))
+            .child(label)
+    };
+    let stems = segment("perform-layer-stems", "wave", "Stems", false)
+        .cursor_pointer()
+        .on_click(cx.listener(|screen, _: &ClickEvent, window, cx| {
+            screen.mixer_act(MixerAction::ShowLayer(Layer::Stems), cx);
+            screen.handle(Intent::ShowPage(Page::Mixer), window, cx);
+        }));
+    div()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .px(px(14.))
+        .py(px(12.))
+        .rounded(px(14.))
+        .bg(theme::surface())
+        .border_1()
+        .border_color(theme::border())
+        .overflow_hidden()
+        .child(
+            div()
+                .h(px(34.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .gap(px(2.))
+                        .p(px(3.))
+                        .rounded(px(10.))
+                        .bg(theme::bg())
+                        .border_1()
+                        .border_color(theme::border())
+                        .child(segment("perform-layer-buses", "sliders", "Buses", true))
+                        .child(stems),
+                )
+                .child(div().flex_1())
+                .child(outputs(&view.outputs)),
+        )
+        .child(
+            div()
+                .id("perform-strips")
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .gap(px(8.))
+                .pb(px(6.))
+                .overflow_x_scroll()
+                .children(bus_strips(view, COMPACT_FADER_ZONE_MIN_HEIGHT, cx)),
+        )
+}
+
+/// The device's outputs, such as "8 outputs", with their icon.
+fn outputs(outputs: &str) -> impl IntoElement {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .text_size(px(13.))
+        .text_color(theme::text_muted())
+        .child(icon("output-ports", theme::text_muted(), 16.))
+        .child(outputs.to_owned())
 }
 
 /// The song, its place in the setlist, the arrangement, the time,
@@ -353,17 +461,7 @@ fn toolbar(view: &MixerScreen, cx: &mut Context<Perform>) -> impl IntoElement {
                             .child(bus.name())
                     })),
             ),
-        Layer::Buses => toolbar.child(div().flex_1()).child(
-            div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .text_size(px(13.))
-                .text_color(theme::text_muted())
-                .child(icon("output-ports", theme::text_muted(), 16.))
-                .child(view.outputs.clone()),
-        ),
+        Layer::Buses => toolbar.child(div().flex_1()).child(outputs(&view.outputs)),
     }
 }
 
@@ -443,7 +541,7 @@ fn stem_strip(stem: &StemStrip, menu: bool, cx: &mut Context<Perform>) -> AnyEle
     let body: AnyElement = if menu {
         bus_choices(stem, cx).into_any_element()
     } else {
-        fader_zone(3.)
+        fader_zone(3., FADER_ZONE_MIN_HEIGHT)
             .when(stem.silenced, |zone| zone.opacity(0.4))
             .child(meter_slot(STEM_METER_WIDTH))
             .child(fader(FaderTarget::Stem(index), stem.fader, false, cx))
@@ -492,9 +590,9 @@ fn stem_strip(stem: &StemStrip, menu: bool, cx: &mut Context<Perform>) -> AnyEle
 }
 
 /// The row that holds a strip's meter slots and its fader, as tall as the
-/// strip leaves; `gap` points between them.
-fn fader_zone(gap: f32) -> Div {
-    div().flex_1().min_h(px(120.)).flex().gap(px(gap))
+/// strip leaves and at least `min_height`; `gap` points between them.
+fn fader_zone(gap: f32, min_height: f32) -> Div {
+    div().flex_1().min_h(px(min_height)).flex().gap(px(gap))
 }
 
 /// A stem's bus choices: the rules table's ("Default") and every bus.
@@ -552,14 +650,14 @@ fn bus_choice(
     .child(div().min_w_0().one_line().child(label))
 }
 
-fn bus_strip(bus: &BusStrip, cx: &mut Context<Perform>) -> AnyElement {
+fn bus_strip(bus: &BusStrip, zone: f32, cx: &mut Context<Perform>) -> AnyElement {
     let color = theme::bus(bus.bus);
     bus_frame(color, theme::strip(), theme::strip_border())
         .child(bus_strip_icon(bus.icon, color))
         .child(bus_name(bus.name))
         .child(output_label(&bus.output))
         .child(
-            bus_meters_and_fader(FaderTarget::Bus(bus.bus), bus.fader, false, cx)
+            bus_meters_and_fader(FaderTarget::Bus(bus.bus), bus.fader, false, zone, cx)
                 .when(bus.mute, |zone| zone.opacity(DISABLED_OPACITY)),
         )
         .child(readout(&bus.db))
@@ -591,7 +689,7 @@ fn bus_strip(bus: &BusStrip, cx: &mut Context<Perform>) -> AnyElement {
         .into_any_element()
 }
 
-fn master_strip(master: &MasterStrip, cx: &mut Context<Perform>) -> AnyElement {
+fn master_strip(master: &MasterStrip, zone: f32, cx: &mut Context<Perform>) -> AnyElement {
     bus_frame(theme::text(), theme::raised(), theme::chip_border())
         .child(bus_strip_icon("speaker", theme::text()))
         .child(bus_name("Master"))
@@ -600,6 +698,7 @@ fn master_strip(master: &MasterStrip, cx: &mut Context<Perform>) -> AnyElement {
             FaderTarget::Master,
             master.fader,
             true,
+            zone,
             cx,
         ))
         .child(readout(&master.db))
@@ -634,14 +733,16 @@ fn bus_name(name: &str) -> impl IntoElement {
         .child(SharedString::from(name.to_uppercase()))
 }
 
-/// A bus's two meter slots, left and right, and its fader.
+/// A bus's two meter slots, left and right, and its fader, at least `zone`
+/// points tall.
 fn bus_meters_and_fader(
     target: FaderTarget,
     position: f32,
     master: bool,
+    zone: f32,
     cx: &mut Context<Perform>,
 ) -> Div {
-    fader_zone(7.)
+    fader_zone(7., zone)
         .child(
             div()
                 .flex_none()

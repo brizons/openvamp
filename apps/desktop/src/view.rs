@@ -1,12 +1,16 @@
 //! What the Perform screen shows, mapped from a session [`Snapshot`] and the
 //! open song (S6): the song map with the playhead and the queued jump, the
 //! section pads with Now and Next, the transport, the fade, the jump
-//! timing, loop and infinite, and the status area.
+//! timing, loop and infinite, and the status area. The design canvas's
+//! Main artboard adds what the song's `song.json` says ([`SongFacts`]): its
+//! key, tempo and meter in the song header, and the bars each section
+//! lasts on the map, the pads and the Now and Next cards.
 
 use app::{
     DeviceStatus, FadeState, JumpKind, JumpTiming, LoadError, LossReason, OpenError, PositionInfo,
     Snapshot, SongInfo, TransportState,
 };
+use domain::{DEFAULT_ARRANGEMENT_ID, SongPackage};
 
 use crate::action::is_playing;
 
@@ -43,9 +47,15 @@ impl SectionKind {
     }
 }
 
-/// A short name for a section block on the song map: "V2" for "Verse 2".
+/// A short name for a section block on the song map: "V2" for "Verse 2";
+/// a tag without a number keeps its name, "Tag", as the design canvas has
+/// it.
 pub fn short_label(label: &str) -> String {
     let word = first_word(label);
+    let number = label[word.len()..].trim();
+    if word == "Tag" && number.is_empty() {
+        return "Tag".to_owned();
+    }
     let short = match word {
         "Count-off" => "CO",
         "Intro" => "In",
@@ -64,8 +74,62 @@ pub fn short_label(label: &str) -> String {
         "Ending" => "End",
         other => return other.chars().take(3).collect(),
     };
-    let number = label[word.len()..].trim();
     format!("{short}{number}")
+}
+
+/// The short names of `positions` on the song map and the pads
+/// ([`short_label`]), where a section without a number that plays more
+/// than once is numbered by its turn: "Chorus" twice is "C1" and "C2".
+fn abbreviations(positions: &[PositionInfo]) -> Vec<String> {
+    positions
+        .iter()
+        .enumerate()
+        .map(|(index, info)| {
+            let label = info.label.as_str();
+            let numbered = label.len() > first_word(label).len();
+            let repeats = positions.iter().filter(|p| p.label == label).count() > 1;
+            if numbered || !repeats {
+                return short_label(label);
+            }
+            let turn = positions[..index]
+                .iter()
+                .filter(|p| p.label == label)
+                .count()
+                + 1;
+            short_label(&format!("{label} {turn}"))
+        })
+        .collect()
+}
+
+/// The icon (a file of `assets/icons` without `.svg`) a section shows on
+/// its pad and on the Now and Next cards, after the design canvas.
+pub fn section_icon(label: &str) -> &'static str {
+    match first_word(label) {
+        "Count-off" => "metronome",
+        "Intro" => "enter",
+        "Verse" => "lines",
+        "Pre-chorus" => "rise",
+        "Chorus" | "Post-chorus" => "star",
+        "Bridge" | "Breakdown" => "bridge",
+        "Tag" => "tag",
+        "Vamp" => "loop",
+        "Turnaround" => "turn",
+        "Outro" => "exit",
+        "Ending" => "flag",
+        _ => "note",
+    }
+}
+
+/// The icon of the end of the song on the Next card.
+const END_ICON: &str = "flag";
+
+/// "1 bar", "16 bars".
+fn bars_text(bars: u64) -> String {
+    if bars == 1 {
+        "1 bar".to_owned()
+    } else {
+        format!("{bars} bars")
+    }
 }
 
 fn first_word(label: &str) -> &str {
@@ -91,6 +155,12 @@ pub struct MapBlock {
     pub is_now: bool,
     /// Whether it is the target of the queued jump or loop.
     pub is_queued: bool,
+    /// How many bars it lasts, when the song says.
+    pub bars: Option<u64>,
+    /// The ruler's number under it: the bar it starts at, counted in play
+    /// order from 1; `None` for a block shorter than 4 bars, which has no
+    /// room for it, or when the bars before it cannot be counted.
+    pub ruler: Option<String>,
 }
 
 /// Where and when the queued jump or loop executes (F6.5).
@@ -121,6 +191,13 @@ pub struct Pad {
     pub position: usize,
     /// Label, such as "Verse 2".
     pub label: String,
+    /// Its short name, large on the pad: "V2", or "C2" for the second
+    /// "Chorus" ([`MapBlock::short`]).
+    pub abbr: String,
+    /// Its icon ([`section_icon`]).
+    pub icon: &'static str,
+    /// How many bars it lasts, such as "16 bars", when the song says.
+    pub bars: Option<String>,
     /// Section family.
     pub kind: SectionKind,
     /// The key that queues it, for the first nine positions.
@@ -140,6 +217,13 @@ pub struct NowCard {
     pub name: String,
     /// Time left in it, such as "6.3 s left".
     pub detail: String,
+    /// Bars left in it, counting the one playing, such as "11 bars left";
+    /// `None` when its bars cannot be counted.
+    pub bars_left: Option<String>,
+    /// Its family, which colors its icon.
+    pub kind: SectionKind,
+    /// Its icon ([`section_icon`]).
+    pub icon: &'static str,
 }
 
 /// The card that says what plays next.
@@ -153,6 +237,14 @@ pub struct NextCard {
     pub detail: String,
     /// Whether a jump or loop is queued; the card then offers to cancel it.
     pub queued: bool,
+    /// [`Self::detail`] in bars, such as "Plays in 11 bars · tap a section
+    /// to jump"; `None` for a queued jump, which says its time, and when
+    /// the current section's bars cannot be counted.
+    pub bars_detail: Option<String>,
+    /// The family of what plays next; neutral for the end of the song.
+    pub kind: SectionKind,
+    /// Its icon ([`section_icon`]), or a flag for the end of the song.
+    pub icon: &'static str,
 }
 
 /// The transport.
@@ -165,6 +257,10 @@ pub struct TransportView {
     pub play_label: String,
     /// Whether the play/pause button shows pause.
     pub playing: bool,
+    /// What the clock adds while the transport changes state ("Loading…",
+    /// "Stopping", "Panic"), which the play/pause icon does not show;
+    /// `None` while it plays, is paused or stopped.
+    pub note: Option<String>,
 }
 
 /// The fade button.
@@ -181,6 +277,8 @@ pub struct FadeButton {
 pub enum Level {
     /// All is well.
     Ok,
+    /// Plays, with something to look at: underruns.
+    Warning,
     /// Needs attention.
     Error,
 }
@@ -201,6 +299,154 @@ pub struct StatusView {
     pub warnings: Vec<String>,
 }
 
+/// The header's device chip: the device, its outputs, buffer and latency.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceChip {
+    /// The device's name.
+    pub name: String,
+    /// Its outputs, buffer frames and latency, such as "8 out · 256 ·
+    /// 5.3 ms", with the underruns when there are any; "Disconnected" or
+    /// "Refuses the new settings" without a stream (the status says why).
+    pub meta: String,
+    /// [`Level::Warning`] with underruns, [`Level::Error`] without a
+    /// stream.
+    pub level: Level,
+}
+
+/// The line under the song's title: its key, tempo and meter, and the
+/// arrangement playing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SongHeader {
+    /// Key, such as "G".
+    pub key: Option<String>,
+    /// Tempo the song starts in, such as "104 BPM".
+    pub tempo: Option<String>,
+    /// Time signature the song starts in, such as "4/4".
+    pub meter: Option<String>,
+    /// The arrangement playing, by its name ("Default"), or by its id when
+    /// the song's facts do not name it.
+    pub arrangement: String,
+}
+
+/// What a song's `song.json` (or a click-only tile) says that the session
+/// does not: its key, tempo and meter, its arrangements' names, and how
+/// long a bar lasts, which counts the bars of a section no other starts
+/// after.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SongFacts {
+    /// Key, such as "G".
+    pub key: Option<String>,
+    /// Tempo at the start, in beats per minute.
+    pub bpm: Option<f64>,
+    /// Time signature at the start: beats per bar and the note of a beat.
+    pub meter: Option<(u32, u32)>,
+    /// Every arrangement, as (id, name).
+    pub arrangements: Vec<(String, String)>,
+    /// From each tempo or time-signature change on (its source frame), the
+    /// seconds a bar lasts; in source order.
+    pub bar_seconds: Vec<(u64, f64)>,
+}
+
+impl SongFacts {
+    /// The facts of the `song.json` manifest `json`; `None` when it does not
+    /// parse ([`SongPackage::from_json`]).
+    pub fn from_manifest(json: &str) -> Option<Self> {
+        let package = SongPackage::from_json(json).ok()?;
+        let mut changes: Vec<u64> = package
+            .tempo_map
+            .iter()
+            .map(|point| point.at)
+            .chain(package.time_signature_map.iter().map(|point| point.at))
+            .collect();
+        changes.sort_unstable();
+        changes.dedup();
+        // The tempo counts the time signature's note: a bar is `numerator`
+        // of them.
+        let bar_seconds = changes
+            .into_iter()
+            .filter_map(|at| {
+                let bpm = package.tempo_map.iter().rfind(|p| p.at <= at)?.bpm;
+                let meter = package.time_signature_map.iter().rfind(|p| p.at <= at)?;
+                (bpm > 0.0).then(|| (at, 60.0 / bpm * f64::from(meter.numerator)))
+            })
+            .collect();
+        Some(Self {
+            key: package.key.clone(),
+            bpm: package.tempo_map.first().map(|point| point.bpm),
+            meter: package
+                .time_signature_map
+                .first()
+                .map(|point| (point.numerator, point.denominator)),
+            arrangements: package
+                .arrangements
+                .iter()
+                .map(|arrangement| (arrangement.id.clone(), arrangement.name.clone()))
+                .collect(),
+            bar_seconds,
+        })
+    }
+
+    /// The facts of a click-only tile at `bpm`, in `numerator`/`denominator`;
+    /// its one arrangement is named as `domain::Song::click_only` names it.
+    pub fn click(bpm: f64, numerator: u32, denominator: u32) -> Self {
+        Self {
+            key: None,
+            bpm: Some(bpm),
+            meter: Some((numerator, denominator)),
+            arrangements: vec![(DEFAULT_ARRANGEMENT_ID.to_owned(), "Default".to_owned())],
+            bar_seconds: if bpm > 0.0 {
+                vec![(0, 60.0 / bpm * f64::from(numerator))]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// The frames a bar lasts at source frame `at`, at `rate`.
+    fn bar_frames_at(&self, at: u64, rate: u32) -> Option<f64> {
+        self.bar_seconds
+            .iter()
+            .rfind(|(from, _)| *from <= at)
+            .map(|(_, seconds)| seconds * f64::from(rate))
+    }
+}
+
+/// How the section pads lay out in a row `width` points wide.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PadGrid {
+    /// Pads per row, which share its width.
+    pub columns: usize,
+    /// A pad's height, in points.
+    pub height: f32,
+    /// More than [`COMPACT_PADS_AFTER`] pads: shorter pads, a smaller
+    /// name, and no bar count.
+    pub compact: bool,
+}
+
+/// Past this many pads, they get compact ([`PadGrid::compact`]).
+pub const COMPACT_PADS_AFTER: usize = 12;
+
+/// The room between pads, in points.
+pub const PAD_GAP: f32 = 8.0;
+
+/// The pads' grid for `pads` pads in a row `width` points wide, as the
+/// design canvas lays them out: pads at least 100 points wide (92 when
+/// compact) share the row, as many as fit, and wrap to more rows.
+pub fn pad_grid(width: f32, pads: usize) -> PadGrid {
+    let compact = pads > COMPACT_PADS_AFTER;
+    let (min, height) = if compact {
+        (92.0, 46.0)
+    } else {
+        (100.0, 100.0)
+    };
+    let fit = ((width + PAD_GAP) / (min + PAD_GAP)).floor().max(1.0) as usize;
+    PadGrid {
+        columns: fit.min(pads).max(1),
+        height,
+        compact,
+    }
+}
+
 /// Everything the Perform screen shows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PerformView {
@@ -208,6 +454,10 @@ pub struct PerformView {
     pub title: String,
     /// Artist and arrangement.
     pub subtitle: String,
+    /// The line under the title: key, tempo, meter and arrangement.
+    pub header: SongHeader,
+    /// The header's device chip.
+    pub device: DeviceChip,
     /// The transport.
     pub transport: TransportView,
     /// Time in the arrangement and its length, such as "01:25 / 05:14".
@@ -235,8 +485,15 @@ pub struct PerformView {
 }
 
 impl PerformView {
-    /// What the screen shows for `snapshot` of `song`.
+    /// What the screen shows for `snapshot` of `song`, knowing nothing of
+    /// its `song.json` ([`Self::with_facts`]).
     pub fn new(snapshot: &Snapshot, song: &SongInfo) -> Self {
+        Self::with_facts(snapshot, song, &SongFacts::default())
+    }
+
+    /// What the screen shows for `snapshot` of `song`, whose `song.json`
+    /// says `facts`.
+    pub fn with_facts(snapshot: &Snapshot, song: &SongInfo, facts: &SongFacts) -> Self {
         let timeline = Timeline::new(snapshot, song);
         let next = next_position(snapshot, song);
         let queued_target = snapshot.queued.as_ref().map(|queued| queued.target);
@@ -244,6 +501,8 @@ impl PerformView {
             Some(artist) => format!("{artist} · arrangement \"{}\"", song.arrangement),
             None => format!("arrangement \"{}\"", song.arrangement),
         };
+        let bars = position_bars(song, facts);
+        let abbreviations = abbreviations(&song.positions);
         let pads = song
             .positions
             .iter()
@@ -251,6 +510,9 @@ impl PerformView {
             .map(|(position, info)| Pad {
                 position,
                 label: info.label.clone(),
+                abbr: abbreviations[position].clone(),
+                icon: section_icon(&info.label),
+                bars: bars[position].map(bars_text),
                 kind: SectionKind::of(&info.label),
                 key: char::from_digit(position as u32 + 1, 10).filter(|_| position < 9),
                 is_now: position == snapshot.position,
@@ -258,9 +520,12 @@ impl PerformView {
                 is_queued: queued_target == Some(position),
             })
             .collect();
+        let bars_left = bars_left(snapshot, song, &bars);
         Self {
             title: song.title.clone(),
             subtitle,
+            header: song_header(song, facts),
+            device: device_chip(snapshot),
             transport: transport_view(snapshot.transport),
             clock: format!(
                 "{} / {}",
@@ -268,15 +533,18 @@ impl PerformView {
                 clock(timeline.total, song.sample_rate)
             ),
             bar_beat: format!("Bar {} · beat {}", snapshot.bar, snapshot.beat),
-            map: song_map(snapshot, song, &timeline),
+            map: song_map(snapshot, song, &timeline, &abbreviations, &bars),
             now: NowCard {
                 name: snapshot.section.clone(),
                 detail: format!(
                     "{} left",
                     seconds(timeline.left_in_section, song.sample_rate)
                 ),
+                bars_left: bars_left.map(|left| format!("{} left", bars_text(left))),
+                kind: SectionKind::of(&snapshot.section),
+                icon: section_icon(&snapshot.section),
             },
-            next: next_card(snapshot, song, next, timeline.left_in_section),
+            next: next_card(snapshot, song, next, timeline.left_in_section, bars_left),
             pads,
             jump_timing: snapshot.jump_timing,
             live_loop: snapshot.live_loop(),
@@ -331,8 +599,64 @@ impl Timeline {
     }
 }
 
-fn song_map(snapshot: &Snapshot, song: &SongInfo, timeline: &Timeline) -> SongMap {
+/// How many bars each position of `song` lasts: up to the bar the section
+/// that follows it in the song starts at, when one in the arrangement
+/// does; else its length in bars at the tempo and meter it starts in, from
+/// `facts`, a bar begun counting as one. `None` when neither says.
+fn position_bars(song: &SongInfo, facts: &SongFacts) -> Vec<Option<u64>> {
+    song.positions
+        .iter()
+        .map(|info| {
+            let end = info.start_frame + info.length_frames;
+            let following = song
+                .positions
+                .iter()
+                .find(|other| other.start_frame == end && other.start_bar > info.start_bar);
+            if let Some(following) = following {
+                return Some(following.start_bar - info.start_bar);
+            }
+            let bar = facts.bar_frames_at(info.start_frame, song.sample_rate)?;
+            // A rounding of the frames never makes a bar of its own.
+            let bars = (info.length_frames as f64 / bar - 1e-6).ceil();
+            (bars.is_finite() && bars >= 0.0).then(|| (bars as u64).max(1))
+        })
+        .collect()
+}
+
+/// Bars left in the current position, counting the one playing; `None`
+/// when its bars cannot be counted.
+fn bars_left(snapshot: &Snapshot, song: &SongInfo, bars: &[Option<u64>]) -> Option<u64> {
+    let info = song.positions.get(snapshot.position)?;
+    let bars = (*bars.get(snapshot.position)?)?;
+    let into = snapshot.bar.saturating_sub(info.start_bar);
+    Some(bars.saturating_sub(into).clamp(1, bars.max(1)))
+}
+
+/// The bar each position starts at, counted in play order from 1, for the
+/// positions of 4 bars or more whose preceding bars are all counted.
+fn ruler(bars: &[Option<u64>]) -> Vec<Option<String>> {
+    let mut start = Some(1);
+    bars.iter()
+        .map(|bars| {
+            let label = start
+                .zip(*bars)
+                .filter(|(_, bars)| *bars >= 4)
+                .map(|(start, _)| start.to_string());
+            start = start.zip(*bars).map(|(start, bars)| start + bars);
+            label
+        })
+        .collect()
+}
+
+fn song_map(
+    snapshot: &Snapshot,
+    song: &SongInfo,
+    timeline: &Timeline,
+    abbreviations: &[String],
+    bars: &[Option<u64>],
+) -> SongMap {
     let mut start = 0;
+    let ruler = ruler(bars);
     let blocks = song
         .positions
         .iter()
@@ -341,7 +665,7 @@ fn song_map(snapshot: &Snapshot, song: &SongInfo, timeline: &Timeline) -> SongMa
             let block = MapBlock {
                 position,
                 label: info.label.clone(),
-                short: short_label(&info.label),
+                short: abbreviations[position].clone(),
                 kind: SectionKind::of(&info.label),
                 start: timeline.fraction(start),
                 width: timeline.fraction(info.length_frames),
@@ -350,6 +674,8 @@ fn song_map(snapshot: &Snapshot, song: &SongInfo, timeline: &Timeline) -> SongMa
                     .queued
                     .as_ref()
                     .is_some_and(|q| q.target == position),
+                bars: bars[position],
+                ruler: ruler[position].clone(),
             };
             start += info.length_frames;
             block
@@ -395,12 +721,17 @@ fn next_card(
     song: &SongInfo,
     next: Option<usize>,
     left_in_section: u64,
+    bars_left: Option<u64>,
 ) -> NextCard {
     let rate = song.sample_rate;
     let name = |position: usize| {
         song.positions
             .get(position)
             .map_or_else(String::new, |p| p.label.clone())
+    };
+    let (kind, icon) = match next.and_then(|position| song.positions.get(position)) {
+        Some(info) => (SectionKind::of(&info.label), section_icon(&info.label)),
+        None => (SectionKind::Neutral, END_ICON),
     };
     if let Some(queued) = &snapshot.queued {
         let mut detail = format!("Executes in {}", seconds(queued.frames_until, rate));
@@ -416,24 +747,90 @@ fn next_card(
             name: name(queued.target),
             detail,
             queued: true,
+            bars_detail: None,
+            kind,
+            icon,
         };
     }
-    let left = seconds(left_in_section, rate);
-    let (name, detail) = match next {
-        Some(position) if snapshot.infinite => {
-            (name(position), format!("Repeats in {left} · infinite loop"))
-        }
-        Some(position) => (
-            name(position),
-            format!("Plays in {left} · tap a section to jump"),
-        ),
-        None => ("End of song".to_owned(), format!("Ends in {left}")),
+    // When it comes, in seconds and in bars.
+    let when = |left: &str| match next {
+        Some(_) if snapshot.infinite => format!("Repeats in {left} · infinite loop"),
+        Some(_) => format!("Plays in {left} · tap a section to jump"),
+        None => format!("Ends in {left}"),
     };
     NextCard {
         heading: "Next".to_owned(),
-        name,
-        detail,
+        name: next.map_or_else(|| "End of song".to_owned(), name),
+        detail: when(&seconds(left_in_section, rate)),
         queued: false,
+        bars_detail: bars_left.map(|left| when(&bars_text(left))),
+        kind,
+        icon,
+    }
+}
+
+/// The header's key, tempo and meter from `facts`, and the arrangement by
+/// the name `facts` give it.
+fn song_header(song: &SongInfo, facts: &SongFacts) -> SongHeader {
+    SongHeader {
+        key: facts.key.clone(),
+        tempo: facts.bpm.map(|bpm| format!("{bpm} BPM")),
+        meter: facts
+            .meter
+            .map(|(numerator, denominator)| format!("{numerator}/{denominator}")),
+        arrangement: facts
+            .arrangements
+            .iter()
+            .find(|(id, _)| *id == song.arrangement)
+            .map_or_else(|| song.arrangement.clone(), |(_, name)| name.clone()),
+    }
+}
+
+/// The device chip: the stream's device, outputs, buffer and latency, and
+/// the underruns so far; without a stream, the device and that it plays
+/// nothing.
+fn device_chip(snapshot: &Snapshot) -> DeviceChip {
+    match &snapshot.device {
+        DeviceStatus::Connected(info) => {
+            let mut meta = format!(
+                "{} out · {} · {:.1} ms",
+                info.channels,
+                info.buffer_frames,
+                info.latency().as_secs_f64() * 1_000.0
+            );
+            let level = match snapshot.underruns {
+                0 => Level::Ok,
+                1 => {
+                    meta += " · 1 underrun";
+                    Level::Warning
+                }
+                underruns => {
+                    meta += &format!(" · {underruns} underruns");
+                    Level::Warning
+                }
+            };
+            DeviceChip {
+                name: info.device.clone(),
+                meta,
+                level,
+            }
+        }
+        DeviceStatus::Disconnected {
+            device,
+            reason: LossReason::Reconfigured,
+            reopen_error: Some(_),
+        } => DeviceChip {
+            name: device.clone(),
+            meta: "Refuses the new settings".to_owned(),
+            level: Level::Error,
+        },
+        DeviceStatus::Disconnected { device, .. } | DeviceStatus::PlayerLost { device } => {
+            DeviceChip {
+                name: device.clone(),
+                meta: "Disconnected".to_owned(),
+                level: Level::Error,
+            }
+        }
     }
 }
 
@@ -454,10 +851,16 @@ fn transport_view(transport: TransportState) -> TransportView {
         TransportState::Panicking => "Panic",
     };
     let playing = is_playing(transport);
+    let note = matches!(
+        transport,
+        TransportState::Starting | TransportState::Stopping | TransportState::Panicking
+    )
+    .then(|| state.to_owned());
     TransportView {
         state: state.to_owned(),
         play_label: if playing { "Pause" } else { "Play" }.to_owned(),
         playing,
+        note,
     }
 }
 

@@ -1,36 +1,33 @@
 //! The Perform screen's presentational code: draws a [`PerformView`], and
 //! for a setlist a [`SetlistView`], after the design canvas's Main artboard
-//! (reduced to S6 and S4), and reports what the person does as an
-//! [`Intent`]. It decides nothing.
+//! (reduced to S6 and S4), with the compact bus mixer of the Mixer screen
+//! under it, and reports what the person does as an [`Intent`]. It decides
+//! nothing. The canvas has no status bar: the device and its underruns are
+//! on the header's device chip, a problem with the song or the device shows
+//! in the notes under the strip, and each control names its key in the
+//! hint it shows when the pointer rests on it.
 
 use app::JumpTiming;
 use domain::Transition;
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, Div, DragMoveEvent, ElementId, Entity,
-    FocusHandle, FontWeight, IntoElement, MouseButton, Pixels, Point, Rgba, SharedString, Stateful,
-    Window, div, prelude::*, px, relative, svg,
+    AnyElement, AnyView, App, Bounds, ClickEvent, Context, Div, DragMoveEvent, ElementId, Entity,
+    FocusHandle, FontWeight, IntoElement, MouseButton, Pixels, Point, Rgba, SharedString, Size,
+    Stateful, Window, div, prelude::*, px, relative, svg,
 };
 use openvamp_desktop::action::UiAction;
+use openvamp_desktop::mixer::MixerScreen;
 use openvamp_desktop::reorder::{Half, half_at};
 use openvamp_desktop::strip::{ItemState, SetlistView, StripItem, TransitionChip};
 use openvamp_desktop::view::{
-    FadeButton, Level, NextCard, NowCard, Pad, PerformView, SongMap, StatusView, TransportView,
+    DeviceChip, FadeButton, Level, NextCard, NowCard, PAD_GAP, Pad, PadGrid, PerformView,
+    SectionKind, SongHeader, SongMap, TransportView, pad_grid,
 };
 
 use openvamp_desktop::action::{Intent, Page};
 
+use crate::mixer_ui;
 use crate::screen::Perform;
 use crate::theme;
-
-/// The keys, as the status area lists them.
-const KEYS: &str = if cfg!(target_os = "macos") {
-    "Space play/pause · S stop · B start · 1–9 queue · N timing · L loop · I infinite · F fade · C cancel · hold X panic · ⌘O open · ⌘Q quit"
-} else {
-    "Space play/pause · S stop · B start · 1–9 queue · N timing · L loop · I infinite · F fade · C cancel · hold X panic · Ctrl-O open · Ctrl-Q quit"
-};
-
-/// The keys of a setlist, listed before [`KEYS`].
-const SETLIST_KEYS: &str = ", previous · . next · ";
 
 /// How the empty screen names the open shortcut.
 const OPEN_HINT: &str = if cfg!(target_os = "macos") {
@@ -38,6 +35,50 @@ const OPEN_HINT: &str = if cfg!(target_os = "macos") {
 } else {
     "Ctrl-O opens a song at any time"
 };
+
+/// The open-song key, as the hints name it.
+const OPEN_KEY: &str = if cfg!(target_os = "macos") {
+    "⌘O"
+} else {
+    "Ctrl-O"
+};
+
+/// The side navigation's width, in points.
+const NAV_WIDTH: f32 = 64.0;
+
+/// The room around a screen, in points ([`main`]).
+const MAIN_PADDING: f32 = 16.0;
+
+/// The room between the parts of a screen, in points.
+const MAIN_GAP: f32 = 12.0;
+
+/// The header's height, its line under it included.
+const HEADER_HEIGHT: f32 = 60.0;
+
+/// The setlist strip's height.
+const STRIP_HEIGHT: f32 = 84.0;
+
+/// The now-playing panel's height above the compact mixer, as on the
+/// design canvas: the title row, the song map, the section controls and one
+/// row of pads.
+const NOW_PLAYING_HEIGHT: f32 = 364.0;
+
+/// The now-playing panel's padding and border, in points.
+const PANEL_PADDING: f32 = 14.0;
+
+/// The pads' area in the now-playing panel above the compact mixer: one row
+/// of pads, the rest scrolls.
+const PADS_HEIGHT: f32 = 100.0;
+
+/// The least height the compact mixer needs for its bus strips; with less
+/// room it stays off Perform (the Mixer screen has it all).
+const COMPACT_MIXER_MIN_HEIGHT: f32 = 272.0;
+
+/// A line of notes or problems, in points, to estimate their room.
+const NOTE_LINE_HEIGHT: f32 = 18.0;
+
+/// The notes panel's tallest, in points; more lines scroll.
+const NOTES_MAX_HEIGHT: f32 = 110.0;
 
 /// The window's root: background, type, and the keyboard focus; the side
 /// navigation and [`main`] go in it.
@@ -64,8 +105,8 @@ pub fn main() -> Div {
         .min_w_0()
         .flex()
         .flex_col()
-        .gap(px(12.))
-        .p(px(16.))
+        .gap(px(MAIN_GAP))
+        .p(px(MAIN_PADDING))
 }
 
 /// The side navigation of the design canvas, with the screens that exist:
@@ -85,7 +126,7 @@ pub fn nav(page: Page, cx: &mut Context<Perform>) -> impl IntoElement {
             .child(icon(name, fg, 22.))
     };
     div()
-        .w(px(64.))
+        .w(px(NAV_WIDTH))
         .flex_none()
         .flex()
         .flex_col()
@@ -110,32 +151,77 @@ pub fn shield() -> impl IntoElement {
 }
 
 /// The screen with a song or a setlist open, and the `problems` that did
-/// not stop it.
+/// not stop it, in a window whose content is `viewport`; `mixer` is the
+/// Mixer screen's view of the song, whose buses show under the pads when
+/// the window leaves them room.
 pub fn perform(
     view: &PerformView,
     setlist: Option<&SetlistView>,
+    mixer: Option<&MixerScreen>,
+    viewport: Size<Pixels>,
     hold: f32,
     problems: &[String],
     cx: &mut Context<Perform>,
 ) -> impl IntoElement {
+    let notes = notes(view, setlist);
+    let mixer = mixer.filter(|_| {
+        mixer_room(
+            f32::from(viewport.height),
+            setlist.is_some(),
+            problems,
+            &notes,
+        ) >= COMPACT_MIXER_MIN_HEIGHT
+    });
+    // The pads' row: the window less the navigation, the screen's padding
+    // and the panel's.
+    let row =
+        f32::from(viewport.width) - NAV_WIDTH - 2.0 * MAIN_PADDING - 2.0 * PANEL_PADDING - 2.0;
+    let grid = pad_grid(row, view.pads.len());
     div()
         .flex_1()
         .min_h_0()
         .flex()
         .flex_col()
-        .gap(px(12.))
+        .gap(px(MAIN_GAP))
         .child(header(view, setlist, hold, cx))
         .when(!problems.is_empty(), |screen| {
             screen.child(problem_banner(problems, cx))
         })
-        .when_some(setlist, |screen, setlist| {
-            screen.child(strip(setlist, cx)).when(
-                !setlist.problems.is_empty() || setlist.blend.is_some(),
-                |screen| screen.child(setlist_notes(setlist)),
-            )
+        .when_some(setlist, |screen, setlist| screen.child(strip(setlist, cx)))
+        .when(!notes.is_empty(), |screen| {
+            screen.child(notes_panel(&notes))
         })
-        .child(now_playing(view, cx))
-        .child(status(&view.status, setlist.is_some()))
+        .child(now_playing(view, grid, mixer.is_some(), cx))
+        .when_some(mixer, |screen, mixer| {
+            screen.child(mixer_ui::compact_mixer(mixer, cx))
+        })
+}
+
+/// The room the compact mixer would get in a window `height` points tall,
+/// under the header, the problems, the strip with a setlist, the notes and
+/// the now-playing panel.
+fn mixer_room(height: f32, setlist: bool, problems: &[String], notes: &[Note]) -> f32 {
+    let block = |lines: usize, max: f32| {
+        if lines == 0 {
+            0.0
+        } else {
+            (lines as f32 * NOTE_LINE_HEIGHT + 22.0).min(max) + MAIN_GAP
+        }
+    };
+    let strip = if setlist {
+        STRIP_HEIGHT + MAIN_GAP
+    } else {
+        0.0
+    };
+    height
+        - 2.0 * MAIN_PADDING
+        - HEADER_HEIGHT
+        - MAIN_GAP
+        - block(problems.len(), f32::INFINITY)
+        - strip
+        - block(notes.len(), NOTES_MAX_HEIGHT)
+        - NOW_PLAYING_HEIGHT
+        - MAIN_GAP
 }
 
 /// Problems that did not stop the song playing, such as a pick that did
@@ -216,6 +302,9 @@ pub fn no_song(errors: &[String], cx: &mut Context<Perform>) -> impl IntoElement
         )
 }
 
+/// The header of the design canvas: the setlist (or the open buttons for a
+/// song alone), the transport, the clock, the device chip, fade and panic;
+/// the app's mark goes first, which the canvas does not have.
 fn header(
     view: &PerformView,
     setlist: Option<&SetlistView>,
@@ -223,7 +312,7 @@ fn header(
     cx: &mut Context<Perform>,
 ) -> impl IntoElement {
     let header = div()
-        .h(px(64.))
+        .h(px(HEADER_HEIGHT))
         .flex_none()
         .flex()
         .items_center()
@@ -237,40 +326,23 @@ fn header(
         None => header
             .child(
                 chip_button("open", cx, Intent::OpenSong)
+                    .h(px(46.))
+                    .tooltip(hint(format!("Open a song folder · {OPEN_KEY}")))
                     .child(icon("folder", theme::text_muted(), 20.))
                     .child("Open song…"),
             )
             .child(
                 chip_button("open-setlist", cx, Intent::OpenSetlist)
+                    .h(px(46.))
                     .child(icon("setlist", theme::text_muted(), 20.))
                     .child("Open setlist…"),
             ),
     };
     header
         .child(transport(&view.transport, setlist, cx))
-        .child(
-            div()
-                .flex_none()
-                .min_w(px(150.))
-                .flex()
-                .flex_col()
-                .gap(px(2.))
-                .child(
-                    div()
-                        .font_family(theme::MONO)
-                        .text_size(px(22.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(view.clock.clone()),
-                )
-                .child(
-                    div()
-                        .font_family(theme::MONO)
-                        .text_size(px(12.))
-                        .text_color(theme::text_muted())
-                        .child(format!("{} · {}", view.bar_beat, view.transport.state)),
-                ),
-        )
+        .child(clock(view))
         .child(div().flex_1())
+        .child(device_chip(&view.device, cx))
         .child(fade(&view.fade, cx))
         .child(panic(hold, cx))
 }
@@ -281,100 +353,246 @@ fn setlist_chip(setlist: &SetlistView, cx: &mut Context<Perform>) -> impl IntoEl
     // It gives way to the transport and the clock, but never below a width
     // that keeps the start of the name readable.
     chip_button("setlist", cx, Intent::OpenSetlist)
+        .h(px(46.))
+        .px(px(10.))
+        .gap(px(10.))
         .flex_shrink()
         .min_w(px(140.))
         .max_w(px(260.))
+        .tooltip(hint(format!("Change setlist · {OPEN_KEY} opens a song")))
         .child(icon("setlist", theme::text_muted(), 20.))
         .child(
             div()
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .child(div().one_line().child(setlist.name.clone()))
+                .gap(px(1.))
+                .child(
+                    div()
+                        .one_line()
+                        .text_size(px(16.))
+                        .child(setlist.name.clone()),
+                )
                 .child(
                     div()
                         .font_family(theme::MONO)
                         .text_size(px(11.))
                         .font_weight(FontWeight::NORMAL)
                         .text_color(theme::text_muted())
+                        .whitespace_nowrap()
                         .child(setlist.position.clone()),
                 ),
         )
+        .child(icon("down", theme::text(), 16.))
 }
 
 /// Back to start, play/pause and stop; with a setlist, previous and next
-/// song around play, as on the design canvas.
+/// song around play, as on the design canvas. Play/pause is an icon.
 fn transport(
     transport: &TransportView,
     setlist: Option<&SetlistView>,
     cx: &mut Context<Perform>,
 ) -> impl IntoElement {
-    let (play_icon, play_label) = if transport.playing {
-        ("pause", "Pause")
-    } else {
-        ("play", "Play")
-    };
-    let step = |name: &'static str, action: UiAction, enabled: bool, cx: &mut Context<Perform>| {
+    let step = |name: &'static str,
+                action: UiAction,
+                enabled: bool,
+                tip: &'static str,
+                cx: &mut Context<Perform>| {
         let color = if enabled {
             theme::text()
         } else {
             theme::text_faint()
         };
-        square_button(name, cx, Intent::Ui(action)).child(icon(name, color, 22.))
+        header_button(name, cx, Intent::Ui(action))
+            .tooltip(hint(tip))
+            .child(icon(name, color, 20.))
     };
-    let previous =
-        setlist.map(|setlist| step("previous", UiAction::PreviousSong, setlist.has_previous, cx));
-    let next = setlist.map(|setlist| step("next", UiAction::NextSong, setlist.has_next, cx));
+    let previous = setlist.map(|setlist| {
+        step(
+            "previous",
+            UiAction::PreviousSong,
+            setlist.has_previous,
+            "Previous song · ,",
+            cx,
+        )
+    });
+    let next = setlist.map(|setlist| {
+        step(
+            "next",
+            UiAction::NextSong,
+            setlist.has_next,
+            "Next song · .",
+            cx,
+        )
+    });
     div()
         .flex_none()
         .flex()
         .items_center()
         .gap(px(8.))
         .child(
-            square_button("back", cx, Intent::Ui(UiAction::BackToStart)).child(icon(
-                "back-to-start",
-                theme::text(),
-                22.,
-            )),
+            header_button("back", cx, Intent::Ui(UiAction::BackToStart))
+                .tooltip(hint("Back to start · B"))
+                .child(icon("back-to-start", theme::text(), 20.)),
         )
         .children(previous)
         .child(
             button("play", cx, Intent::Ui(UiAction::TogglePlay))
-                .w(px(96.))
-                .h(px(52.))
+                .w(px(64.))
+                .h(px(48.))
                 .justify_center()
                 .rounded(px(14.))
                 .bg(theme::accent())
-                .text_color(theme::on_fill())
-                .font_weight(FontWeight::BOLD)
-                .child(icon(play_icon, theme::on_fill(), 26.))
-                .child(play_label),
+                .tooltip(hint(format!("{} · Space", transport.play_label)))
+                .child(icon(
+                    if transport.playing { "pause" } else { "play" },
+                    theme::on_fill(),
+                    26.,
+                )),
         )
         .children(next)
         .child(
-            square_button("stop", cx, Intent::Ui(UiAction::Stop)).child(icon(
-                "stop",
-                theme::text(),
-                22.,
-            )),
+            header_button("stop", cx, Intent::Ui(UiAction::Stop))
+                .tooltip(hint("Stop · S"))
+                .child(icon("stop", theme::text(), 20.)),
+        )
+}
+
+/// A 44 point square button of the header.
+fn header_button(id: &'static str, cx: &mut Context<Perform>, intent: Intent) -> Stateful<Div> {
+    square_button(id, cx, intent).size(px(44.))
+}
+
+/// The time and the length of the arrangement, and the bar and beat, with
+/// what the transport is doing while it changes state.
+fn clock(view: &PerformView) -> impl IntoElement {
+    let (time, total) = view
+        .clock
+        .split_once(" / ")
+        .unwrap_or((view.clock.as_str(), ""));
+    let bar = match &view.transport.note {
+        Some(note) => format!("{} · {note}", view.bar_beat),
+        None => view.bar_beat.clone(),
+    };
+    div()
+        .flex_none()
+        .min_w(px(128.))
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(
+            div()
+                .flex()
+                .items_baseline()
+                .whitespace_nowrap()
+                .font_family(theme::MONO)
+                .child(
+                    div()
+                        .text_size(px(22.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(time.to_owned()),
+                )
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .text_color(theme::text_faint())
+                        .child(format!("\u{a0}/ {total}")),
+                ),
+        )
+        .child(
+            div()
+                .font_family(theme::MONO)
+                .text_size(px(12.))
+                .text_color(theme::text_muted())
+                .whitespace_nowrap()
+                .child(bar),
+        )
+}
+
+/// The device, its outputs, buffer and latency, with a dot that says
+/// whether it plays; opens the Audio output screen.
+fn device_chip(device: &DeviceChip, cx: &mut Context<Perform>) -> impl IntoElement {
+    let dot = match device.level {
+        Level::Ok => theme::accent(),
+        Level::Warning => theme::queued(),
+        Level::Error => theme::danger(),
+    };
+    button("device", cx, Intent::ShowPage(Page::Output))
+        .flex_shrink()
+        .min_w_0()
+        .max_w(px(300.))
+        .h(px(44.))
+        .pl(px(10.))
+        .pr(px(12.))
+        .gap(px(10.))
+        .bg(theme::surface())
+        .border_1()
+        .border_color(theme::border())
+        .tooltip(hint("Audio output settings"))
+        .child(
+            div()
+                .relative()
+                .flex_none()
+                .flex()
+                .child(icon("device", theme::text_soft(), 22.))
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(0.))
+                        .right(px(-5.))
+                        .size(px(12.))
+                        .rounded(px(6.))
+                        .border_2()
+                        .border_color(theme::surface())
+                        .bg(dot),
+                ),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .child(
+                    div()
+                        .one_line()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(device.name.clone()),
+                )
+                .child(
+                    div()
+                        .one_line()
+                        .font_family(theme::MONO)
+                        .text_size(px(11.))
+                        .text_color(theme::text_muted())
+                        .child(device.meta.clone()),
+                ),
         )
 }
 
 fn fade(fade: &FadeButton, cx: &mut Context<Perform>) -> impl IntoElement {
-    let (bg, fg) = if fade.active {
-        (theme::text(), theme::on_fill())
+    let fg = if fade.active {
+        theme::on_fill()
     } else {
-        (theme::raised(), theme::text())
+        theme::text()
     };
-    button("fade", cx, Intent::Ui(UiAction::ToggleFade))
-        .h(px(48.))
-        .min_w(px(150.))
-        .px(px(16.))
-        .bg(bg)
+    let button = button("fade", cx, Intent::Ui(UiAction::ToggleFade))
+        .h(px(44.))
+        .px(px(14.))
         .text_color(fg)
-        .border_1()
-        .border_color(theme::border())
+        .text_size(px(15.))
         .font_weight(FontWeight::SEMIBOLD)
+        .tooltip(hint("Fade out or in · F"));
+    let button = if fade.active {
+        button.bg(theme::text())
+    } else {
+        button
+            .bg(theme::raised())
+            .border_1()
+            .border_color(theme::border())
+    };
+    button
         .child(icon("fade", fg, 20.))
         .child(fade.label.clone())
 }
@@ -383,10 +601,11 @@ fn fade(fade: &FadeButton, cx: &mut Context<Perform>) -> impl IntoElement {
 fn panic(hold: f32, cx: &mut Context<Perform>) -> impl IntoElement {
     div()
         .id("panic")
+        .flex_none()
         .relative()
         .overflow_hidden()
-        .h(px(48.))
-        .px(px(18.))
+        .h(px(44.))
+        .px(px(14.))
         .flex()
         .items_center()
         .gap(px(8.))
@@ -395,8 +614,10 @@ fn panic(hold: f32, cx: &mut Context<Perform>) -> impl IntoElement {
         .border_color(theme::danger())
         .bg(theme::danger_bg())
         .text_color(theme::danger_text())
+        .text_size(px(15.))
         .font_weight(FontWeight::BOLD)
         .cursor_pointer()
+        .tooltip(hint("Hold to fade everything out and stop · hold X"))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(|screen, _, window, cx| screen.handle(Intent::PanicDown, window, cx)),
@@ -429,21 +650,34 @@ fn panic(hold: f32, cx: &mut Context<Perform>) -> impl IntoElement {
         )
 }
 
-fn now_playing(view: &PerformView, cx: &mut Context<Perform>) -> impl IntoElement {
-    div()
-        .flex_1()
-        .min_h_0()
+/// The song's title and facts, Now and Next, the song map, the section
+/// controls and the pads. With the compact mixer under it (`fixed`), it is
+/// as tall as on the design canvas and shows one row of pads; without it,
+/// the pads take the rest of the screen.
+fn now_playing(
+    view: &PerformView,
+    grid: PadGrid,
+    fixed: bool,
+    cx: &mut Context<Perform>,
+) -> impl IntoElement {
+    let panel = div()
         .flex()
         .flex_col()
         .gap(px(12.))
-        .p(px(14.))
+        .p(px(PANEL_PADDING))
         .bg(theme::surface())
         .border_1()
         .border_color(theme::border())
-        .rounded(px(14.))
+        .rounded(px(14.));
+    let panel = if fixed {
+        panel.flex_none().h(px(NOW_PLAYING_HEIGHT))
+    } else {
+        panel.flex_1().min_h_0()
+    };
+    panel
         .child(
             div()
-                .h(px(68.))
+                .h(px(60.))
                 .flex_none()
                 .flex()
                 .gap(px(12.))
@@ -454,62 +688,134 @@ fn now_playing(view: &PerformView, cx: &mut Context<Perform>) -> impl IntoElemen
                         .flex()
                         .flex_col()
                         .justify_center()
-                        .gap(px(4.))
+                        .gap(px(6.))
                         .child(
                             div()
                                 .one_line()
                                 .text_size(px(26.))
+                                .line_height(relative(1.15))
                                 .font_weight(FontWeight::BOLD)
                                 .child(view.title.clone()),
                         )
-                        .child(
-                            div()
-                                .one_line()
-                                .text_size(px(14.))
-                                .text_color(theme::text_muted())
-                                .child(view.subtitle.clone()),
-                        ),
+                        .child(song_facts(&view.header)),
                 )
                 .child(now_card(&view.now))
                 .child(next_card(&view.next, cx)),
         )
         .child(song_map(&view.map))
         .child(section_controls(view, cx))
-        .child(pads(&view.pads, cx))
+        .child(pads(&view.pads, grid, fixed, cx))
+}
+
+/// The song's key, tempo and meter, and the arrangement playing, drawn as
+/// the design canvas's dropdown; the app cannot switch arrangements yet,
+/// so it picks nothing.
+fn song_facts(header: &SongHeader) -> impl IntoElement {
+    let fact = |name: &'static str, text: String| {
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .whitespace_nowrap()
+            .child(icon(name, theme::text_faint(), 15.))
+            .child(text)
+    };
+    div()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap(px(14.))
+        .font_family(theme::MONO)
+        .text_size(px(14.))
+        .text_color(theme::text_soft())
+        .when_some(header.key.clone(), |row, key| row.child(fact("note", key)))
+        .when_some(header.tempo.clone(), |row, tempo| {
+            row.child(fact("metronome", tempo))
+        })
+        .when_some(header.meter.clone(), |row, meter| {
+            row.child(div().flex_none().whitespace_nowrap().child(meter))
+        })
+        .child(
+            div()
+                .min_w_0()
+                .h(px(28.))
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(theme::border())
+                .bg(theme::raised())
+                .font_family(theme::UI)
+                .text_size(px(13.))
+                .text_color(theme::text())
+                .child(icon("arrangement", theme::text_faint(), 14.))
+                .child(div().min_w_0().one_line().child(header.arrangement.clone()))
+                .child(icon("down", theme::text(), 14.)),
+        )
+}
+
+/// A section's icon on its color, as the Now and Next cards show it.
+fn section_badge(kind: SectionKind, name: &'static str) -> impl IntoElement {
+    div()
+        .size(px(34.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(9.))
+        .bg(theme::section(kind))
+        .child(icon(name, theme::on_fill(), 18.))
 }
 
 fn now_card(now: &NowCard) -> impl IntoElement {
     div()
-        .w(px(240.))
+        .w(px(230.))
         .flex_none()
         .flex()
-        .flex_col()
-        .justify_center()
+        .items_center()
+        .gap(px(10.))
         .px(px(12.))
+        .py(px(6.))
         .rounded(px(12.))
         .bg(theme::raised())
         .border_2()
         .border_color(theme::text())
-        .child(small_heading("Now", theme::text_muted()))
+        .child(section_badge(now.kind, now.icon))
         .child(
             div()
-                .one_line()
-                .text_size(px(20.))
-                .font_weight(FontWeight::BOLD)
-                .child(now.name.clone()),
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .child(small_heading("Now", theme::text_muted()))
+                .child(
+                    div()
+                        .one_line()
+                        .text_size(px(20.))
+                        .line_height(relative(1.15))
+                        .font_weight(FontWeight::BOLD)
+                        .child(now.name.clone()),
+                )
+                .child(mono_note(
+                    now.bars_left.clone().unwrap_or_else(|| now.detail.clone()),
+                )),
         )
-        .child(mono_note(now.detail.clone()))
 }
 
 fn next_card(next: &NextCard, cx: &mut Context<Perform>) -> impl IntoElement {
     let card = div()
-        .w(px(330.))
+        .w(px(310.))
         .flex_none()
         .flex()
         .items_center()
         .gap(px(10.))
         .pl(px(12.))
         .pr(px(8.))
+        .py(px(6.))
         .rounded(px(12.));
     let card = if next.queued {
         card.border_2()
@@ -519,50 +825,68 @@ fn next_card(next: &NextCard, cx: &mut Context<Perform>) -> impl IntoElement {
     } else {
         card.border_1()
             .border_color(theme::border())
-            .bg(theme::bg())
+            .bg(theme::panel())
     };
-    let heading_color = if next.queued {
-        theme::queued()
+    let (heading_color, heading_icon, name_color) = if next.queued {
+        (theme::queued(), "jump", theme::text())
     } else {
-        theme::text_muted()
+        (theme::text_muted(), "arrow-right", theme::text_soft())
     };
-    card.child(
-        div()
-            .flex_1()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .child(small_heading(next.heading.clone(), heading_color))
-            .child(
-                div()
-                    .one_line()
-                    .text_size(px(20.))
-                    .font_weight(FontWeight::BOLD)
-                    .child(next.name.clone()),
-            )
-            .child(
-                div()
-                    .one_line()
-                    .text_size(px(12.))
-                    .text_color(theme::text_muted())
-                    .child(next.detail.clone()),
-            ),
-    )
-    .when(next.queued, |card| {
-        card.child(
-            square_button("cancel", cx, Intent::Ui(UiAction::CancelJump))
-                .bg(theme::queued_bg())
-                .border_color(theme::queued_border())
-                .child(icon("close", theme::queued(), 18.)),
+    card.child(section_badge(next.kind, next.icon))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .child(icon(heading_icon, heading_color, 13.))
+                        .child(small_heading(next.heading.clone(), heading_color)),
+                )
+                .child(
+                    div()
+                        .one_line()
+                        .text_size(px(20.))
+                        .line_height(relative(1.15))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(name_color)
+                        .child(next.name.clone()),
+                )
+                .child(
+                    div()
+                        .one_line()
+                        .text_size(px(12.))
+                        .text_color(theme::text_muted())
+                        .child(
+                            next.bars_detail
+                                .clone()
+                                .unwrap_or_else(|| next.detail.clone()),
+                        ),
+                ),
         )
-    })
+        .when(next.queued, |card| {
+            card.child(
+                square_button("cancel", cx, Intent::Ui(UiAction::CancelJump))
+                    .size(px(44.))
+                    .bg(theme::queued_bg())
+                    .border_color(theme::queued_border())
+                    .tooltip(hint("Cancel the queued jump · C"))
+                    .child(icon("close", theme::queued(), 18.)),
+            )
+        })
 }
 
-/// The arrangement in play order, sized by length, with the playhead and
-/// the queued jump.
+/// The arrangement in play order, sized by length and numbered by bar, with
+/// the playhead and the queued jump. The song's waveform is to come: the
+/// track under the sections shows their colors.
 fn song_map(map: &SongMap) -> impl IntoElement {
     let strip = div()
-        .h(px(30.))
+        .h(px(28.))
         .flex_none()
         .flex()
         .children(map.blocks.iter().map(|block| {
@@ -576,6 +900,7 @@ fn song_map(map: &SongMap) -> impl IntoElement {
                 .rounded(px(5.))
                 .bg(color)
                 .text_color(theme::on_fill())
+                .font_family(theme::CONDENSED)
                 .text_size(px(13.))
                 .font_weight(FontWeight::BOLD)
                 .whitespace_nowrap()
@@ -597,7 +922,7 @@ fn song_map(map: &SongMap) -> impl IntoElement {
         }));
     let track = div()
         .relative()
-        .h(px(40.))
+        .h(px(50.))
         .flex_none()
         .flex()
         .children(map.blocks.iter().map(|block| {
@@ -633,14 +958,14 @@ fn song_map(map: &SongMap) -> impl IntoElement {
                 .child(
                     div()
                         .absolute()
-                        .top(px(2.))
+                        .top(px(-2.))
                         .left(relative(jump.at))
                         .ml(px(6.))
                         .px(px(6.))
                         .py(px(2.))
                         .flex()
                         .items_center()
-                        .gap(px(4.))
+                        .gap(px(3.))
                         .rounded(px(5.))
                         .bg(theme::queued())
                         .text_color(theme::on_fill())
@@ -660,18 +985,35 @@ fn song_map(map: &SongMap) -> impl IntoElement {
                 .w(px(2.))
                 .bg(theme::text()),
         );
+    let ruler = div()
+        .h(px(14.))
+        .flex_none()
+        .flex()
+        .font_family(theme::MONO)
+        .text_size(px(11.))
+        .text_color(theme::text_faint())
+        .children(map.blocks.iter().map(|block| {
+            div()
+                .w(relative(block.width))
+                .h_full()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .children(block.ruler.clone())
+        }));
     div()
         .flex_none()
         .flex()
         .flex_col()
-        .gap(px(8.))
+        .gap(px(6.))
         .child(strip)
         .child(track)
+        .child(ruler)
 }
 
 fn section_controls(view: &PerformView, cx: &mut Context<Perform>) -> impl IntoElement {
+    let sections = view.pads.len();
     div()
-        .h(px(44.))
+        .h(px(34.))
         .flex_none()
         .flex()
         .items_center()
@@ -682,7 +1024,10 @@ fn section_controls(view: &PerformView, cx: &mut Context<Perform>) -> impl IntoE
                 .font_weight(FontWeight::SEMIBOLD)
                 .child("Sections"),
         )
-        .child(mono_note(format!("{}", view.pads.len())))
+        .child(mono_note(format!(
+            "{sections} section{}",
+            if sections == 1 { "" } else { "s" }
+        )))
         .child(div().flex_1())
         .child(
             div()
@@ -722,6 +1067,7 @@ fn section_controls(view: &PerformView, cx: &mut Context<Perform>) -> impl IntoE
             "loop",
             view.live_loop,
             Intent::Ui(UiAction::ToggleLiveLoop),
+            "Loop the current section · L",
             cx,
         ))
         .child(toggle(
@@ -730,6 +1076,7 @@ fn section_controls(view: &PerformView, cx: &mut Context<Perform>) -> impl IntoE
             "infinite",
             view.infinite,
             Intent::Ui(UiAction::ToggleInfinite),
+            "Repeat the current section until you move on · I",
             cx,
         ))
 }
@@ -750,14 +1097,16 @@ fn timing_button(
         (theme::bg(), theme::text_muted())
     };
     button(id, cx, Intent::Ui(UiAction::SetJumpTiming(timing)))
-        .h(px(36.))
-        .px(px(12.))
+        .h(px(28.))
+        .px(px(10.))
+        .gap(px(6.))
         .rounded(px(7.))
-        .text_size(px(14.))
+        .text_size(px(13.))
         .font_weight(FontWeight::SEMIBOLD)
         .bg(bg)
         .text_color(fg)
-        .child(icon(icon_name, fg, 16.))
+        .tooltip(hint(format!("Jump at the {} · N", label.to_lowercase())))
+        .child(icon(icon_name, fg, 14.))
         .child(label)
 }
 
@@ -767,48 +1116,62 @@ fn toggle(
     icon_name: &'static str,
     on: bool,
     intent: Intent,
+    tip: &'static str,
     cx: &mut Context<Perform>,
 ) -> Stateful<Div> {
     let color = if on { theme::accent() } else { theme::text() };
     button(id, cx, intent)
-        .h(px(44.))
-        .px(px(14.))
+        .h(px(34.))
+        .px(px(12.))
         .bg(theme::raised())
         .border_1()
         .border_color(if on { theme::accent() } else { theme::border() })
         .text_color(color)
+        .text_size(px(14.))
         .font_weight(FontWeight::SEMIBOLD)
+        .tooltip(hint(tip))
         .child(icon(icon_name, color, 18.))
         .child(label)
 }
 
-fn pads(pads: &[Pad], cx: &mut Context<Perform>) -> impl IntoElement {
-    div()
-        .id("pads")
-        .flex_1()
-        .min_h_0()
-        .overflow_y_scroll()
-        .flex()
-        .flex_wrap()
+/// The pads in `grid`'s columns: one row of them when the compact mixer
+/// is under them (`fixed`), and the rest scrolls; else as many rows as the
+/// screen leaves.
+fn pads(pads: &[Pad], grid: PadGrid, fixed: bool, cx: &mut Context<Perform>) -> impl IntoElement {
+    let area = div().id("pads");
+    let area = if fixed {
+        area.flex_none().h(px(PADS_HEIGHT))
+    } else {
+        area.flex_1().min_h_0()
+    };
+    area.overflow_y_scroll()
+        .grid()
+        .grid_cols(u16::try_from(grid.columns).unwrap_or(u16::MAX))
+        .gap(px(PAD_GAP))
         .content_start()
-        .gap(px(8.))
-        .children(pads.iter().map(|pad| pad_button(pad, cx)))
+        .children(pads.iter().map(|pad| pad_button(pad, grid, cx)))
 }
 
-fn pad_button(pad: &Pad, cx: &mut Context<Perform>) -> AnyElement {
+fn pad_button(pad: &Pad, grid: PadGrid, cx: &mut Context<Perform>) -> AnyElement {
     let color = theme::section(pad.kind);
+    let compact = grid.compact;
     let id = ElementId::Name(format!("pad-{}", pad.position).into());
+    let tip = match pad.key {
+        Some(key) => format!("Queue {} · {key}", pad.label),
+        None => format!("Queue {}", pad.label),
+    };
     let button = div()
         .id(id)
         .relative()
-        .w(px(156.))
-        .h(px(100.))
+        .h(px(grid.height))
+        .min_w_0()
         .flex()
         .flex_col()
         .overflow_hidden()
         .rounded(px(12.))
         .bg(theme::raised())
         .cursor_pointer()
+        .tooltip(hint(tip))
         .on_click(on_click(
             cx,
             Intent::Ui(UiAction::QueueSection(pad.position)),
@@ -829,6 +1192,9 @@ fn pad_button(pad: &Pad, cx: &mut Context<Perform>) -> AnyElement {
     };
     let badge = |label: &'static str, bg: Rgba| {
         div()
+            .absolute()
+            .top(px(if compact { 7. } else { 12. }))
+            .right(px(6.))
             .px(px(6.))
             .py(px(1.))
             .rounded(px(5.))
@@ -838,41 +1204,63 @@ fn pad_button(pad: &Pad, cx: &mut Context<Perform>) -> AnyElement {
             .font_weight(FontWeight::BOLD)
             .child(label)
     };
+    let (strip, icon_size, abbr_size, name_size) = if compact {
+        (4., 14., 18., 11.)
+    } else {
+        (6., 18., 24., 12.)
+    };
     button
-        .child(div().h(px(6.)).flex_none().bg(color))
+        .child(div().h(px(strip)).flex_none().bg(color))
         .child(
             div()
-                .flex_1()
+                .min_w_0()
                 .flex()
                 .flex_col()
-                .justify_between()
-                .p(px(10.))
+                .gap(px(2.))
+                .px(px(if compact { 8. } else { 10. }))
+                .py(px(if compact { 4. } else { 8. }))
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .when_some(pad.key, |row, key| {
-                            row.child(
-                                div()
-                                    .font_family(theme::MONO)
-                                    .text_size(px(12.))
-                                    .text_color(theme::text_faint())
-                                    .child(key.to_string()),
-                            )
-                        })
-                        .child(div().flex_1())
-                        .when(pad.is_now, |row| row.child(badge("Now", theme::text())))
-                        .when(pad.is_next, |row| row.child(badge("Next", theme::queued()))),
+                        .child(icon(pad.icon, color, icon_size))
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .font_family(theme::CONDENSED)
+                                .font_weight(FontWeight::BOLD)
+                                .text_size(px(abbr_size))
+                                .line_height(relative(1.))
+                                .child(pad.abbr.clone()),
+                        ),
                 )
                 .child(
                     div()
                         .one_line()
-                        .text_size(px(20.))
-                        .font_weight(FontWeight::BOLD)
+                        .text_size(px(name_size))
+                        .line_height(relative(1.2))
+                        .text_color(theme::text_muted())
                         .child(pad.label.clone()),
-                ),
+                )
+                .when_some(pad.bars.clone().filter(|_| !compact), |column, bars| {
+                    column.child(
+                        div()
+                            .mt(px(4.))
+                            .font_family(theme::MONO)
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .whitespace_nowrap()
+                            .child(bars),
+                    )
+                }),
         )
+        .when(pad.is_now, |button| {
+            button.child(badge("Now", theme::text()))
+        })
+        .when(pad.is_next, |button| {
+            button.child(badge("Next", theme::queued()))
+        })
         .into_any_element()
 }
 
@@ -897,12 +1285,14 @@ fn tile_insertion_line() -> Div {
 /// The setlist strip: a tile per item, the chip with its transition
 /// between tiles; a tile selects its item, and dragging it along the strip
 /// moves it (L46). The "+" after the tiles neither drags nor takes a drop.
+/// Tiles share the strip's width, never narrower than the design canvas's
+/// 196 points; past that the strip scrolls.
 fn strip(setlist: &SetlistView, cx: &mut Context<Perform>) -> impl IntoElement {
     let insertion = setlist.insertion.filter(|_| cx.has_active_drag());
     let tiles = setlist.items.len();
     div()
         .id("strip")
-        .h(px(84.))
+        .h(px(STRIP_HEIGHT))
         .flex_none()
         .flex()
         .gap(px(8.))
@@ -910,7 +1300,8 @@ fn strip(setlist: &SetlistView, cx: &mut Context<Perform>) -> impl IntoElement {
         .overflow_x_scroll()
         .child(
             div()
-                .flex_none()
+                .flex_grow()
+                .flex_shrink_0()
                 .flex()
                 .gap(px(8.))
                 // Room for the line before the first tile.
@@ -927,7 +1318,8 @@ fn strip(setlist: &SetlistView, cx: &mut Context<Perform>) -> impl IntoElement {
                 }))
                 .children(setlist.items.iter().map(|item| {
                     div()
-                        .flex_none()
+                        .flex_grow()
+                        .flex_shrink_0()
                         .flex()
                         .gap(px(8.))
                         .child(strip_tile(item, tiles, insertion, cx))
@@ -942,6 +1334,7 @@ fn strip(setlist: &SetlistView, cx: &mut Context<Perform>) -> impl IntoElement {
                 .bg(theme::surface())
                 .border_1()
                 .border_color(theme::border())
+                .tooltip(hint("Add songs from the library"))
                 .child(icon("plus", theme::text_muted(), 22.)),
         )
 }
@@ -981,8 +1374,10 @@ fn strip_tile(
     };
     let tile = div()
         .id(ElementId::Name(format!("item-{}", item.index).into()))
-        .w(px(240.))
-        .flex_none()
+        .flex_grow()
+        .flex_shrink_0()
+        .flex_basis(px(196.))
+        .min_w(px(196.))
         .flex()
         .items_center()
         .gap(px(10.))
@@ -1057,12 +1452,12 @@ fn strip_tile(
                             .text_color(theme::text_faint())
                             .child(item.number.clone()),
                     )
-                    // The title takes the room the number and tag leave: a
-                    // width from its own measurement could stay at the one
-                    // gpui 0.2.2 took first, before the tile had a width.
+                    // The title takes its own width and gives way to the
+                    // number and tag: a text that grows from no width keeps
+                    // the lines gpui 0.2.2 measured before the tile had a
+                    // width, and showed three letters of the title.
                     .child(
                         div()
-                            .flex_1()
                             .min_w_0()
                             .one_line()
                             .text_size(px(16.))
@@ -1121,12 +1516,63 @@ fn transition_chip(chip: &TransitionChip) -> impl IntoElement {
         )
 }
 
-/// A crossfade under way and the setlist's problems, under the strip.
-fn setlist_notes(setlist: &SetlistView) -> impl IntoElement {
+/// One line of the notes under the strip, in its color.
+struct Note {
+    text: String,
+    color: Rgba,
+    strong: bool,
+}
+
+/// What needs a look, one line each: a crossfade under way and the
+/// setlist's problems; the device that does not play, the last problem and
+/// the song package's warnings. Nothing when all is well, as on the design
+/// canvas.
+fn notes(view: &PerformView, setlist: Option<&SetlistView>) -> Vec<Note> {
+    let note = |text: String, color: Rgba, strong: bool| Note {
+        text,
+        color,
+        strong,
+    };
+    let mut notes = Vec::new();
+    if let Some(setlist) = setlist {
+        notes.extend(
+            setlist
+                .blend
+                .clone()
+                .map(|blend| note(blend, theme::accent(), true)),
+        );
+        notes.extend(
+            setlist
+                .problems
+                .iter()
+                .map(|line| note(line.clone(), theme::queued(), false)),
+        );
+    }
+    let status = &view.status;
+    if status.device_level == Level::Error {
+        notes.push(note(status.device.clone(), theme::danger(), true));
+    }
+    notes.extend(
+        status
+            .last_error
+            .iter()
+            .map(|error| note(format!("Last problem: {error}"), theme::danger(), true)),
+    );
+    notes.extend(
+        status
+            .warnings
+            .iter()
+            .map(|warning| note(format!("Warning: {warning}"), theme::text_muted(), false)),
+    );
+    notes
+}
+
+/// The notes under the strip ([`notes`]).
+fn notes_panel(notes: &[Note]) -> impl IntoElement {
     div()
-        .id("setlist-notes")
+        .id("notes")
         .flex_none()
-        .max_h(px(110.))
+        .max_h(px(NOTES_MAX_HEIGHT))
         .overflow_y_scroll()
         .flex()
         .flex_col()
@@ -1138,89 +1584,39 @@ fn setlist_notes(setlist: &SetlistView) -> impl IntoElement {
         .border_1()
         .border_color(theme::border())
         .text_size(px(13.))
-        .when_some(setlist.blend.clone(), |notes, blend| {
-            notes.child(
-                div()
-                    .text_color(theme::accent())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(blend),
-            )
-        })
-        .children(
-            setlist
-                .problems
-                .iter()
-                .map(|line| div().text_color(theme::queued()).child(line.clone())),
-        )
+        .children(notes.iter().map(|note| {
+            div()
+                .text_color(note.color)
+                .when(note.strong, |line| line.font_weight(FontWeight::SEMIBOLD))
+                .child(note.text.clone())
+        }))
 }
 
-fn status(status: &StatusView, setlist: bool) -> impl IntoElement {
-    let dot = match status.device_level {
-        Level::Ok => theme::accent(),
-        Level::Error => theme::danger(),
-    };
-    div()
-        .flex_none()
-        .flex()
-        .flex_col()
-        .gap(px(6.))
-        .px(px(14.))
-        .py(px(10.))
-        .bg(theme::surface())
-        .border_1()
-        .border_color(theme::border())
-        .rounded(px(14.))
-        .text_size(px(13.))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(14.))
-                .child(icon("device", theme::text_muted(), 18.))
-                .child(div().size(px(8.)).rounded(px(4.)).bg(dot))
-                // The device keeps a readable width; the long key list
-                // gives way first.
-                .child(
-                    div()
-                        .flex_shrink()
-                        .min_w(px(160.))
-                        .one_line()
-                        .child(status.device.clone()),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .font_family(theme::MONO)
-                        .text_color(theme::text_muted())
-                        .child(status.underruns.clone()),
-                )
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .min_w_0()
-                        .one_line()
-                        .text_size(px(12.))
-                        .text_color(theme::text_faint())
-                        .child(if setlist {
-                            format!("{SETLIST_KEYS}{KEYS}")
-                        } else {
-                            KEYS.to_owned()
-                        }),
-                ),
-        )
-        .when_some(status.last_error.clone(), |area, error| {
-            area.child(
-                div()
-                    .text_color(theme::danger())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!("Last problem: {error}")),
-            )
-        })
-        .children(status.warnings.iter().map(|warning| {
-            div()
-                .text_color(theme::text_muted())
-                .child(format!("Warning: {warning}"))
-        }))
+/// A control's hint while the pointer rests on it: what it does and its
+/// key.
+struct Hint(SharedString);
+
+impl Render for Hint {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.))
+            .py(px(4.))
+            .rounded(px(6.))
+            .bg(theme::raised())
+            .border_1()
+            .border_color(theme::border())
+            .shadow_md()
+            .font_family(theme::UI)
+            .text_size(px(12.))
+            .text_color(theme::text())
+            .child(self.0.clone())
+    }
+}
+
+/// Builds the [`Hint`] that says `text`, for an element's `tooltip`.
+fn hint(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    let text = text.into();
+    move |_, cx| cx.new(|_| Hint(text.clone())).into()
 }
 
 /// A clickable row of an icon and a label that reports `intent`.
@@ -1399,5 +1795,6 @@ fn mono_note(text: impl Into<SharedString>) -> impl IntoElement {
         .font_family(theme::MONO)
         .text_size(px(12.))
         .text_color(theme::text_muted())
+        .whitespace_nowrap()
         .child(text.into())
 }
