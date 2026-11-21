@@ -2,21 +2,25 @@
 //! [`MixerScreen`] view model after the design canvas's Mixer artboard and
 //! sends [`MixerAction`]s to the container. Faders drag with gpui's drag
 //! events, so a fast drag keeps following the pointer outside the fader; a
-//! double click returns a fader to 0 dB. Every fader has its meter slot
-//! beside it, empty: the engine reports no levels yet (T6b fills them).
-//! The arrangement chip draws as the design's dropdown but picks nothing
-//! yet: the app cannot switch arrangements. The Perform screen shows the
-//! buses layer's strips compactly under its pads ([`compact_mixer`]).
+//! double click returns a fader to 0 dB. Every fader has its meter beside
+//! it, drawn from what the session reports ([`MeterBar`]): a stem's one
+//! slot shows its louder side, a bus's and the master's two slots their
+//! left and right, each with its hold tick. The arrangement chip draws as
+//! the design's dropdown but picks nothing yet: the app cannot switch
+//! arrangements. The Perform screen shows the buses layer's strips
+//! compactly under its pads ([`compact_mixer`]).
 
 use domain::Bus;
 use gpui::{
     AnyElement, ClickEvent, Context, Div, DragMoveEvent, ElementId, FontWeight, IntoElement,
-    Render, Rgba, SharedString, Stateful, Window, div, prelude::*, px, relative,
+    Render, Rgba, SharedString, Stateful, Window, div, linear_color_stop, linear_gradient,
+    prelude::*, px, relative, rgb,
 };
 use openvamp_desktop::action::{Intent, Page, UiAction};
 use openvamp_desktop::mixer::{
-    BusStrip, FADER_CAP_HEIGHT, FADER_CAP_WIDTH, FADER_PADDING, Layer, MasterStrip, MixerAction,
-    MixerScreen, StemStrip, fader_drag_position,
+    BUS_METER_GREEN_UNTIL, BusStrip, FADER_CAP_HEIGHT, FADER_CAP_WIDTH, FADER_PADDING, Layer,
+    MasterStrip, MeterBar, MixerAction, MixerScreen, STEM_METER_GREEN_UNTIL, StemStrip,
+    fader_drag_position, meter_bands, meter_colour,
 };
 
 use crate::screen::Perform;
@@ -38,6 +42,12 @@ const STEM_METER_WIDTH: f32 = 5.0;
 
 /// The width of each of a bus's two meter slots (left and right).
 const BUS_METER_WIDTH: f32 = 6.0;
+
+/// The corner radius of a meter's slot and of its bar.
+const METER_RADIUS: f32 = 3.0;
+
+/// The height of a meter's hold tick.
+const HOLD_TICK_HEIGHT: f32 = 2.0;
 
 /// The opacity of a control that does nothing now.
 const DISABLED_OPACITY: f32 = 0.45;
@@ -505,14 +515,49 @@ fn strip_frame(color: Rgba, min_width: f32, bar: f32) -> Div {
         .child(div().flex_none().w_full().h(px(bar)).bg(color))
 }
 
-/// An empty meter slot `width` points wide, the height of the fader beside
-/// it: the engine reports no levels yet, so nothing fills it.
-fn meter_slot(width: f32) -> Div {
-    div()
-        .flex_none()
-        .w(px(width))
-        .rounded(px(3.))
+/// A meter slot `width` points wide, the height of the fader beside it,
+/// with `bar` drawn up from its bottom in the canvas's colours (green until
+/// `green_until`, then yellow, red at the top; [`meter_bands`]) and its
+/// hold tick in the colour where it sits. Without a bar (a stem past the
+/// 64th) the slot keeps its room but draws nothing, so the strip does not
+/// read as silent.
+fn meter(bar: Option<MeterBar>, width: f32, green_until: f32) -> Div {
+    let slot = div().flex_none().w(px(width));
+    let Some(bar) = bar else {
+        return slot;
+    };
+    let bands = meter_bands(bar.level, green_until);
+    let top = bands.len().saturating_sub(1);
+    let fill = bands.into_iter().enumerate().map(move |(index, band)| {
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom(relative(band.from))
+            .h(relative(band.to - band.from))
+            .bg(linear_gradient(
+                0.,
+                linear_color_stop(rgb(band.bottom), 0.),
+                linear_color_stop(rgb(band.top), 1.),
+            ))
+            .when(index == 0, |band| band.rounded_b(px(METER_RADIUS)))
+            .when(index == top, |band| band.rounded_t(px(METER_RADIUS)))
+    });
+    let hold = bar.hold.map(|hold| {
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .top(relative(1.0 - hold))
+            .h(px(HOLD_TICK_HEIGHT))
+            .bg(rgb(meter_colour(hold, green_until)))
+    });
+    slot.relative()
+        .overflow_hidden()
+        .rounded(px(METER_RADIUS))
         .bg(theme::bg())
+        .children(fill)
+        .children(hold)
 }
 
 fn stem_strip(stem: &StemStrip, menu: bool, cx: &mut Context<Perform>) -> AnyElement {
@@ -543,7 +588,7 @@ fn stem_strip(stem: &StemStrip, menu: bool, cx: &mut Context<Perform>) -> AnyEle
     } else {
         fader_zone(3., FADER_ZONE_MIN_HEIGHT)
             .when(stem.silenced, |zone| zone.opacity(0.4))
-            .child(meter_slot(STEM_METER_WIDTH))
+            .child(meter(stem.meter, STEM_METER_WIDTH, STEM_METER_GREEN_UNTIL))
             .child(fader(FaderTarget::Stem(index), stem.fader, false, cx))
             .into_any_element()
     };
@@ -657,8 +702,15 @@ fn bus_strip(bus: &BusStrip, zone: f32, cx: &mut Context<Perform>) -> AnyElement
         .child(bus_name(bus.name))
         .child(output_label(&bus.output))
         .child(
-            bus_meters_and_fader(FaderTarget::Bus(bus.bus), bus.fader, false, zone, cx)
-                .when(bus.mute, |zone| zone.opacity(DISABLED_OPACITY)),
+            bus_meters_and_fader(
+                FaderTarget::Bus(bus.bus),
+                bus.fader,
+                bus.meter,
+                false,
+                zone,
+                cx,
+            )
+            .when(bus.mute, |zone| zone.opacity(DISABLED_OPACITY)),
         )
         .child(readout(&bus.db))
         .child(
@@ -697,6 +749,7 @@ fn master_strip(master: &MasterStrip, zone: f32, cx: &mut Context<Perform>) -> A
         .child(bus_meters_and_fader(
             FaderTarget::Master,
             master.fader,
+            master.meter,
             true,
             zone,
             cx,
@@ -733,23 +786,21 @@ fn bus_name(name: &str) -> impl IntoElement {
         .child(SharedString::from(name.to_uppercase()))
 }
 
-/// A bus's two meter slots, left and right, and its fader, at least `zone`
-/// points tall.
+/// A bus's two meters, `meters` left and right, and its fader, at least
+/// `zone` points tall.
 fn bus_meters_and_fader(
     target: FaderTarget,
     position: f32,
+    meters: [MeterBar; 2],
     master: bool,
     zone: f32,
     cx: &mut Context<Perform>,
 ) -> Div {
     fader_zone(7., zone)
         .child(
-            div()
-                .flex_none()
-                .flex()
-                .gap(px(3.))
-                .child(meter_slot(BUS_METER_WIDTH))
-                .child(meter_slot(BUS_METER_WIDTH)),
+            div().flex_none().flex().gap(px(3.)).children(
+                meters.map(|bar| meter(Some(bar), BUS_METER_WIDTH, BUS_METER_GREEN_UNTIL)),
+            ),
         )
         .child(fader(target, position, master, cx))
 }

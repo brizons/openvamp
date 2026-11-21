@@ -2,16 +2,19 @@
 //! the song playing (a setlist's current item), and the `app` command each
 //! control sends. The header shows the song, its place in a setlist, its
 //! arrangement, the time and whether it plays. The stems layer has a strip
-//! per stem (named and drawn after its part, its bus, level, mute and
-//! solo), the buses layer a strip per bus (the output it plays on, level,
-//! mute) and the master. The song's mix is saved to its `mix.json` on
-//! request; bus and master changes are global and saved to the
-//! configuration folder once they settle.
+//! per stem (named and drawn after its part, its bus, level, mute, solo
+//! and meter), the buses layer a strip per bus (the output it plays on,
+//! level, mute, and its left and right meters) and the master. Meters show
+//! what the session reports, on a −60 to 0 dBFS scale in the canvas's
+//! colours ([`meter_height`], [`meter_bands`]); the screens draw frames
+//! while they move ([`needs_frames`]). The song's mix is saved to its
+//! `mix.json` on request; bus and master changes are global and saved to
+//! the configuration folder once they settle.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use app::Command;
+use app::{Command, Meter, Snapshot};
 use domain::{ArrangementMix, Bus, Destination, MAX_VOLUME_DB, SetlistItem, StemRole, Volume};
 
 use crate::audio_settings::AudioSettings;
@@ -408,6 +411,191 @@ fn icon_words(name: &str) -> Vec<String> {
     words
 }
 
+/// The quietest level a meter shows, at the bottom of its slot: −60 dBFS.
+/// The design canvas draws its meters as bare heights; this scale runs
+/// linear in decibels from here to 0 dBFS at the top, so the canvas's
+/// colour stops fall at −18 dBFS (where a stem's green ends,
+/// [`STEM_METER_GREEN_UNTIL`]), −7.2 dBFS (yellow, [`METER_YELLOW_AT`])
+/// and full scale (red).
+pub const METER_BOTTOM_DB: f32 = -60.0;
+
+/// Where green ends up a stem strip's meter, after the design canvas's
+/// Mixer artboard: `#3DDC97` from the bottom to here.
+pub const STEM_METER_GREEN_UNTIL: f32 = 0.70;
+
+/// Where green ends up a bus or master strip's meter, after the canvas's
+/// bus mixer.
+pub const BUS_METER_GREEN_UNTIL: f32 = 0.72;
+
+/// Where a meter turns fully yellow, from the green below it.
+pub const METER_YELLOW_AT: f32 = 0.88;
+
+/// A meter's green, as `0xRRGGBB`.
+pub const METER_GREEN: u32 = 0x3DDC97;
+
+/// A meter's yellow, as `0xRRGGBB`.
+pub const METER_YELLOW: u32 = 0xE9D45B;
+
+/// A meter's red at the top of its slot, as `0xRRGGBB`.
+pub const METER_RED: u32 = 0xFF6B6B;
+
+/// How far up its slot a meter reading `amplitude` reaches, from 0.0 (the
+/// bottom) to 1.0 (the top): linear in decibels from [`METER_BOTTOM_DB`]
+/// to full scale (1.0). Silence, anything quieter than the bottom, and a
+/// reading that is not a level (negative or NaN) draw nothing; full scale
+/// and above reach the top.
+pub fn meter_height(amplitude: f32) -> f32 {
+    if amplitude.is_nan() || amplitude <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * amplitude.log10();
+    ((db - METER_BOTTOM_DB) / -METER_BOTTOM_DB).clamp(0.0, 1.0)
+}
+
+/// One bar of a level meter as a strip draws it, heights up its slot from
+/// 0.0 to 1.0 ([`meter_height`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeterBar {
+    /// How far its level reaches.
+    pub level: f32,
+    /// Where its hold tick sits, never under the level; `None` while the
+    /// hold reads silence.
+    pub hold: Option<f32>,
+}
+
+impl MeterBar {
+    /// A bar that reads silence: nothing drawn.
+    pub const SILENT: Self = Self {
+        level: 0.0,
+        hold: None,
+    };
+
+    /// The bar for a meter whose `level` and `hold` read these amplitudes.
+    pub fn new(level: f32, hold: f32) -> Self {
+        let level = meter_height(level);
+        let hold = meter_height(hold).max(level);
+        Self {
+            level,
+            hold: (hold > 0.0).then_some(hold),
+        }
+    }
+
+    /// The bars of `meter`, left then right.
+    pub fn sides(meter: &Meter) -> [Self; 2] {
+        [0, 1].map(|side| Self::new(meter.level[side], meter.hold[side]))
+    }
+
+    /// The one bar of a stem's meter slot for `meter`: its louder side.
+    pub fn louder(meter: &Meter) -> Self {
+        Self::new(
+            meter.level[0].max(meter.level[1]),
+            meter.hold[0].max(meter.hold[1]),
+        )
+    }
+}
+
+/// One stretch of a meter bar: a gradient from `bottom` at height `from`
+/// up to `top` at `to`, colours as `0xRRGGBB`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeterBand {
+    /// Where it starts up the slot.
+    pub from: f32,
+    /// Where it ends.
+    pub to: f32,
+    /// Its colour at `from`.
+    pub bottom: u32,
+    /// Its colour at `to`.
+    pub top: u32,
+}
+
+/// The colour stops up a meter's slot whose green ends at `green_until`,
+/// after the design canvas's gradient: green, then yellow, red at the top.
+fn meter_stops(green_until: f32) -> [(f32, u32); 4] {
+    [
+        (0.0, METER_GREEN),
+        (green_until, METER_GREEN),
+        (METER_YELLOW_AT, METER_YELLOW),
+        (1.0, METER_RED),
+    ]
+}
+
+/// The colour, as `0xRRGGBB`, of a meter's slot at `height` when its green
+/// ends at `green_until`: the canvas's gradient, mixed in sRGB as it draws
+/// it. The hold tick takes the colour where it sits.
+pub fn meter_colour(height: f32, green_until: f32) -> u32 {
+    let height = height.clamp(0.0, 1.0);
+    let stops = meter_stops(green_until);
+    for pair in stops.windows(2) {
+        let ((from, bottom), (to, top)) = (pair[0], pair[1]);
+        if height <= to {
+            let along = if to > from {
+                (height - from) / (to - from)
+            } else {
+                1.0
+            };
+            return mix(bottom, top, along.clamp(0.0, 1.0));
+        }
+    }
+    METER_RED
+}
+
+/// `along` of the way from `from` to `to`, channel by channel.
+fn mix(from: u32, to: u32, along: f32) -> u32 {
+    let channel = |shift: u32| {
+        let a = ((from >> shift) & 0xFF) as f32;
+        let b = ((to >> shift) & 0xFF) as f32;
+        ((a + (b - a) * along).round() as u32) << shift
+    };
+    channel(16) | channel(8) | channel(0)
+}
+
+/// The bands that draw a bar `height` up its slot (0.0 to 1.0), whose
+/// green ends at `green_until`: the canvas's gradient across the whole
+/// slot, cut at the bar's top, so a colour always marks the same level.
+/// Nothing for silence.
+pub fn meter_bands(height: f32, green_until: f32) -> Vec<MeterBand> {
+    let height = height.clamp(0.0, 1.0);
+    meter_stops(green_until)
+        .windows(2)
+        .filter_map(|pair| {
+            let ((from, bottom), (to, _)) = (pair[0], pair[1]);
+            let to = to.min(height);
+            (to > from).then(|| MeterBand {
+                from,
+                to,
+                bottom,
+                top: meter_colour(to, green_until),
+            })
+        })
+        .collect()
+}
+
+/// Whether the screens must keep drawing frames for `snapshot`, at the
+/// poll rate: while its transport moves (starting, playing, or ramping out)
+/// or any meter, level or hold, reads above silence. Once neither holds,
+/// every meter reads 0 and stays there until the song plays again.
+pub fn needs_frames(snapshot: &Snapshot) -> bool {
+    use app::TransportState::{Panicking, Pausing, Playing, Starting, Stopping};
+    let lit = |meter: &Meter| {
+        meter
+            .level
+            .iter()
+            .chain(&meter.hold)
+            .any(|&value| value > 0.0)
+    };
+    let mixer = &snapshot.mixer;
+    matches!(
+        snapshot.transport,
+        Starting | Playing | Pausing | Stopping | Panicking
+    ) || mixer
+        .stems
+        .iter()
+        .filter_map(|stem| stem.meter.as_ref())
+        .any(lit)
+        || mixer.bus_meters.iter().any(lit)
+        || lit(&mixer.master_meter)
+}
+
 /// The two layers of the Mixer screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
@@ -443,6 +631,10 @@ pub struct StemStrip {
     /// Whether it plays nothing: muted, its bus or the master silent or
     /// muted, or another stem soloed.
     pub silenced: bool,
+    /// Its meter, the louder of its two sides in the strip's one slot
+    /// ([`MeterBar::louder`]); `None` past the 64th stem, which plays
+    /// without one.
+    pub meter: Option<MeterBar>,
 }
 
 /// One bus's strip.
@@ -464,6 +656,8 @@ pub struct BusStrip {
     pub fader: f32,
     /// Whether it is muted.
     pub mute: bool,
+    /// Its meter, left then right.
+    pub meter: [MeterBar; 2],
 }
 
 /// The master strip.
@@ -477,6 +671,8 @@ pub struct MasterStrip {
     pub db: String,
     /// Where its fader stands.
     pub fader: f32,
+    /// Its meter, left then right: every bus summed.
+    pub meter: [MeterBar; 2],
 }
 
 /// Everything the Mixer screen shows.
@@ -757,12 +953,14 @@ impl MixerPage {
                     mute: mix.mute,
                     solo: mix.solo,
                     silenced: view.gain == 0.0,
+                    meter: view.meter.as_ref().map(MeterBar::louder),
                 }
             })
             .collect();
         let buses = Bus::ALL
             .into_iter()
-            .map(|bus| {
+            .zip(&mixer.bus_meters)
+            .map(|(bus, meter)| {
                 let level = mixer.buses.level(bus);
                 BusStrip {
                     bus,
@@ -773,6 +971,7 @@ impl MixerPage {
                     db: db_text(level.volume),
                     fader: fader_position(level.volume),
                     mute: level.mute,
+                    meter: MeterBar::sides(meter),
                 }
             })
             .collect();
@@ -822,6 +1021,7 @@ impl MixerPage {
                 volume: master,
                 db: db_text(master),
                 fader: fader_position(master),
+                meter: MeterBar::sides(&mixer.master_meter),
             },
             notices,
             bus_menu: self.bus_menu,
