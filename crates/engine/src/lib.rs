@@ -9,9 +9,13 @@
 //! [`live::Player`] plays the same song in real time, buffer by buffer, and
 //! takes live commands (jumps, loops, fade, panic) from a
 //! [`live::Controller`]. With no live command it produces the same samples as
-//! [`render_offline`] for the compiled plan. A [`live::Deck`] plays two
-//! players for a setlist and hands over from one to the next (AutoLink,
-//! Crossfade).
+//! [`render_offline`] for the compiled plan. It mixes through buses with
+//! per-stem gains that ramp, and routes each bus to 1 to 32 output channels
+//! ([`live::Routes`]); with unity gains and every bus on outputs 1 and 2 its
+//! outputs 1 and 2 still hold exactly [`render_offline`]'s samples. A
+//! [`live::Deck`] plays two players for a setlist and hands over from one to
+//! the next (AutoLink, Crossfade) on every channel. The offline renderer
+//! stays stereo.
 //!
 //! Guide cues ([`domain::CueEvent`]) are not rendered yet: no voice samples
 //! exist, so the plan's cues are ignored. A `guide` stem plays as plain audio.

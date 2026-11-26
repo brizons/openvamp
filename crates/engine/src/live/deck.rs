@@ -77,8 +77,50 @@ impl fmt::Display for DeckFull {
 
 impl std::error::Error for DeckFull {}
 
+/// Why the deck refused a player ([`DeckController::cue`],
+/// [`DeckController::select`]); the player is dropped on the calling thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeckError {
+    /// The message queue is full ([`DeckFull`]).
+    Full,
+    /// The player renders another number of output channels than the deck:
+    /// every player of a deck renders the same.
+    ChannelMismatch {
+        /// The deck's output channels.
+        deck: usize,
+        /// The player's.
+        player: usize,
+    },
+}
+
+impl fmt::Display for DeckError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full => DeckFull.fmt(f),
+            Self::ChannelMismatch { deck, player } => write!(
+                f,
+                "the player renders {player} output channels and the deck {deck}; every player of a deck renders the same"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeckError {}
+
+impl From<DeckFull> for DeckError {
+    fn from(_: DeckFull) -> Self {
+        Self::Full
+    }
+}
+
 enum Message {
     Command(Command),
+    /// For the item with this number wherever the deck holds it; for none
+    /// when `None`.
+    ItemCommand {
+        item: Option<u64>,
+        command: Command,
+    },
     Cue {
         player: Box<Player>,
         item: u64,
@@ -109,6 +151,7 @@ enum Exit {
 
 struct Leaving {
     player: Box<Player>,
+    item: u64,
     exit: Exit,
 }
 
@@ -179,6 +222,8 @@ pub struct Deck {
     retired: Vec<Box<Player>>,
     scratch: Vec<f32>,
     max_frames: usize,
+    /// Output channels of every player: the current one's.
+    channels: usize,
     applied: u64,
     finished: u64,
     finished_item: Option<u64>,
@@ -189,6 +234,11 @@ pub struct Deck {
 pub struct DeckController {
     messages: Producer<Message>,
     returns: Consumer<Box<Player>>,
+    /// The output channels every player of the deck renders.
+    channels: usize,
+    /// The item cued last, until it is sent back or selected: the one
+    /// [`Self::send_cued`] is for, wherever the deck holds it by then.
+    cued: Option<u64>,
 }
 
 impl Deck {
@@ -198,6 +248,7 @@ impl Deck {
     /// leaving items in pieces of that size.
     pub fn new(player: Player, item: u64, max_frames: usize) -> (Self, DeckController) {
         let max_frames = max_frames.max(1);
+        let channels = player.channels();
         let (producer, messages) = RingBuffer::new(COMMAND_CAPACITY);
         let (returns, back) = RingBuffer::new(RETURN_CAPACITY);
         let deck = Self {
@@ -209,8 +260,9 @@ impl Deck {
             messages,
             returns,
             retired: Vec::with_capacity(RETURN_CAPACITY),
-            scratch: vec![0.0; 2 * max_frames],
+            scratch: vec![0.0; channels * max_frames],
             max_frames,
+            channels,
             applied: 0,
             finished: 0,
             finished_item: None,
@@ -218,6 +270,8 @@ impl Deck {
         let controller = DeckController {
             messages: producer,
             returns: back,
+            channels,
+            cued: None,
         };
         (deck, controller)
     }
@@ -229,7 +283,7 @@ impl Deck {
     pub fn process(&mut self, out: &mut [f32]) {
         self.take_messages();
         out.fill(0.0);
-        let frames = out.len() / 2;
+        let frames = out.len() / self.channels;
         if frames == 0 {
             // Lets the player take in what the messages changed.
             self.current.process(&mut []);
@@ -237,7 +291,8 @@ impl Deck {
         let mut done = 0;
         while done < frames {
             let n = self.piece(frames - done);
-            self.render_piece(&mut out[2 * done..2 * (done + n)]);
+            let channels = self.channels;
+            self.render_piece(&mut out[channels * done..channels * (done + n)]);
             done += n;
         }
         self.settle();
@@ -277,6 +332,11 @@ impl Deck {
             self.applied += 1;
             match message {
                 Message::Command(command) => self.apply(command),
+                Message::ItemCommand {
+                    item: Some(item),
+                    command,
+                } => self.apply_to(item, command),
+                Message::ItemCommand { item: None, .. } => {}
                 Message::Cue {
                     player,
                     item,
@@ -325,7 +385,31 @@ impl Deck {
                     cued.player.command(command);
                 }
             }
+            // The device's routing and the Click & Guide bus are global:
+            // every item heard, and the cued one, follow them.
+            Command::SetRouting(_) | Command::SetClickGain(_) => {
+                if let Some(cued) = &mut self.cued {
+                    cued.player.command(command);
+                }
+                for leaving in &mut self.leaving {
+                    leaving.player.command(command);
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Applies `command` to item `item`, current, cued or leaving; to none
+    /// when the deck no longer holds it.
+    fn apply_to(&mut self, item: u64, command: Command) {
+        if self.item == item {
+            self.current.command(command);
+        } else if let Some(cued) = &mut self.cued
+            && cued.item == item
+        {
+            cued.player.command(command);
+        } else if let Some(leaving) = self.leaving.iter_mut().find(|leaving| leaving.item == item) {
+            leaving.player.command(command);
         }
     }
 
@@ -346,21 +430,21 @@ impl Deck {
             None => 1.0,
         };
         let mut old = mem::replace(&mut self.current, player);
-        self.item = item;
+        let old_item = mem::replace(&mut self.item, item);
         if old.transport() == Transport::Stopped {
             self.retire(old);
             return;
         }
         old.command(Command::Stop);
-        self.leave(old, Exit::Fixed(gain_in));
+        self.leave(old, old_item, Exit::Fixed(gain_in));
     }
 
-    fn leave(&mut self, player: Box<Player>, exit: Exit) {
+    fn leave(&mut self, player: Box<Player>, item: u64, exit: Exit) {
         if self.leaving.len() == MAX_LEAVING {
             let oldest = self.leaving.remove(0);
             self.retire(oldest.player);
         }
-        self.leaving.push(Leaving { player, exit });
+        self.leaving.push(Leaving { player, item, exit });
     }
 
     /// Frames to render before the next event: a blend starting or
@@ -427,7 +511,7 @@ impl Deck {
             len: to_end.max(1),
             played: 0,
         });
-        self.leave(outgoing.0, Exit::Blend);
+        self.leave(outgoing.0, outgoing.1, Exit::Blend);
     }
 
     /// Makes the cued item current and playing; returns the item it
@@ -444,7 +528,8 @@ impl Deck {
     /// runs, plus every leaving item; then hands over at the current item's
     /// end and moves the blend on.
     fn render_piece(&mut self, out: &mut [f32]) {
-        let n = out.len() / 2;
+        let channels = self.channels;
+        let n = out.len() / channels;
         let before = self.current.output_frame();
         let ends = self.current.ends();
         // Commands apply before the first piece, so a transport that plays
@@ -463,18 +548,19 @@ impl Deck {
         let blend = self.blend;
         let t = |i: usize| blend.map_or(0, |blend| blend.played + (i as u64).min(advanced));
         if let Some(blend) = blend {
-            for (i, frame) in out.chunks_exact_mut(2).enumerate() {
+            for (i, frame) in out.chunks_exact_mut(channels).enumerate() {
                 let gain = blend.gain(t(i)) as f32;
-                frame[0] *= gain;
-                frame[1] *= gain;
+                for sample in frame {
+                    *sample *= gain;
+                }
             }
         }
         for leaving in &mut self.leaving {
-            let scratch = &mut self.scratch[..2 * n];
+            let scratch = &mut self.scratch[..channels * n];
             leaving.player.process(scratch);
             for (i, (frame, heard)) in out
-                .chunks_exact_mut(2)
-                .zip(scratch.chunks_exact(2))
+                .chunks_exact_mut(channels)
+                .zip(scratch.chunks_exact(channels))
                 .enumerate()
             {
                 let gain = match (leaving.exit, blend) {
@@ -482,8 +568,9 @@ impl Deck {
                     (Exit::Blend, Some(blend)) => (1.0 - blend.gain(t(i))) as f32,
                     (Exit::Blend, None) => 0.0,
                 };
-                frame[0] += heard[0] * gain;
-                frame[1] += heard[1] * gain;
+                for (sample, heard) in frame.iter_mut().zip(heard) {
+                    *sample += heard * gain;
+                }
             }
         }
 
@@ -589,26 +676,67 @@ impl DeckController {
     /// `handoff`; a cued item already there comes back. The player should
     /// have the audio at its start buffered ([`Player::playhead_ready`]),
     /// since the deck starts it without waiting.
-    pub fn cue(&mut self, player: Player, item: u64, handoff: Handoff) -> Result<(), DeckFull> {
+    /// A player rendering another channel count than the deck is refused
+    /// ([`DeckError::ChannelMismatch`]).
+    pub fn cue(&mut self, player: Player, item: u64, handoff: Handoff) -> Result<(), DeckError> {
+        self.check_channels(&player)?;
         self.push(Message::Cue {
             player: Box::new(player),
             item,
             handoff,
-        })
+        })?;
+        self.cued = Some(item);
+        Ok(())
+    }
+
+    /// Queues `command` for the item cued last, such as its stem gains
+    /// ([`Command::SetStemGain`]) after the bus or master volumes changed,
+    /// since its stems are not the current item's: [`Self::send_to`] that
+    /// item, so it reaches it even when an AutoLink or Crossfade has made
+    /// it current by the time the deck takes the command. It is dropped
+    /// when no item is cued: none was, or it was sent back
+    /// ([`Self::uncue`]) or selected ([`Self::select_cued`]).
+    pub fn send_cued(&mut self, command: Command) -> Result<(), SendError> {
+        self.messages
+            .push(Message::ItemCommand {
+                item: self.cued,
+                command,
+            })
+            .map_err(|_| SendError::Full(command))
+    }
+
+    /// Queues `command` for item `item` wherever the deck holds it when it
+    /// takes the command: current, cued, or leaving under another item. It
+    /// is dropped when the deck no longer holds that item. A command meant
+    /// for one item's stems ([`Command::SetStemGain`],
+    /// [`Command::SetStemBus`]) goes this way, so a handoff the control
+    /// thread has not seen yet cannot give it to another item's stems.
+    pub fn send_to(&mut self, item: u64, command: Command) -> Result<(), SendError> {
+        self.messages
+            .push(Message::ItemCommand {
+                item: Some(item),
+                command,
+            })
+            .map_err(|_| SendError::Full(command))
     }
 
     /// Sends the cued item back.
     pub fn uncue(&mut self) -> Result<(), DeckFull> {
-        self.push(Message::Uncue)
+        self.push(Message::Uncue)?;
+        self.cued = None;
+        Ok(())
     }
 
     /// Makes `player` the current item as `item`, stopped at its start; the
     /// current item leaves with its stop ramp.
-    pub fn select(&mut self, player: Player, item: u64) -> Result<(), DeckFull> {
-        self.push(Message::Select {
+    /// A player rendering another channel count than the deck is refused
+    /// ([`DeckError::ChannelMismatch`]).
+    pub fn select(&mut self, player: Player, item: u64) -> Result<(), DeckError> {
+        self.check_channels(&player)?;
+        Ok(self.push(Message::Select {
             player: Box::new(player),
             item,
-        })
+        })?)
     }
 
     /// Makes the cued item current, stopped at its start; the current item
@@ -616,12 +744,25 @@ impl DeckController {
     /// the time the deck takes the message (an AutoLink or Crossfade may
     /// have started it already).
     pub fn select_cued(&mut self) -> Result<(), DeckFull> {
-        self.push(Message::SelectCued)
+        self.push(Message::SelectCued)?;
+        self.cued = None;
+        Ok(())
     }
 
     /// A player the deck no longer needs, to be dropped on this thread.
     pub fn returned(&mut self) -> Option<Player> {
         self.returns.pop().ok().map(|player| *player)
+    }
+
+    fn check_channels(&self, player: &Player) -> Result<(), DeckError> {
+        if player.channels() == self.channels {
+            Ok(())
+        } else {
+            Err(DeckError::ChannelMismatch {
+                deck: self.channels,
+                player: player.channels(),
+            })
+        }
     }
 
     fn push(&mut self, message: Message) -> Result<(), DeckFull> {

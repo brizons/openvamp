@@ -264,3 +264,11 @@ fn spanish_names_follow_the_same_precedence() {
     ]);
     assert_eq!(bus_for_stem(&track("", "stems/Batería 2.wav")), Bus::Drums);
 }
+
+#[test]
+fn every_bus_sits_in_bus_all_at_its_index() {
+    for (place, bus) in Bus::ALL.into_iter().enumerate() {
+        assert_eq!(bus.index(), place, "{bus}");
+        assert_eq!(Bus::ALL[bus.index()], bus);
+    }
+}

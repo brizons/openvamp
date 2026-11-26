@@ -150,6 +150,8 @@ fn config(sample_rate: u32, options: &SessionOptions) -> PlayerConfig {
         sample_rate,
         max_frames: options.buffer_frames as usize,
         seam_crossfade: options.seam_crossfade,
+        // The output port is stereo until the multichannel open (T4).
+        channels: 2,
     }
 }
 

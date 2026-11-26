@@ -81,6 +81,16 @@ impl Ramp {
         };
     }
 
+    /// Moves `frames` frames on without producing them.
+    pub(crate) fn skip(&mut self, frames: u64) {
+        self.pos = (self.pos + frames).min(self.len);
+    }
+
+    /// Lands on the target at once.
+    pub(crate) fn finish(&mut self) {
+        *self = Self::at(self.to);
+    }
+
     fn value(&self, pos: u64) -> f32 {
         if pos >= self.len {
             self.to

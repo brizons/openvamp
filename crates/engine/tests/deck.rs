@@ -788,3 +788,34 @@ fn autolink_out_of_a_short_item_inside_a_crossfade_is_sample_exact() {
     });
     assert_eq!(c_at, Some(tile_end), "C starts on the frame after the tile");
 }
+
+#[test]
+fn a_player_with_another_channel_count_is_refused_with_an_error() {
+    let (a, b) = (song_a(), song_b());
+    let (mut deck, mut control) = deck_of(&a, 256);
+    let wide = || {
+        let (player, _controller) = Player::new(
+            &b.0,
+            "default",
+            &MixSettings::default(),
+            &PlayerConfig {
+                channels: 8,
+                ..PlayerConfig::new(RATE, 256)
+            },
+            memory_sources(b.1.clone()).unwrap(),
+        )
+        .unwrap();
+        player
+    };
+    let mismatch = engine::live::DeckError::ChannelMismatch { deck: 2, player: 8 };
+    assert_eq!(control.cue(wide(), 2, Handoff::AutoLink), Err(mismatch));
+    assert_eq!(control.select(wide(), 3), Err(mismatch));
+    assert!(mismatch.to_string().contains("8"), "{mismatch}");
+
+    // Nothing reached the deck: A plays on alone.
+    control.send(Command::Play).unwrap();
+    let out = run(&mut deck, 256, 2_000);
+    assert!(out.iter().any(|&s| s != 0.0));
+    let status = deck.status();
+    assert_eq!((status.item, status.cued), (1, None));
+}

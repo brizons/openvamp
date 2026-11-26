@@ -214,3 +214,170 @@ fn the_end_fade_allocates_nothing_when_it_starts_cancels_and_starts_again() {
     }
     assert_eq!(allocations, 0, "the end fade allocated or freed memory");
 }
+
+#[test]
+fn mixer_gains_routing_changes_and_32_channels_allocate_nothing() {
+    use domain::{Bus, Destination};
+    use engine::live::{Gain, Routes};
+
+    let frames = 1_152_000;
+    let song = four_sections(vec![
+        ("drums", StemRole::Track),
+        ("keys", StemRole::Track),
+        ("guide", StemRole::Guide),
+    ])
+    .build();
+    let stems = vec![
+        mono("drums", StemRole::Track, noise(1, frames)),
+        stereo("keys", StemRole::Track, noise(2, 2 * frames)),
+        mono("guide", StemRole::Guide, noise(3, frames)),
+    ];
+    let buffer = 256;
+    let channels = 32;
+    let (mut player, mut controller) = Player::new(
+        &song,
+        "f23",
+        &MixSettings::default(),
+        &PlayerConfig {
+            channels,
+            ..PlayerConfig::new(48_000, buffer)
+        },
+        memory_sources(stems).unwrap(),
+    )
+    .unwrap();
+    let mut spread = Routes::STEREO;
+    spread.buses[1] = Destination::Stereo {
+        left: 31,
+        right: 32,
+    };
+    spread.buses[3] = Destination::Mono(17);
+    spread.master = Some(Destination::Stereo { left: 3, right: 4 });
+    let script = [
+        (0, Command::Play),
+        (
+            20,
+            Command::SetStemGain {
+                stem: 0,
+                gain: Gain::new(0.5),
+            },
+        ),
+        (40, Command::SetRouting(spread)),
+        // Changes in quick succession restart from the blend heard.
+        (41, Command::SetRouting(Routes::STEREO)),
+        (42, Command::SetRouting(spread)),
+        (
+            60,
+            Command::SetStemBus {
+                stem: 1,
+                bus: Bus::Vocals,
+            },
+        ),
+        (
+            61,
+            Command::SetStemBus {
+                stem: 1,
+                bus: Bus::Drums,
+            },
+        ),
+        (
+            62,
+            Command::SetStemBus {
+                stem: 1,
+                bus: Bus::Guitars,
+            },
+        ),
+        (80, Command::SetClickGain(Gain::new(0.25))),
+        (
+            100,
+            Command::SetStemGain {
+                stem: 2,
+                gain: Gain::new(0.0),
+            },
+        ),
+        (120, Command::SetRouting(Routes::STEREO)),
+        (
+            140,
+            Command::SetStemGain {
+                stem: 0,
+                gain: Gain::new(1.0),
+            },
+        ),
+        (160, Command::Pause),
+        (170, Command::SetRouting(spread)),
+        (180, Command::Play),
+        (300, Command::Stop),
+    ];
+    let mut output = vec![0.0f32; usize::from(channels) * buffer];
+    let mut allocations = 0;
+    for call in 0..400 {
+        for &(_, command) in script.iter().filter(|(at, _)| *at == call) {
+            controller.send(command).unwrap();
+        }
+        COUNT.with(|count| count.set(Some(0)));
+        player.process(&mut output);
+        allocations += COUNT.with(|count| count.replace(None)).unwrap_or(0);
+    }
+    assert_eq!(
+        allocations, 0,
+        "the mixer or the router allocated or freed memory"
+    );
+}
+
+#[test]
+fn a_32_channel_deck_allocates_nothing_through_a_crossfade_with_routing_changes() {
+    use domain::Destination;
+    use engine::live::{Gain, Routes};
+
+    let frames = 1_152_000;
+    let song = four_sections(vec![("drums", StemRole::Track), ("keys", StemRole::Track)]).build();
+    let buffer = 256;
+    let channels = 32;
+    let player = |seed: u64| {
+        let stems = vec![
+            mono("drums", StemRole::Track, noise(seed, frames)),
+            stereo("keys", StemRole::Track, noise(seed + 1, 2 * frames)),
+        ];
+        let (player, _controller) = Player::new(
+            &song,
+            "default",
+            &MixSettings::default(),
+            &PlayerConfig {
+                channels,
+                ..PlayerConfig::new(48_000, buffer)
+            },
+            memory_sources(stems).unwrap(),
+        )
+        .unwrap();
+        player
+    };
+    let (mut deck, mut control) = Deck::new(player(1), 1, buffer);
+    control
+        .cue(player(3), 2, Handoff::Crossfade { frames: 240_000 })
+        .unwrap();
+    control.send(Command::Play).unwrap();
+    let mut spread = Routes::STEREO;
+    spread.buses[1] = Destination::Mono(32);
+    let mut output = vec![0.0f32; usize::from(channels) * buffer];
+    let mut allocations = 0;
+    let mut blended = false;
+    for call in 0..(frames / buffer + 200) {
+        if call == 4_200 {
+            control.send(Command::SetRouting(spread)).unwrap();
+            control.send(Command::SetClickGain(Gain::new(0.5))).unwrap();
+            control
+                .send_cued(Command::SetStemGain {
+                    stem: 0,
+                    gain: Gain::new(0.5),
+                })
+                .unwrap();
+        }
+        COUNT.with(|count| count.set(Some(0)));
+        deck.process(&mut output);
+        allocations += COUNT.with(|count| count.replace(None)).unwrap_or(0);
+        blended |= deck.status().blend.is_some();
+        while control.returned().is_some() {}
+    }
+    assert_eq!(allocations, 0, "the deck allocated or freed memory");
+    assert!(blended, "the crossfade ran");
+    assert_eq!(deck.status().item, 2);
+}

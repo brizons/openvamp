@@ -28,10 +28,28 @@
 //! end, and [`Player::set_infinite_at_start`] keeps a click-only tile's bar
 //! repeating.
 //!
+//! # Mixer and router (F7, F8)
+//!
+//! Each stem has a live gain ([`Command::SetStemGain`], the effective gain
+//! [`domain::effective_gains`] gives) and a bus ([`Command::SetStemBus`]);
+//! the generated click plays on Click & Guide with its own gain
+//! ([`Command::SetClickGain`]). Gains and routing changes ramp over
+//! [`GAIN_RAMP_MILLISECONDS`]. The player renders
+//! [`PlayerConfig::channels`] interleaved output channels, and [`Routes`] say
+//! which outputs each bus plays on ([`Command::SetRouting`]).
+//!
+//! With every bus on outputs 1 and 2 and no master destination
+//! ([`Routes::STEREO`], the default), the stems are summed in stem order
+//! straight into outputs 1 and 2, as before routing existed: at unity gains
+//! the samples are bit-identical to [`crate::render_offline`]'s, since every
+//! gain the mixer adds multiplies by exactly 1.0. Any other routing sums each
+//! stem into its bus (a stereo pair of buffers), then writes each bus to its
+//! outputs.
+//!
 //! Real-time rules: `process` allocates nothing, takes no locks, and does no
-//! I/O. Every buffer is sized at construction from the maximum buffer size,
-//! and every gain change (fade, click on/off, pause, stop, panic) ramps per
-//! frame.
+//! I/O. Every buffer is sized at construction from the maximum buffer size
+//! and the channel count, and every gain change (fade, click on/off, pause,
+//! stop, panic, mixer gains, routing) ramps per frame.
 
 mod deck;
 mod player;
@@ -44,7 +62,7 @@ use std::fmt;
 
 use domain::DEFAULT_SEAM_CROSSFADE;
 
-pub use deck::{BlendStatus, Deck, DeckController, DeckFull, DeckStatus, Handoff};
+pub use deck::{BlendStatus, Deck, DeckController, DeckError, DeckFull, DeckStatus, Handoff};
 pub use player::Player;
 pub use source::{MemorySource, StemSource, memory_sources};
 pub use status::{ClickSource, FadeState, FadeStatus, JumpKind, QueuedJump, Status, Transport};
@@ -68,6 +86,83 @@ pub const DEFAULT_FADE_SECONDS: u32 = 3;
 /// Commands the queue holds before [`Controller::send`] reports it full.
 pub const COMMAND_CAPACITY: usize = 256;
 
+/// How long a gain or routing change takes to reach its target while the
+/// transport runs (F7.4): every stem gain, the click gain and a routing
+/// change ramp linearly over this time whatever the size of the change, so
+/// a fader moved in steps never zips. While the transport is stopped or
+/// paused a change applies at once, since nothing is heard.
+pub const GAIN_RAMP_MILLISECONDS: u64 = 20;
+
+/// Most output channels a player renders (F8.2).
+pub const MAX_CHANNELS: u16 = domain::MAX_OUTPUTS;
+
+/// A linear gain a [`Command`] carries, such as a stem's effective gain
+/// ([`domain::effective_gains`]). Two gains are equal when their bits are,
+/// so [`Command`] keeps `Eq`.
+#[derive(Debug, Clone, Copy)]
+pub struct Gain(f32);
+
+impl Gain {
+    /// `gain`, or 0.0 (silence) when it is negative or not a finite number.
+    pub fn new(gain: f32) -> Self {
+        Self(if gain.is_finite() && gain >= 0.0 {
+            gain
+        } else {
+            0.0
+        })
+    }
+
+    /// The linear factor.
+    pub fn get(self) -> f32 {
+        self.0
+    }
+}
+
+impl PartialEq for Gain {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for Gain {}
+
+/// Where each bus plays, in a table of fixed size the audio thread takes
+/// as it is ([`Command::SetRouting`]): one [`domain::Destination`] per bus
+/// in [`domain::Bus::ALL`] order, and where the main mix also plays.
+/// [`Routes::from_routing`] resolves a device's [`domain::Routing`], split
+/// mode included.
+///
+/// A mono destination receives the bus's left and right folded as
+/// `(left + right) / 2`, so a centred source keeps its level; buses sharing
+/// an output are summed. The main mix is every bus but Click & Guide.
+/// Outputs past the player's channel count play nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Routes {
+    /// Destination of each bus, in [`domain::Bus::ALL`] order.
+    pub buses: [domain::Destination; domain::Bus::ALL.len()],
+    /// Where the main mix also plays, if anywhere.
+    pub master: Option<domain::Destination>,
+}
+
+impl Routes {
+    /// Every bus on outputs 1 and 2, no master: the routing that plays
+    /// exactly what the players played before routing existed.
+    pub const STEREO: Routes = Routes {
+        buses: [domain::Destination::MAIN; domain::Bus::ALL.len()],
+        master: None,
+    };
+
+    /// The table for `routing`: [`domain::Routing::destination`] of each
+    /// bus (split mode resolved) and [`domain::Routing::master_destination`].
+    /// Fit the routing to the device first ([`domain::Routing::fit`]).
+    pub fn from_routing(routing: &domain::Routing) -> Routes {
+        Routes {
+            buses: domain::Bus::ALL.map(|bus| routing.destination(bus)),
+            master: routing.master_destination(),
+        }
+    }
+}
+
 /// How a [`Player`] runs, besides the song, its mix, and its sources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayerConfig {
@@ -80,16 +175,20 @@ pub struct PlayerConfig {
     /// [`domain::CompileOptions::seam_crossfade`]; the same value gives the
     /// same samples as the compiled plan.
     pub seam_crossfade: u64,
+    /// Output channels, 1 to [`MAX_CHANNELS`]: [`Player::process`] fills
+    /// buffers of this many interleaved channels. Default 2.
+    pub channels: u16,
 }
 
 impl PlayerConfig {
     /// `sample_rate` and `max_frames` with the default seam crossfade,
-    /// [`DEFAULT_SEAM_CROSSFADE`].
+    /// [`DEFAULT_SEAM_CROSSFADE`], on 2 channels.
     pub fn new(sample_rate: u32, max_frames: usize) -> Self {
         Self {
             sample_rate,
             max_frames,
             seam_crossfade: DEFAULT_SEAM_CROSSFADE,
+            channels: 2,
         }
     }
 }
@@ -167,6 +266,34 @@ pub enum Command {
     /// Like [`crate::ClickSettings::enabled`], it does not affect a `click`
     /// stem; [`Status::click_source`] says which click the song has.
     SetClick(bool),
+    /// Sets the effective gain of stem `stem` (its index in the sources
+    /// the player was built with), such as [`domain::StemGain::gain`]: the
+    /// stem, bus and master volumes with mute and solo applied. It ramps over
+    /// [`GAIN_RAMP_MILLISECONDS`] while the transport runs. The operator's
+    /// fade and the end fade still apply on top, to `track` stems only. An
+    /// unknown index is ignored.
+    SetStemGain {
+        /// Index of the stem.
+        stem: usize,
+        /// Its linear gain.
+        gain: Gain,
+    },
+    /// Sends stem `stem` to `bus` ([`domain::StemGain::bus`]); it plays on
+    /// that bus's outputs from the next frame. An unknown index is ignored.
+    SetStemBus {
+        /// Index of the stem.
+        stem: usize,
+        /// Its bus.
+        bus: domain::Bus,
+    },
+    /// Sets the gain of the generated click, which plays on Click & Guide:
+    /// [`domain::BusSettings::bus_gain`] of that bus, master included. It
+    /// ramps like a stem gain and multiplies [`Command::SetClick`]'s on/off.
+    SetClickGain(Gain),
+    /// Routes the buses to the outputs. While the transport runs, the old
+    /// and the new routing crossfade linearly over
+    /// [`GAIN_RAMP_MILLISECONDS`], so no output jumps.
+    SetRouting(Routes),
 }
 
 /// Sends [`Command`]s to its [`Player`] from the control thread.
@@ -247,6 +374,11 @@ pub enum LiveError {
     },
     /// The maximum buffer size is 0.
     ZeroBufferSize,
+    /// The channel count is not 1 to [`MAX_CHANNELS`].
+    ChannelsOutOfRange {
+        /// The requested count.
+        channels: u16,
+    },
     /// [`crate::MixSettings::stem_gains`] names a stem with no source.
     UnknownStemGain {
         /// The id with a gain but no source.
@@ -263,6 +395,10 @@ impl fmt::Display for LiveError {
                 "the song runs at {song} Hz but the output at {output} Hz; resampling is not supported"
             ),
             Self::ZeroBufferSize => write!(f, "the maximum buffer size must be at least one frame"),
+            Self::ChannelsOutOfRange { channels } => write!(
+                f,
+                "a player renders 1 to {MAX_CHANNELS} output channels, not {channels}"
+            ),
             Self::UnknownStemGain { id } => write!(
                 f,
                 "a gain is set for stem \"{id}\", but no stem source has that id"

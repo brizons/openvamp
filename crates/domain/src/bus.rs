@@ -123,7 +123,26 @@ impl Bus {
     pub fn from_id(id: &str) -> Option<Bus> {
         Self::ALL.into_iter().find(|bus| bus.id() == id)
     }
+
+    /// The bus's place in [`Bus::ALL`] (`Bus::ALL[bus.index()] == bus`),
+    /// for whatever is kept per bus in mixer order.
+    pub const fn index(self) -> usize {
+        self as usize
+    }
 }
+
+// `Bus::index` is the declaration order, so `Bus::ALL` must list the buses
+// in that order: reordering one without the other fails to build.
+const _: () = {
+    let mut place = 0;
+    while place < Bus::ALL.len() {
+        assert!(
+            Bus::ALL[place].index() == place,
+            "Bus::ALL lists the buses in declaration order"
+        );
+        place += 1;
+    }
+};
 
 impl fmt::Display for Bus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
