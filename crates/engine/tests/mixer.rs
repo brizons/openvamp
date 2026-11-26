@@ -374,8 +374,10 @@ fn buses_sharing_an_output_are_summed() {
 
 #[test]
 fn split_mode_on_two_outputs_puts_click_and_guide_left_and_the_rest_in_mono_right() {
-    let split = Routing::preset(2);
-    assert!(split.split_mode);
+    let split = Routing {
+        split_mode: true,
+        ..Routing::preset(2)
+    };
     let frame = routed_frame(2, Routes::from_routing(&split));
     close(&frame, &[0.125, 0.8]);
 }

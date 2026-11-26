@@ -8,25 +8,29 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use app::SessionOptions;
+use app::AudioOutput;
 use gpui::{
     App, AppContext, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
     ModifiersChangedEvent, PathPromptOptions, PromptButton, PromptLevel, Render, Subscription,
     Task, Window, prelude::*,
 };
 use io_cpal::CpalOutput;
+use library::ConfigStore;
 use openvamp_desktop::action::{Intent, Page, UiAction, disarms_removal};
+use openvamp_desktop::audio_settings::AudioSettings;
 use openvamp_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_request};
 use openvamp_desktop::hold::PanicHold;
 use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, Typed, is_panic_key, typed};
 use openvamp_desktop::library_page::{Dragged, LibraryPage, Opened, library_to_open};
+use openvamp_desktop::mixer::{MixerAction, MixerPage, restore_mix, unsaved_mix};
+use openvamp_desktop::output_page::{OutputAction, OutputPage};
 use openvamp_desktop::reorder::Half;
 use openvamp_desktop::show::{LoadedSetlist, Show, Source, close, replace};
 use openvamp_desktop::view::PerformView;
 
 use crate::library_ui::{DraggedItem, DraggedSetlist};
 use crate::ui::DraggedTile;
-use crate::{library_ui, ui};
+use crate::{library_ui, mixer_ui, output_ui, ui};
 
 /// How often the session is polled: about 30 Hz (Decision 3). The timer
 /// keeps running while the window is hidden, since a waiting play starts
@@ -53,6 +57,12 @@ pub struct Perform {
     opened: Opened,
     /// Why the last library folder picked did not open.
     library_problem: Option<String>,
+    /// The saved routings and bus settings every session opens with.
+    settings: AudioSettings,
+    /// The Mixer screen's own state.
+    mixer: MixerPage,
+    /// The Audio output screen's own state.
+    output: OutputPage,
     _poll: Task<()>,
     _quit: Subscription,
     _deactivated: Subscription,
@@ -96,6 +106,9 @@ impl Perform {
             library: None,
             opened: Opened::Followed,
             library_problem: None,
+            settings: AudioSettings::load(ConfigStore::from_environment()),
+            mixer: MixerPage::new(),
+            output: OutputPage::new(),
             _poll: poll,
             _quit: quit,
             _deactivated: deactivated,
@@ -111,6 +124,7 @@ impl Perform {
     /// refuses again within [`openvamp_desktop::song::STOP_WAIT`], then
     /// closes the session and its device; what went wrong goes to stderr.
     pub fn close_song(&mut self) {
+        self.save_waiting_buses();
         if let Some(show) = self.loaded.take()
             && let Some(problem) = close(show, thread::sleep).problem()
         {
@@ -192,10 +206,15 @@ impl Perform {
     /// with its ramp and closes its device before the pick opens the
     /// device.
     fn open(&mut self, source: &Source) {
+        // The saved routing of the device it opens on, and the bus settings,
+        // with the last bus changes in them.
+        self.save_waiting_buses();
+        let listed = CpalOutput::new().devices();
+        let (options, fallback) = self.settings.open_options(&listed);
         let replaced = replace(
             &mut self.loaded,
             source,
-            &SessionOptions::default(),
+            &options,
             || Box::new(CpalOutput::new()),
             thread::sleep,
         );
@@ -213,6 +232,11 @@ impl Perform {
                     .insert(0, format!("Could not open {}:", source.describe()));
             }
         }
+        // Not the device asked for: say which one plays instead.
+        if let Some(notice) = fallback {
+            eprintln!("warning: {notice}");
+            self.problems.push(notice);
+        }
     }
 
     /// The window lost focus (Cmd-Tab, a system dialog, the folder
@@ -228,7 +252,11 @@ impl Perform {
     /// that is complete.
     fn tick(&mut self, cx: &mut Context<Self>) {
         let counting = self.hold.is_counting();
-        let fires = self.hold.tick(Instant::now());
+        let now = Instant::now();
+        let fires = self.hold.tick(now);
+        if let Some(show) = &mut self.loaded {
+            self.mixer.tick(show, &mut self.settings, now);
+        }
         let Some(show) = &mut self.loaded else {
             // Nothing moves without a song, except a hold's fill.
             if counting {
@@ -240,6 +268,8 @@ impl Perform {
             show.send(UiAction::Panic);
         }
         show.poll();
+        // A buffer size or routing waiting for the stream to open again.
+        self.output.follow(Some(show), &mut self.settings);
         cx.notify();
     }
 
@@ -350,6 +380,10 @@ impl Perform {
     /// is open yet.
     fn show_page(&mut self, page: Page) {
         self.page = page;
+        if page == Page::Output {
+            self.output
+                .set_devices(CpalOutput::new().devices().unwrap_or_default());
+        }
         if page != Page::Library {
             return;
         }
@@ -380,6 +414,53 @@ impl Perform {
             if let Some(show) = &mut self.loaded {
                 show.follow_move(&root, &from, &to);
             }
+        }
+    }
+
+    /// Carries out what a Mixer screen control asks for; nothing while the
+    /// question before ending the show is open.
+    pub fn mixer_act(&mut self, action: MixerAction, cx: &mut Context<Self>) {
+        if self.asking {
+            return;
+        }
+        if let Some(show) = &mut self.loaded {
+            self.mixer.act(action, show, Instant::now());
+            cx.notify();
+        }
+    }
+
+    /// Carries out what an Audio output screen control asks for; nothing
+    /// while the question before ending the show is open. Another device
+    /// opens the song again on it.
+    pub fn output_act(&mut self, action: OutputAction, cx: &mut Context<Self>) {
+        if self.asking {
+            return;
+        }
+        let reopen = self
+            .output
+            .act(action, self.loaded.as_mut(), &mut self.settings);
+        if reopen && let Some(show) = &self.loaded {
+            // A mix not saved yet carries onto the new device.
+            let unsaved = unsaved_mix(show);
+            let source = show.source();
+            self.open(&source);
+            if let (Some(show), Some(unsaved)) = (&mut self.loaded, &unsaved) {
+                restore_mix(show, unsaved);
+            }
+        }
+        if let Some(show) = &mut self.loaded {
+            show.poll();
+        }
+        cx.notify();
+    }
+
+    /// Saves bus and master changes that wait for their delay, before the
+    /// song that has them closes.
+    fn save_waiting_buses(&mut self) {
+        if self.mixer.buses_waiting()
+            && let Some(show) = &mut self.loaded
+        {
+            self.mixer.save_buses(show, &mut self.settings);
         }
     }
 
@@ -667,6 +748,14 @@ impl Render for Perform {
                 .into_any_element()
             }
             (Page::Perform, None) => ui::no_song(&self.problems, cx).into_any_element(),
+            (Page::Output, show) => {
+                let view = self.output.view(show.as_ref(), &self.settings);
+                output_ui::output(&view, cx).into_any_element()
+            }
+            (Page::Mixer, show) => match self.mixer.view(show.as_ref()) {
+                Some(view) => mixer_ui::mixer(&view, cx).into_any_element(),
+                None => mixer_ui::no_mixer().into_any_element(),
+            },
         };
         ui::root(&self.focus, cx)
             .on_key_down(cx.listener(Self::key_down))

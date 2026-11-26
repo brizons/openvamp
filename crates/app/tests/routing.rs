@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use app::testing::FakeOutput;
 use app::{
-    Command, DeviceStatus, RuntimeError, Session, SessionOptions, SetlistCommand, SetlistSession,
-    Snapshot, TransportState,
+    Command, DeviceStatus, JumpTiming, LossReason, OutputError, RuntimeError, Session,
+    SessionOptions, SetlistCommand, SetlistSession, Snapshot, TransportState,
 };
 use domain::{
     Arrangement, Bus, Destination, Routing, SectionMarker, SectionType, Setlist, SetlistItem,
@@ -629,4 +629,211 @@ fn a_refused_mixer_command_still_reaches_the_cued_setlist_item() {
         "the second song plays {:?}, the master shows {master}",
         last(&out, 2)
     );
+}
+
+/// Sends commands the audio thread has not taken yet until its queue is
+/// full.
+fn fill_queue(session: &mut Session) {
+    for _ in 0..1_000 {
+        if session
+            .send(Command::SetJumpTiming(JumpTiming::NextBar))
+            .is_err()
+        {
+            return;
+        }
+    }
+    panic!("the queue never filled");
+}
+
+#[test]
+fn a_routing_refitted_while_the_queue_is_full_still_reaches_the_players() {
+    let dir = band();
+    let fake = device(8);
+    let mut session = open(dir.path(), &fake, Some(Routing::preset(8)));
+    // The interface is set up with two outputs while the session runs.
+    fake.set_channels("fake:1", 2);
+    fill_queue(&mut session);
+    // Stopped, so the stream opens again at once, on two outputs.
+    session.set_buffer_frames(512).unwrap();
+    assert_eq!(fake.opened()[1].channels, 2);
+    run(&mut session, &fake, 256);
+    assert_eq!(session.poll().mixer.routing, Routing::preset(8).fit(2));
+    let out = play(&mut session, &fake, 1_024);
+    // Click & Guide stays on 1 and Drums on 2; the rest falls back to 1/2.
+    let rest = BASS + GUITAR + KEYS + VOCALS;
+    assert_eq!(last(&out, 2), [GUIDE + rest, DRUMS + rest]);
+}
+
+#[test]
+fn a_device_back_with_its_outputs_again_plays_its_routing_without_a_notice() {
+    let dir = band();
+    let fake = device(8);
+    let mut session = open(dir.path(), &fake, Some(Routing::preset(8)));
+    play(&mut session, &fake, 512);
+    let fewer = unplug_and_replug(&mut session, &fake, 2);
+    assert!(
+        matches!(
+            fewer.last_error,
+            Some(RuntimeError::RoutingRefitted { outputs: 2, .. })
+        ),
+        "{:?}",
+        fewer.last_error
+    );
+    let back = unplug_and_replug(&mut session, &fake, 8);
+    assert_eq!(back.mixer.routing, Routing::preset(8), "the whole routing");
+    assert_eq!(back.last_error, None, "restoring it is not a refit");
+    assert_eq!(
+        fake.opened().last().map(|request| request.channels),
+        Some(8)
+    );
+}
+
+#[test]
+fn a_reopen_asked_while_the_queue_is_full_still_ramps_out_first() {
+    let dir = band();
+    let fake = device(2);
+    let mut session = open(dir.path(), &fake, None);
+    let out = play(&mut session, &fake, 512);
+    fill_queue(&mut session);
+    session.set_buffer_frames(512).unwrap();
+    assert_eq!(fake.opened().len(), 1, "never mid-signal");
+    let old = until_reopened(&mut session, &fake, 2);
+    assert_eq!(last(&old, 2), [0.0, 0.0]);
+    let edge = largest_step(&[&out[out.len() - 2..], &old[..]].concat(), 2);
+    assert!(edge <= RAMP_STEP, "the old stream steps by {edge}");
+    let new = run(&mut session, &fake, 2_048);
+    assert!(new[..2].iter().all(|sample| sample.abs() <= RAMP_STEP));
+    assert!(largest_step(&new, 2) <= RAMP_STEP);
+    assert_eq!(last(&new, 2), [ALL, ALL]);
+    assert_eq!(session.poll().transport, TransportState::Playing);
+}
+
+#[test]
+fn a_routing_asked_while_the_queue_is_full_reaches_the_players_with_a_ramp() {
+    let dir = band();
+    let fake = device(8);
+    let mut session = open(dir.path(), &fake, Some(Routing::stereo(8)));
+    let out = play(&mut session, &fake, 512);
+    fill_queue(&mut session);
+    let error = session.set_routing(Routing::preset(8)).unwrap_err();
+    assert!(matches!(error, RuntimeError::QueueFull { .. }), "{error:?}");
+    assert_eq!(
+        session.poll().mixer.routing,
+        Routing::stereo(8),
+        "not in use before the players have it"
+    );
+    assert_eq!(fake.opened().len(), 1, "never mid-signal");
+    let old = until_reopened(&mut session, &fake, 2);
+    assert_eq!(fake.opened()[1].channels, 8);
+    assert_eq!(last(&old, 2), [0.0, 0.0]);
+    let edge = largest_step(&[&out[out.len() - 2..], &old[..]].concat(), 2);
+    assert!(edge <= RAMP_STEP, "the old stream steps by {edge}");
+    let new = run(&mut session, &fake, 2_048);
+    assert!(new[..8].iter().all(|sample| sample.abs() <= RAMP_STEP));
+    assert_eq!(
+        last(&new, 8),
+        [GUIDE, DRUMS, BASS, GUITAR, KEYS, KEYS, VOCALS, VOCALS]
+    );
+    let snapshot = session.poll();
+    assert_eq!(snapshot.mixer.routing, Routing::preset(8));
+    assert_eq!(snapshot.transport, TransportState::Playing);
+}
+
+#[test]
+fn a_pause_the_queue_refused_does_not_keep_a_reopen_waiting() {
+    let dir = band();
+    let fake = device(2);
+    let mut session = open(dir.path(), &fake, None);
+    play(&mut session, &fake, 512);
+    fill_queue(&mut session);
+    assert!(
+        session.send(Command::Pause).is_err(),
+        "the pause is refused"
+    );
+    session.set_buffer_frames(512).unwrap();
+    let old = until_reopened(&mut session, &fake, 2);
+    assert_eq!(last(&old, 2), [0.0, 0.0], "it ramped out");
+    let new = run(&mut session, &fake, 2_048);
+    assert_eq!(last(&new, 2), [ALL, ALL], "and plays on, as before");
+    assert_eq!(session.poll().transport, TransportState::Playing);
+}
+
+#[test]
+fn a_buffer_size_set_while_the_device_is_away_opens_with_it_when_it_is_back() {
+    let dir = band();
+    let fake = device(2);
+    let mut session = open(dir.path(), &fake, None);
+    play(&mut session, &fake, 512);
+    fake.unplug("fake:1");
+    assert!(matches!(
+        session.poll().device,
+        DeviceStatus::Disconnected { .. }
+    ));
+    let attempts = fake.open_attempts();
+    session.set_buffer_frames(512).unwrap();
+    assert_eq!(fake.open_attempts(), attempts, "nothing opens meanwhile");
+    fake.plug("fake:1");
+    let back = session.poll();
+    let DeviceStatus::Connected(info) = &back.device else {
+        panic!("the device plays again: {:?}", back.device);
+    };
+    assert_eq!(info.buffer_frames, 512);
+    assert_eq!(back.transport, TransportState::Paused, "as after any loss");
+}
+
+#[test]
+fn a_buffer_size_the_device_refuses_holds_the_session_until_one_it_takes() {
+    let dir = band();
+    let fake = device(2);
+    fake.set_buffer_range("fake:1", Some((64, 512)));
+    let mut session = open(dir.path(), &fake, None);
+    play(&mut session, &fake, 512);
+    session.set_buffer_frames(1_024).unwrap();
+    let mut held = session.poll();
+    for _ in 0..40 {
+        if matches!(held.device, DeviceStatus::Disconnected { .. }) {
+            break;
+        }
+        assert!(session.disk_monitor().wait_idle(Duration::from_secs(10)));
+        fake.render(256);
+        held = session.poll();
+    }
+    let refused = OutputError::UnsupportedBufferSize {
+        device: "Interface".to_owned(),
+        requested: 1_024,
+        min: 64,
+        max: 512,
+    };
+    assert_eq!(
+        held.device,
+        DeviceStatus::Disconnected {
+            device: "Interface".to_owned(),
+            reason: LossReason::Reconfigured,
+            reopen_error: Some(refused.clone()),
+        }
+    );
+    assert_eq!(
+        held.last_error,
+        Some(RuntimeError::DeviceReopenFailed {
+            device: "Interface".to_owned(),
+            error: refused,
+        })
+    );
+    assert_eq!(held.transport, TransportState::Paused, "it ramped out");
+    assert_eq!(
+        LossReason::Reconfigured.to_string(),
+        "the stream closed to open again with new settings"
+    );
+
+    // A size the device takes opens it again, paused as after any loss.
+    session.set_buffer_frames(512).unwrap();
+    let back = session.poll();
+    let DeviceStatus::Connected(info) = &back.device else {
+        panic!("the device plays again: {:?}", back.device);
+    };
+    assert_eq!(info.buffer_frames, 512);
+    assert_eq!(back.last_error, None);
+    assert_eq!(back.transport, TransportState::Paused);
+    let out = play(&mut session, &fake, 1_024);
+    assert_eq!(last(&out, 2), [ALL, ALL]);
 }

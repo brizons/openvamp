@@ -534,6 +534,32 @@ fn status_area_shows_the_device_underruns_and_the_last_error_in_the_apps_words()
         PerformView::new(&snapshot, &song).status.device,
         format!("No device: \"Speakers\" (cannot open it again: {refused})")
     );
+    // The session closed the stream itself for new settings the device
+    // refuses: the device is there.
+    let refused = OutputError::UnsupportedBufferSize {
+        device: "Speakers".to_owned(),
+        requested: 1_024,
+        min: 64,
+        max: 512,
+    };
+    snapshot.device = DeviceStatus::Disconnected {
+        device: "Speakers".to_owned(),
+        reason: LossReason::Reconfigured,
+        reopen_error: Some(refused.clone()),
+    };
+    assert_eq!(
+        PerformView::new(&snapshot, &song).status.device,
+        format!("Paused: \"Speakers\" refuses the new settings ({refused})")
+    );
+    snapshot.device = DeviceStatus::Disconnected {
+        device: "Speakers".to_owned(),
+        reason: LossReason::Reconfigured,
+        reopen_error: None,
+    };
+    assert_eq!(
+        PerformView::new(&snapshot, &song).status.device,
+        "No device: \"Speakers\" (the stream closed to open again with new settings)"
+    );
     snapshot.device = DeviceStatus::PlayerLost {
         device: "Speakers".to_owned(),
     };

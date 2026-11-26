@@ -4,7 +4,7 @@
 //! test calls [`FakeOutput::render`] to run one audio callback, so the
 //! player is driven deterministically. Devices can be unplugged and plugged
 //! back in, lose their stream for another reason, and change the rates they
-//! run at. The n-th device added has the id `fake:n`; the methods that act
+//! run at, the buffer sizes they take and their outputs. The n-th device added has the id `fake:n`; the methods that act
 //! on one device take its id, since two devices can share a name. Clones
 //! share one stream at a time, like an interface that takes one; a check
 //! ([`AudioOutput::check`]) looks at the devices only and is counted apart
@@ -54,6 +54,8 @@ struct Device {
     channels: u16,
     /// `None` for any rate.
     rates: Option<Vec<u32>>,
+    /// The smallest and largest buffer it takes; `None` for any.
+    buffers: Option<(u32, u32)>,
     present: bool,
 }
 
@@ -100,6 +102,7 @@ impl FakeOutput {
             name: name.to_owned(),
             channels,
             rates: rates.map(<[u32]>::to_vec),
+            buffers: None,
             present: true,
         });
         drop(state);
@@ -146,6 +149,15 @@ impl FakeOutput {
     pub fn set_rates(&self, id: &str, rates: Option<&[u32]>) {
         for device in self.lock().devices.iter_mut().filter(|d| d.id == id) {
             device.rates = rates.map(<[u32]>::to_vec);
+        }
+    }
+
+    /// From now on, the device with id `id` takes buffers of `min` to `max`
+    /// frames only (any size when `None`): it refuses another one with
+    /// [`OutputError::UnsupportedBufferSize`].
+    pub fn set_buffer_range(&self, id: &str, range: Option<(u32, u32)>) {
+        for device in self.lock().devices.iter_mut().filter(|d| d.id == id) {
+            device.buffers = range;
         }
     }
 
@@ -274,8 +286,9 @@ impl AudioOutput for FakeOutput {
     }
 }
 
-/// The present device `request` means, if it has the request's channels and
-/// plays at its rate: what [`FakeOutput`] checks before it opens a stream.
+/// The present device `request` means, if it has the request's channels,
+/// plays at its rate and takes its buffer size: what [`FakeOutput`] checks
+/// before it opens a stream.
 fn lookup<'a>(devices: &'a [Device], request: &OutputRequest) -> Result<&'a Device, OutputError> {
     let present: Vec<&Device> = devices.iter().filter(|d| d.present).collect();
     let device = match &request.device {
@@ -302,6 +315,16 @@ fn lookup<'a>(devices: &'a [Device], request: &OutputRequest) -> Result<&'a Devi
             device: device.name.clone(),
             requested: request.sample_rate,
             supported: rates.iter().map(|&rate| (rate, rate)).collect(),
+        });
+    }
+    if let Some((min, max)) = device.buffers
+        && !(min..=max).contains(&request.buffer_frames)
+    {
+        return Err(OutputError::UnsupportedBufferSize {
+            device: device.name.clone(),
+            requested: request.buffer_frames,
+            min,
+            max,
         });
     }
     Ok(device)

@@ -26,11 +26,16 @@ use crate::output::{
     StreamInfo,
 };
 use crate::renderer::{AudioRenderer, AudioState, Report};
-use crate::routing::{Router, device_outputs};
+use crate::routing::{Router, device_outputs, needed_channels, shrank};
 use crate::song::SongInfo;
 
 /// How long the session waits for a closed stream to hand the player back.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a stream reopen waits for the report to show its ramp out
+/// before it settles for any report that shows the transport silent:
+/// longer than the longest ramp, a panic's.
+const REOPEN_PATIENCE: Duration = Duration::from_secs(2);
 
 /// How a session opens; [`Default`] gives the usual values.
 #[derive(Clone)]
@@ -406,6 +411,11 @@ struct Reopen {
     /// Messages sent when the ramp out was: a report that applied as many
     /// shows how it went.
     after: u64,
+    /// The pause that ramps out could not be queued yet (the queue was
+    /// full): every poll tries again.
+    pause_pending: bool,
+    /// Past this, any report that shows the transport silent will do.
+    deadline: Instant,
 }
 
 /// Where a play request stands.
@@ -445,9 +455,13 @@ pub struct Session {
     /// many describes the playhead they left.
     sent: u64,
     router: Router,
-    /// The routing in use changed while the device was away: say so once
-    /// it plays again.
-    refit_pending: bool,
+    /// The routing the players were sent last: in use. The router's may be
+    /// newer while the queue to the audio thread is full; every poll sends
+    /// it until they have it.
+    routing_in_use: Routing,
+    /// The routing in use when the stream last closed, to tell once the
+    /// device plays again whether its outputs took buses off.
+    routing_before: Option<Routing>,
     /// The global bus and master settings, and as last saved.
     buses: BusSettings,
     buses_saved: BusSettings,
@@ -590,8 +604,9 @@ impl PreparedSong {
             decode_errors_seen: 0,
             deferral_seen: None,
             sent: 0,
+            routing_in_use: router.routing().clone(),
+            routing_before: None,
             router,
-            refit_pending: false,
             buses_saved: buses.clone(),
             buses,
             mix,
@@ -610,8 +625,6 @@ impl PreparedSong {
                 session.request.device = Some(DeviceChoice::Id(stream.info().device_id.clone()));
                 session.device = stream.info().device.clone();
                 session.link = Link::Streaming { stream, home };
-                // Fitting to the device that opens first is the rule, not news.
-                session.refit_pending = false;
                 Ok(session)
             }
             Err((state, error)) => {
@@ -682,19 +695,33 @@ impl Session {
     /// ([`RuntimeError::DeviceReopenFailed`]). Saving
     /// it for the device stays with the shell
     /// (`library::ConfigStore::save_routing`).
+    ///
+    /// When the queue to the audio thread is full it returns
+    /// [`RuntimeError::QueueFull`], and the routing still reaches the
+    /// players from the next polls; [`MixerView::routing`] shows it once
+    /// they have it.
     pub fn set_routing(&mut self, routing: Routing) -> Result<(), RuntimeError> {
-        let mut router = self.router.clone();
-        if router.set(routing) {
-            let result = self.forward(live::Command::SetRouting(router.routes()));
-            if let Err(error) = &result {
-                self.last_error = Some(error.clone());
-            }
-            result?;
-        }
-        self.router = router;
+        self.router.set(routing);
+        let result = self.send_routing();
         if self.router.needed() > self.request.channels {
             self.reopen_stream();
         }
+        if let Err(error) = &result {
+            self.last_error = Some(error.clone());
+        }
+        result
+    }
+
+    /// Sends the players the router's routing when they do not have it
+    /// yet; the queue being full, a later poll sends it.
+    fn send_routing(&mut self) -> Result<(), RuntimeError> {
+        if self.routing_in_use == *self.router.routing() {
+            return Ok(());
+        }
+        self.push(live::Command::SetRouting(self.router.routes()))
+            .map_err(refused)?;
+        self.routing_in_use = self.router.routing().clone();
+        self.apply_if_held();
         Ok(())
     }
 
@@ -767,17 +794,18 @@ impl Session {
             drop(player);
         }
         self.watch_device(now);
+        // The queue was full; it may have room now. Still full, the rest
+        // waits for the next poll.
         if self.gains_pending {
-            // The queue was full; it may have room now. Still full, the
-            // rest waits for the next poll.
             let _ = self.send_gains();
         }
+        let _ = self.send_routing();
         (*self.reports.read(), now)
     }
 
     /// The second half of [`Self::poll`], on the report the first half read.
     pub(crate) fn end_poll(&mut self, report: &Report, now: Instant) -> Snapshot {
-        self.advance_reopen(report);
+        self.advance_reopen(report, now);
         self.advance_start(report, now);
         self.watch_disk(report);
         self.snapshot(report)
@@ -794,13 +822,7 @@ impl Session {
                 }
                 return self.play();
             }
-            Command::Pause | Command::Stop | Command::Panic => {
-                self.halted = true;
-                self.start = None;
-                if let Some(reopen) = &mut self.reopen {
-                    reopen.resume = false;
-                }
-            }
+            Command::Pause | Command::Stop | Command::Panic => self.start = None,
             _ => {}
         }
         let engine_command = match command {
@@ -828,6 +850,14 @@ impl Session {
             | Command::ResetMix => return self.mixer(command),
         };
         self.forward(engine_command)?;
+        // Only a halt the audio thread took counts: a refused one leaves
+        // the transport as it was.
+        if matches!(command, Command::Pause | Command::Stop | Command::Panic) {
+            self.halted = true;
+            if let Some(reopen) = &mut self.reopen {
+                reopen.resume = false;
+            }
+        }
         if let Command::SetJumpTiming(timing) = command {
             self.jump_timing = timing;
         }
@@ -932,7 +962,7 @@ impl Session {
         if click != self.click_gain && result.is_ok() {
             result = self
                 .push(live::Command::SetClickGain(Gain::new(click)))
-                .map_err(queue_full);
+                .map_err(refused);
             if result.is_ok() {
                 self.click_gain = click;
             }
@@ -944,10 +974,12 @@ impl Session {
 
     /// Sends item `item` what takes it to `mix` with the bus settings.
     fn send_mix(&mut self, item: u64, mix: &mut ItemMix) -> Result<(), RuntimeError> {
-        for (stem, target, command) in mix.changes(&self.buses) {
-            self.deck.send_to(item, command).map_err(queue_full)?;
+        for (stem, change) in mix.changes(&self.buses) {
+            self.deck
+                .send_to(item, change.command(stem))
+                .map_err(refused)?;
             self.sent += 1;
-            mix.sent(stem, target, command);
+            mix.sent(stem, change);
         }
         Ok(())
     }
@@ -1053,7 +1085,7 @@ impl Session {
     /// Sends `command` to the player. While the device is lost the control
     /// thread holds the player, so it applies the command at once.
     fn forward(&mut self, command: live::Command) -> Result<(), RuntimeError> {
-        self.push(command).map_err(queue_full)?;
+        self.push(command).map_err(refused)?;
         self.apply_if_held();
         Ok(())
     }
@@ -1094,6 +1126,7 @@ impl Session {
         // The device is gone: it opens with the session's request when it is
         // back, and the transport stays paused, as after any loss.
         self.reopen = None;
+        self.closing();
         let Some(mut state) = take_back(home) else {
             self.last_error = Some(RuntimeError::PlayerLost);
             return;
@@ -1191,15 +1224,21 @@ impl Session {
     /// at once), then opens a stream with the channels that routing needs.
     /// On an error the state comes back, unless the output kept it.
     fn open_held(&mut self, mut state: Box<AudioState>) -> Opened {
-        if let Some(outputs) = device_outputs(self.output.as_ref(), self.request.device.as_ref())
-            && self.router.fit_to(outputs)
-        {
-            let _ = self.push(live::Command::SetRouting(self.router.routes()));
-            state.deck.process(&mut []);
-            state.publish();
-            self.refit_pending = true;
+        if let Some(outputs) = device_outputs(self.output.as_ref(), self.request.device.as_ref()) {
+            self.router.fit_to(outputs);
         }
-        self.request.channels = self.router.needed();
+        // The deck is on this thread: it takes what was sent so far, which
+        // empties its queue, and then the routing.
+        state.deck.process(&mut []);
+        let _ = self.send_routing();
+        state.deck.process(&mut []);
+        state.publish();
+        // Never narrower than what the players have, should they not have
+        // the new routing yet.
+        self.request.channels = self
+            .router
+            .needed()
+            .max(needed_channels(&self.routing_in_use));
         state.set_out_channels(usize::from(self.request.channels));
         let (renderer, home) = AudioRenderer::new(state);
         match self.output.open(&self.request, renderer) {
@@ -1209,7 +1248,9 @@ impl Session {
     }
 
     /// The device plays the session again: the loss is over, and a routing
-    /// fitted to fewer outputs meanwhile is said.
+    /// that lost outputs since the stream closed is said
+    /// ([`RuntimeError::RoutingRefitted`]); one that plays whole again on a
+    /// device back with its outputs is not news.
     fn connected(&mut self, stream: Box<dyn OutputStream>, home: Consumer<Box<AudioState>>) {
         self.device = stream.info().device.clone();
         self.link = Link::Streaming { stream, home };
@@ -1219,11 +1260,21 @@ impl Session {
                 RuntimeError::DeviceLost { .. } | RuntimeError::DeviceReopenFailed { .. }
             )
         });
-        if mem::take(&mut self.refit_pending) {
+        if let Some(before) = self.routing_before.take()
+            && shrank(&before, &self.routing_in_use)
+        {
             self.last_error = Some(RuntimeError::RoutingRefitted {
                 device: self.device.clone(),
-                outputs: self.router.routing().outputs,
+                outputs: self.routing_in_use.outputs,
             });
+        }
+    }
+
+    /// The stream is closing: keep the routing it played, to compare once
+    /// the device plays again (the first close counts until then).
+    fn closing(&mut self) {
+        if self.routing_before.is_none() {
+            self.routing_before = Some(self.routing_in_use.clone());
         }
     }
 
@@ -1245,27 +1296,38 @@ impl Session {
             self.reopen_now();
             return;
         }
-        // A pause, stop or panic on its way ends silent on its own.
+        // Played on unless the operator's pause, stop or panic is on its
+        // way. The pause is sent anyway: the engine pauses only a playing
+        // transport, so it never undoes a stop or a panic. A full queue
+        // refuses it for now; the polls send it.
         let resume = transport == Transport::Playing && !self.halted;
-        if resume && let Err(error) = self.forward(live::Command::Pause) {
-            // The queue is full: the stream reopens as it is.
-            self.last_error = Some(error);
-            self.reopen_now();
-            return;
-        }
+        let pause_pending = self.forward(live::Command::Pause).is_err();
         self.reopen = Some(Reopen {
             resume,
             after: self.sent,
+            pause_pending,
+            deadline: Instant::now() + REOPEN_PATIENCE,
         });
     }
 
-    /// Opens the stream again once the report shows the ramp out over, and
-    /// plays on when the transport played before it.
-    fn advance_reopen(&mut self, report: &Report) {
-        let Some(reopen) = self.reopen else {
+    /// Sends the ramp out a full queue refused, and opens the stream again
+    /// once a report shows the transport silent: one that applied the ramp
+    /// out, or any report after [`REOPEN_PATIENCE`]. Then plays on when the
+    /// transport played before.
+    fn advance_reopen(&mut self, report: &Report, now: Instant) {
+        let Some(mut reopen) = self.reopen else {
             return;
         };
-        if report.applied < reopen.after || report.status().transport.is_running() {
+        if reopen.pause_pending {
+            if self.forward(live::Command::Pause).is_ok() {
+                reopen.pause_pending = false;
+                reopen.after = self.sent;
+            }
+            self.reopen = Some(reopen);
+            return;
+        }
+        let caught_up = report.applied >= reopen.after || now >= reopen.deadline;
+        if !caught_up || report.status().transport.is_running() {
             return;
         }
         self.reopen = None;
@@ -1281,6 +1343,9 @@ impl Session {
     /// Closes the stream and opens the device again with the session's
     /// request.
     fn reopen_now(&mut self) {
+        if matches!(self.link, Link::Streaming { .. }) {
+            self.closing();
+        }
         let state = match mem::replace(&mut self.link, Link::Lost) {
             Link::Streaming { stream, home } => {
                 drop(stream);
@@ -1294,31 +1359,43 @@ impl Session {
             }
         };
         match state {
-            Some(state) => self.open_or_hold(state, LossReason::StreamInvalidated),
+            Some(state) => {
+                // Either way the snapshot says what happened.
+                let _ = self.open_or_hold(state);
+            }
             None => self.last_error = Some(RuntimeError::PlayerLost),
         }
     }
 
-    /// Opens the device with `state`; a device that refuses is held as a
-    /// lost one, lost for `reason`, with the transport paused, and the
-    /// session keeps trying.
-    fn open_or_hold(&mut self, state: Box<AudioState>, reason: LossReason) {
+    /// Opens the device with `state` after the session closed the stream
+    /// itself; a device that refuses is held as a lost one
+    /// ([`LossReason::Reconfigured`]), with the transport paused, and the
+    /// session keeps trying. `Err` only when the output kept the player
+    /// ([`RuntimeError::PlayerLost`]): nothing can play any more.
+    fn open_or_hold(&mut self, state: Box<AudioState>) -> Result<(), RuntimeError> {
         let now = Instant::now();
         match self.open_held(state) {
-            Ok((stream, home)) => self.connected(stream, home),
+            Ok((stream, home)) => {
+                self.connected(stream, home);
+                Ok(())
+            }
             Err((Some(mut state), error)) => {
                 if state.deck.status().current.transport.is_running() {
                     self.pause_now(&mut state);
                 }
                 self.link = Link::Held {
                     state,
-                    reason,
+                    reason: LossReason::Reconfigured,
                     reopen_error: (!is_absent(&error)).then_some(error),
                     retry_at: now + self.reconnect_interval,
                 };
                 self.last_error = self.device_error();
+                Ok(())
             }
-            Err((None, _)) => self.last_error = Some(RuntimeError::PlayerLost),
+            Err((None, _)) => {
+                self.last_error = Some(RuntimeError::PlayerLost);
+                Err(RuntimeError::PlayerLost)
+            }
         }
     }
 
@@ -1409,7 +1486,7 @@ impl Session {
                 mix_problems: self.mix.problems().to_vec(),
                 buses: self.buses.clone(),
                 buses_changed: self.buses != self.buses_saved,
-                routing: self.router.routing().clone(),
+                routing: self.routing_in_use.clone(),
             },
             underruns: status.underruns,
             decode_errors: self.monitor.decode_errors(),
@@ -1567,18 +1644,21 @@ impl Session {
 
     /// Plays `item` as `tag` at its own sample rate: makes `item` current,
     /// closes the stream (the current item has stopped), and opens the same
-    /// device again at the new rate. A device that refuses is held as a lost
-    /// one, so the session keeps trying and says why
-    /// ([`RuntimeError::DeviceReopenFailed`]); choosing an item at a rate
-    /// the device takes brings it back.
+    /// device again at the new rate.
     ///
-    /// The item goes to the deck before the stream closes: when the deck
-    /// refuses it (its queue is full), nothing else changes, so the session
-    /// keeps describing and playing the item it had at the rate it had, and
-    /// the refusal is returned and kept as [`Snapshot::last_error`]. With no
-    /// player left ([`RuntimeError::PlayerLost`]) nothing is sent at all.
-    /// Should the output keep the player once the stream closes, the session
-    /// is lost after all, still describing the item it had.
+    /// - `Ok`: the item is current, and the device plays it, or refused the
+    ///   rate and is held as a lost one ([`LossReason::Reconfigured`]): the
+    ///   session keeps trying and says why
+    ///   ([`RuntimeError::DeviceReopenFailed`]), and choosing an item at a
+    ///   rate the device takes brings it back.
+    /// - `Err(QueueFull)`: the deck refused the item; nothing else changed,
+    ///   so the session keeps describing and playing the item it had at the
+    ///   rate it had.
+    /// - `Err(PlayerLost)`: no player was left, so nothing was sent; or the
+    ///   output kept the player once the stream closed, and the session is
+    ///   lost, still describing the item it had.
+    ///
+    /// Every error is also kept as [`Snapshot::last_error`].
     pub(crate) fn reopen_with(&mut self, item: Item, tag: u64) -> Result<(), RuntimeError> {
         let Item {
             info,
@@ -1599,6 +1679,9 @@ impl Session {
         // item waits there stopped: silent, whatever the rate.
         let sent = self.deck.select(player, tag);
         self.count(sent.is_ok(), "Select")?;
+        if matches!(self.link, Link::Streaming { .. }) {
+            self.closing();
+        }
         let state = match mem::replace(&mut self.link, Link::Lost) {
             Link::Streaming { stream, home } => {
                 drop(stream);
@@ -1618,11 +1701,7 @@ impl Session {
         self.request.sample_rate = rate;
         // This open takes any new request too.
         self.reopen = None;
-        self.open_or_hold(state, LossReason::StreamInvalidated);
-        match self.link {
-            Link::Lost => Err(RuntimeError::PlayerLost),
-            _ => Ok(()),
-        }
+        self.open_or_hold(state)
     }
 }
 
@@ -1634,8 +1713,9 @@ type Opened = Result<
     (Option<Box<AudioState>>, OutputError),
 >;
 
-/// The error a full queue to the audio thread gives.
-fn queue_full(error: SendError) -> RuntimeError {
+/// What a command the audio thread's queue refused means for the shell: the
+/// queue is full, or the command named a position outside the arrangement.
+fn refused(error: SendError) -> RuntimeError {
     match error {
         SendError::Full(command) => RuntimeError::QueueFull {
             command: format!("{command:?}"),

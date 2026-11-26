@@ -3,6 +3,7 @@
 
 use std::borrow::Cow;
 
+use domain::Bus;
 use gpui::{AssetSource, Result, Rgba, SharedString, rgb, rgba};
 use openvamp_desktop::view::SectionKind;
 
@@ -115,6 +116,43 @@ pub fn section(kind: SectionKind) -> Rgba {
     })
 }
 
+/// The color of a bus, as the design canvas's mixer gives each family.
+pub fn bus(bus: Bus) -> Rgba {
+    rgb(match bus {
+        Bus::ClickGuide => 0x8E99AB,
+        Bus::Drums => 0x5E9BFF,
+        Bus::Bass => 0x9F86FF,
+        Bus::KeysPads => 0xF06BB0,
+        Bus::Guitars => 0x38C9B0,
+        Bus::Vocals => 0xC9B458,
+    })
+}
+
+/// A mixer strip's background.
+pub fn strip() -> Rgba {
+    rgb(0x121418)
+}
+
+/// A mixer strip's border.
+pub fn strip_border() -> Rgba {
+    rgb(0x22252B)
+}
+
+/// A fader's cap.
+pub fn fader_cap() -> Rgba {
+    rgb(0xE2E5EA)
+}
+
+/// A soloed stem's S.
+pub fn solo() -> Rgba {
+    rgb(0x4EA8FF)
+}
+
+/// The chosen item of a segmented control.
+pub fn segment() -> Rgba {
+    rgb(0x2C3038)
+}
+
 /// A section color at `alpha`, for the unplayed part of the song map.
 pub fn faded(color: Rgba, alpha: f32) -> Rgba {
     Rgba { a: alpha, ..color }
@@ -183,6 +221,10 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/minus.svg",
         include_bytes!("../assets/icons/minus.svg"),
     ),
+    (
+        "icons/mixer.svg",
+        include_bytes!("../assets/icons/mixer.svg"),
+    ),
     ("icons/next.svg", include_bytes!("../assets/icons/next.svg")),
     (
         "icons/next-bar.svg",
@@ -196,6 +238,10 @@ const ICONS: &[(&str, &[u8])] = &[
     (
         "icons/openvamp-play.svg",
         include_bytes!("../assets/icons/openvamp-play.svg"),
+    ),
+    (
+        "icons/output.svg",
+        include_bytes!("../assets/icons/output.svg"),
     ),
     (
         "icons/panic.svg",

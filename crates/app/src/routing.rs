@@ -42,49 +42,59 @@ impl Router {
         }
     }
 
-    /// The routing in use.
+    /// The routing the players should have: the shell's fitted to the
+    /// device. The session tracks apart which one they have.
     pub(crate) fn routing(&self) -> &Routing {
         &self.fitted
     }
 
-    /// The routing in use, as the players take it.
+    /// [`Self::routing`], as the players take it.
     pub(crate) fn routes(&self) -> Routes {
         Routes::from_routing(&self.fitted)
     }
 
-    /// Channels the output must take: the highest output the routing in
-    /// use plays on, and two at least on a device with two or more.
+    /// Channels the output must take for [`Self::routing`]
+    /// ([`needed_channels`]).
     pub(crate) fn needed(&self) -> u16 {
-        let highest = Bus::ALL
-            .iter()
-            .map(|&bus| self.fitted.destination(bus))
-            .chain(self.fitted.master_destination())
-            .flat_map(|destination| destination.outputs())
-            .max()
-            .unwrap_or(1);
-        highest.max(self.fitted.outputs.min(2))
+        needed_channels(&self.fitted)
     }
 
-    /// Fits the routing to a device with `outputs` outputs; whether the
-    /// routing in use changed.
-    pub(crate) fn fit_to(&mut self, outputs: u16) -> bool {
+    /// Fits the routing to a device with `outputs` outputs.
+    pub(crate) fn fit_to(&mut self, outputs: u16) {
         self.outputs = outputs;
-        self.refit()
+        self.refit();
     }
 
-    /// Plays `routing` from now on, fitted to the device; whether the
-    /// routing in use changed.
-    pub(crate) fn set(&mut self, routing: Routing) -> bool {
+    /// Plays `routing` from now on, fitted to the device.
+    pub(crate) fn set(&mut self, routing: Routing) {
         self.base = Some(routing);
-        self.refit()
+        self.refit();
     }
 
-    fn refit(&mut self) -> bool {
-        let fitted = fit(self.base.as_ref(), self.outputs, self.channels);
-        let changed = fitted != self.fitted;
-        self.fitted = fitted;
-        changed
+    fn refit(&mut self) {
+        self.fitted = fit(self.base.as_ref(), self.outputs, self.channels);
     }
+}
+
+/// Channels an output must take to play `routing`: the highest output it
+/// plays on, and two at least on a device with two or more.
+pub(crate) fn needed_channels(routing: &Routing) -> u16 {
+    let highest = Bus::ALL
+        .iter()
+        .map(|&bus| routing.destination(bus))
+        .chain(routing.master_destination())
+        .flat_map(|destination| destination.outputs())
+        .max()
+        .unwrap_or(1);
+    highest.max(routing.outputs.min(2))
+}
+
+/// Whether going from `before` to `now` took a bus off an output because
+/// the device has fewer outputs: what [`crate::RuntimeError::RoutingRefitted`]
+/// says. A device back with more outputs, whose routing plays whole again,
+/// shrank nothing.
+pub(crate) fn shrank(before: &Routing, now: &Routing) -> bool {
+    now.outputs < before.outputs && Routes::from_routing(now) != Routes::from_routing(before)
 }
 
 /// Channels the players of a session with `routing` render: its outputs,

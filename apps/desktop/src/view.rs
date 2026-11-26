@@ -4,8 +4,8 @@
 //! timing, loop and infinite, and the status area.
 
 use app::{
-    DeviceStatus, FadeState, JumpKind, JumpTiming, LoadError, OpenError, PositionInfo, Snapshot,
-    SongInfo, TransportState,
+    DeviceStatus, FadeState, JumpKind, JumpTiming, LoadError, LossReason, OpenError, PositionInfo,
+    Snapshot, SongInfo, TransportState,
 };
 
 use crate::action::is_playing;
@@ -486,6 +486,16 @@ fn status_view(snapshot: &Snapshot, song: &SongInfo) -> StatusView {
                 info.latency().as_secs_f64() * 1_000.0
             ),
             Level::Ok,
+        ),
+        // The session closed the stream for new settings (a buffer size,
+        // more outputs, another rate): the device is there and refuses them.
+        DeviceStatus::Disconnected {
+            device,
+            reason: LossReason::Reconfigured,
+            reopen_error: Some(error),
+        } => (
+            format!("Paused: \"{device}\" refuses the new settings ({error})"),
+            Level::Error,
         ),
         DeviceStatus::Disconnected {
             device,

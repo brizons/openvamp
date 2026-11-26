@@ -158,6 +158,10 @@ pub enum LossReason {
     HostStopped,
     /// The audio system reported another error.
     Failed,
+    /// The session closed the stream itself to open it again with new
+    /// settings (a buffer size, more outputs for the routing, a setlist
+    /// item's sample rate); no port reports it.
+    Reconfigured,
 }
 
 impl fmt::Display for LossReason {
@@ -171,6 +175,7 @@ impl fmt::Display for LossReason {
             Self::DeviceBusy => "the device is busy with another application",
             Self::HostStopped => "the audio system stopped",
             Self::Failed => "the audio system reported an error",
+            Self::Reconfigured => "the stream closed to open again with new settings",
         })
     }
 }

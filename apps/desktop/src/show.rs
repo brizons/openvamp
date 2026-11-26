@@ -9,11 +9,11 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use app::{
-    AudioOutput, OpenError, OutputCheck, PreparedSetlist, PreparedSong, Session, SessionOptions,
-    SetlistCommand, SetlistCommandError, SetlistOpenError, SetlistSession, SetlistSnapshot,
-    Snapshot, SongInfo,
+    AudioOutput, Command, OpenError, OutputCheck, PreparedSetlist, PreparedSong, RuntimeError,
+    Session, SessionOptions, SetlistCommand, SetlistCommandError, SetlistOpenError, SetlistSession,
+    SetlistSnapshot, Snapshot, SongInfo,
 };
-use domain::SetlistItem;
+use domain::{BusSettings, MixFile, Routing, SetlistItem};
 use library::{Library, SETLIST_EXTENSION, SETLISTS_FOLDER, SetlistError};
 
 use crate::action::{UiAction, command_for, setlist_command_for};
@@ -474,6 +474,69 @@ impl Show {
         match self {
             Self::Song(_) => None,
             Self::Setlist(setlist) => Some(setlist),
+        }
+    }
+
+    /// Sends `command`, a mixer command, to the song (a setlist's current
+    /// item). A refusal also shows as the snapshot's last error.
+    pub fn send_mixer(&mut self, command: Command) -> Result<(), RuntimeError> {
+        match self {
+            Self::Song(song) => song.session.send(command),
+            Self::Setlist(setlist) => match setlist.session.send(SetlistCommand::Item(command)) {
+                Err(SetlistCommandError::Runtime(error)) => Err(error),
+                // Only an item command's own refusal comes back for one.
+                _ => Ok(()),
+            },
+        }
+    }
+
+    /// The song's mix file and the folder it goes in, with the mix playing
+    /// as its arrangement's; `None` for a click-only tile.
+    pub fn mix_file(&self) -> Option<(PathBuf, MixFile)> {
+        match self {
+            Self::Song(song) => song.session.mix_file(),
+            Self::Setlist(setlist) => setlist.session.mix_file(),
+        }
+    }
+
+    /// The mix file was written: the mix is no longer changed.
+    pub fn mix_saved(&mut self) {
+        match self {
+            Self::Song(song) => song.session.mix_saved(),
+            Self::Setlist(setlist) => setlist.session.mix_saved(),
+        }
+    }
+
+    /// The global bus and master settings playing.
+    pub fn bus_settings(&self) -> &BusSettings {
+        match self {
+            Self::Song(song) => song.session.bus_settings(),
+            Self::Setlist(setlist) => setlist.session.bus_settings(),
+        }
+    }
+
+    /// The bus settings were saved.
+    pub fn bus_settings_saved(&mut self) {
+        match self {
+            Self::Song(song) => song.session.bus_settings_saved(),
+            Self::Setlist(setlist) => setlist.session.bus_settings_saved(),
+        }
+    }
+
+    /// Plays with `routing` from now on ([`app::Session::set_routing`]).
+    pub fn set_routing(&mut self, routing: Routing) -> Result<(), RuntimeError> {
+        match self {
+            Self::Song(song) => song.session.set_routing(routing),
+            Self::Setlist(setlist) => setlist.session.set_routing(routing),
+        }
+    }
+
+    /// Plays with buffers of `frames` from now on
+    /// ([`app::Session::set_buffer_frames`]).
+    pub fn set_buffer_frames(&mut self, frames: u32) -> Result<(), RuntimeError> {
+        match self {
+            Self::Song(song) => song.session.set_buffer_frames(frames),
+            Self::Setlist(setlist) => setlist.session.set_buffer_frames(frames),
         }
     }
 

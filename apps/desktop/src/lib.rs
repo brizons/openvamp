@@ -22,6 +22,7 @@
 #![warn(missing_docs)]
 
 pub mod action;
+pub mod audio_settings;
 pub mod catalog;
 pub mod editor;
 pub mod ending;
@@ -29,6 +30,8 @@ pub mod hold;
 pub mod keys;
 pub mod library_page;
 pub mod line_edit;
+pub mod mixer;
+pub mod output_page;
 pub mod reorder;
 pub mod shelf;
 pub mod show;

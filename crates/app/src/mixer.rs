@@ -26,6 +26,28 @@ pub struct StemView {
     pub gain: f32,
 }
 
+/// One change of one stem's place in the mix, as the player takes it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum StemChange {
+    /// It moves to this bus ([`live::Command::SetStemBus`]).
+    Bus(Bus),
+    /// It plays at this gain ([`live::Command::SetStemGain`]).
+    Gain(f32),
+}
+
+impl StemChange {
+    /// The command that makes the change for stem `stem`.
+    pub(crate) fn command(self, stem: usize) -> live::Command {
+        match self {
+            Self::Bus(bus) => live::Command::SetStemBus { stem, bus },
+            Self::Gain(gain) => live::Command::SetStemGain {
+                stem,
+                gain: Gain::new(gain),
+            },
+        }
+    }
+}
+
 /// What the control thread keeps of one item's mix: the stems, the
 /// arrangement's mix as it plays and as its `mix.json` has it, and the
 /// gains its player was last given.
@@ -90,34 +112,29 @@ impl ItemMix {
         player.set_click_gain(buses.bus_gain(Bus::ClickGuide));
     }
 
-    /// The commands that take the player from the gains it has to the
-    /// gains of this mix with `buses`, stem by stem; [`Self::sent`] records
-    /// each one the player was sent.
-    pub(crate) fn changes(&self, buses: &BusSettings) -> Vec<(usize, StemGain, live::Command)> {
+    /// What takes the player from the gains it has to the gains of this
+    /// mix with `buses`, stem by stem; [`Self::sent`] records each change
+    /// the player was sent.
+    pub(crate) fn changes(&self, buses: &BusSettings) -> Vec<(usize, StemChange)> {
         let target = effective_gains(&self.stems, &self.mix, buses);
         let mut changes = Vec::new();
         for (stem, (now, then)) in self.gains.iter().zip(&target).enumerate() {
             if now.bus != then.bus {
-                let command = live::Command::SetStemBus {
-                    stem,
-                    bus: then.bus,
-                };
-                changes.push((stem, *then, command));
+                changes.push((stem, StemChange::Bus(then.bus)));
             }
             if now.gain != then.gain {
-                let gain = Gain::new(then.gain);
-                changes.push((stem, *then, live::Command::SetStemGain { stem, gain }));
+                changes.push((stem, StemChange::Gain(then.gain)));
             }
         }
         changes
     }
 
-    /// The player took `command`, one of [`Self::changes`], for `stem`.
-    pub(crate) fn sent(&mut self, stem: usize, target: StemGain, command: live::Command) {
+    /// The player took `change`, one of [`Self::changes`], for `stem`.
+    pub(crate) fn sent(&mut self, stem: usize, change: StemChange) {
         if let Some(gain) = self.gains.get_mut(stem) {
-            match command {
-                live::Command::SetStemBus { .. } => gain.bus = target.bus,
-                _ => gain.gain = target.gain,
+            match change {
+                StemChange::Bus(bus) => gain.bus = bus,
+                StemChange::Gain(level) => gain.gain = level,
             }
         }
     }

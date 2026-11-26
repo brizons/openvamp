@@ -40,7 +40,9 @@ fn assert_preset(outputs: u16, split_mode: bool, destinations: [Destination; 6])
 fn presets_follow_the_output_count() {
     // In mixer order: Click & Guide, Drums, Bass, Keys & Pads, Guitars, Vocals.
     assert_preset(1, false, [Mono(1); 6]);
-    assert_preset(2, true, [MAIN; 6]);
+    // Plain stereo, as the user asked (L22); split mode is a switch.
+    assert_preset(2, false, [MAIN; 6]);
+    assert_eq!(Routing::preset(2), Routing::stereo(2));
     assert_preset(
         3,
         false,
@@ -94,7 +96,7 @@ fn presets_clamp_the_output_count_to_what_a_routing_holds() {
 fn split_mode_sends_click_and_guide_left_and_the_stems_right() {
     // F8.4: "click and guide on the left, the stems summed to mono on the right."
     let mut routing = Routing::preset(2);
-    assert!(routing.split_mode);
+    routing.split_mode = true;
     assert_eq!(routing.destination(Bus::ClickGuide), Mono(1));
     for bus in &Bus::ALL[1..] {
         assert_eq!(routing.destination(*bus), Mono(2), "{bus}");
@@ -227,6 +229,7 @@ fn validation_reports_every_problem_at_once() {
     );
 
     let mut routing = Routing::preset(2);
+    routing.split_mode = true;
     routing.outputs = 1;
     let errors = routing.validate().expect_err("split mode on one output");
     assert_eq!(
@@ -307,7 +310,13 @@ const EXAMPLE: &str = r#"{
 fn routing_files_round_trip_every_device() {
     let file = RoutingFile::from_json(EXAMPLE).expect("example parses");
     assert_eq!(file.format_version, ROUTING_FORMAT_VERSION);
-    assert_eq!(file.devices["Built-in Output"], Routing::preset(2));
+    assert_eq!(
+        file.devices["Built-in Output"],
+        Routing {
+            split_mode: true,
+            ..Routing::preset(2)
+        }
+    );
     let usb = Routing {
         master: Some(pair(7, 8)),
         ..Routing::preset(8)

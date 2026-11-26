@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 
 mod library_ui;
+mod mixer_ui;
+mod output_ui;
 mod screen;
 mod theme;
 mod ui;
