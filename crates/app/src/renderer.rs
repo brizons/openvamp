@@ -15,6 +15,8 @@ use std::fmt;
 use engine::live::{Deck, DeckStatus, Status};
 use rtrb::{Consumer, Producer, RingBuffer};
 
+use crate::output::MAX_BUFFER_FRAMES;
+
 /// What the audio thread publishes after every buffer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Report {
@@ -39,13 +41,68 @@ impl Report {
 pub(crate) struct AudioState {
     pub(crate) deck: Deck,
     pub(crate) reports: triple_buffer::Input<Report>,
+    /// Channels the deck's players render.
+    channels: usize,
+    /// Channels the stream takes, at most `channels`: the first ones the
+    /// players render. Set before each stream opens.
+    out_channels: usize,
+    /// Frames of `channels` channels, for a stream that takes fewer.
+    scratch: Vec<f32>,
 }
 
 impl AudioState {
-    /// Renders `out` and publishes the result. Real-time safe.
+    /// The state of `deck`, whose players render `channels` channels, for a
+    /// stream that takes them all until [`Self::set_out_channels`] says
+    /// otherwise.
+    pub(crate) fn new(deck: Deck, reports: triple_buffer::Input<Report>, channels: usize) -> Self {
+        Self {
+            deck,
+            reports,
+            channels,
+            out_channels: channels,
+            scratch: vec![0.0; channels * MAX_BUFFER_FRAMES as usize],
+        }
+    }
+
+    /// Channels the deck's players render.
+    pub(crate) fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// The stream to open takes the first `channels` channels.
+    pub(crate) fn set_out_channels(&mut self, channels: usize) {
+        self.out_channels = channels.clamp(1, self.channels);
+    }
+
+    /// Renders `out`, frames of the stream's channels, and publishes the
+    /// result. Real-time safe.
     pub(crate) fn render(&mut self, out: &mut [f32]) {
-        self.deck.process(out);
+        if self.out_channels == self.channels {
+            self.deck.process(out);
+        } else {
+            self.render_first(out);
+        }
         self.publish();
+    }
+
+    /// Renders the players' channels into the scratch buffer and keeps the
+    /// first ones the stream takes; a trailing partial frame is silent.
+    fn render_first(&mut self, out: &mut [f32]) {
+        let (channels, taken) = (self.channels, self.out_channels);
+        let piece = self.scratch.len() / channels;
+        let whole = out.len() - out.len() % taken;
+        let (frames, rest) = out.split_at_mut(whole);
+        rest.fill(0.0);
+        for chunk in frames.chunks_mut(piece * taken) {
+            let rendered = &mut self.scratch[..channels * (chunk.len() / taken)];
+            self.deck.process(rendered);
+            for (frame, heard) in chunk
+                .chunks_exact_mut(taken)
+                .zip(rendered.chunks_exact(channels))
+            {
+                frame.copy_from_slice(&heard[..taken]);
+            }
+        }
     }
 
     /// Publishes the deck's state. Real-time safe: `Report` is plain data,
@@ -80,9 +137,10 @@ impl AudioRenderer {
         (renderer, back)
     }
 
-    /// Fills `out` with interleaved stereo frames (a trailing odd sample is
-    /// left at 0.0) and publishes the session's state. Real-time safe: no
-    /// allocation, no lock, no I/O.
+    /// Fills `out` with interleaved frames of the channels the stream was
+    /// requested with ([`crate::OutputRequest::channels`]; a trailing partial
+    /// frame is left at 0.0) and publishes the session's state. Real-time
+    /// safe: no allocation, no lock, no I/O.
     pub fn render(&mut self, out: &mut [f32]) {
         match self.state.as_mut() {
             Some(state) => state.render(out),

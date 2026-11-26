@@ -60,6 +60,8 @@ struct Device {
 struct Running {
     id: u64,
     renderer: AudioRenderer,
+    /// Channels the renderer fills ([`OutputRequest::channels`]).
+    channels: usize,
     /// Id of the device it plays on.
     device: String,
     lost: Option<LossReason>,
@@ -105,14 +107,16 @@ impl FakeOutput {
     }
 
     /// Runs one audio callback of `frames` frames and returns its
-    /// interleaved stereo output; `None` when no stream plays.
+    /// interleaved output, in the channels the stream was requested with
+    /// ([`OutputRequest::channels`]: two for stereo); `None` when no stream
+    /// plays.
     pub fn render(&self, frames: usize) -> Option<Vec<f32>> {
         let mut state = self.lock();
         let running = state
             .stream
             .as_mut()
             .filter(|running| running.lost.is_none())?;
-        let mut out = vec![0.0f32; 2 * frames];
+        let mut out = vec![0.0f32; running.channels * frames];
         running.renderer.render(&mut out);
         Some(out)
     }
@@ -142,6 +146,14 @@ impl FakeOutput {
     pub fn set_rates(&self, id: &str, rates: Option<&[u32]>) {
         for device in self.lock().devices.iter_mut().filter(|d| d.id == id) {
             device.rates = rates.map(<[u32]>::to_vec);
+        }
+    }
+
+    /// From now on, the device with id `id` has `channels` outputs, as an
+    /// interface set up differently before it is plugged back in.
+    pub fn set_channels(&self, id: &str, channels: u16) {
+        for device in self.lock().devices.iter_mut().filter(|d| d.id == id) {
+            device.channels = channels;
         }
     }
 
@@ -241,7 +253,8 @@ impl AudioOutput for FakeOutput {
             device_id: device.id.clone(),
             sample_rate: request.sample_rate,
             buffer_frames: request.buffer_frames,
-            channels: device.channels,
+            // It opens exactly the channels requested.
+            channels: request.channels,
         };
         state.next_id += 1;
         let id = state.next_id;
@@ -249,6 +262,7 @@ impl AudioOutput for FakeOutput {
         state.stream = Some(Running {
             id,
             renderer,
+            channels: usize::from(request.channels),
             device: info.device_id.clone(),
             lost: None,
         });
@@ -260,8 +274,8 @@ impl AudioOutput for FakeOutput {
     }
 }
 
-/// The present device `request` means, if it plays stereo at the request's
-/// rate: what [`FakeOutput`] checks before it opens a stream.
+/// The present device `request` means, if it has the request's channels and
+/// plays at its rate: what [`FakeOutput`] checks before it opens a stream.
 fn lookup<'a>(devices: &'a [Device], request: &OutputRequest) -> Result<&'a Device, OutputError> {
     let present: Vec<&Device> = devices.iter().filter(|d| d.present).collect();
     let device = match &request.device {
@@ -274,10 +288,11 @@ fn lookup<'a>(devices: &'a [Device], request: &OutputRequest) -> Result<&'a Devi
         }
         None => present.first().ok_or(OutputError::NoDevice)?,
     };
-    if device.channels < 2 {
-        return Err(OutputError::NotStereo {
+    if device.channels < request.channels {
+        return Err(OutputError::TooFewChannels {
             device: device.name.clone(),
             channels: device.channels,
+            needed: request.channels,
         });
     }
     if let Some(rates) = &device.rates

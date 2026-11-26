@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use app::{
     Command, DeviceStatus, FadeState, FadeView, JumpKind, JumpTiming, LoadError, LossReason,
-    OpenError, OutputError, PositionInfo, QueuedView, RuntimeError, Snapshot, SongInfo,
+    MixerView, OpenError, OutputError, PositionInfo, QueuedView, RuntimeError, Snapshot, SongInfo,
     SongProblem, StreamInfo, TransportState,
 };
 use openvamp_desktop::action::{UiAction, command_for};
@@ -70,6 +70,7 @@ fn snapshot() -> Snapshot {
             buffer_frames: 256,
             channels: 2,
         }),
+        mixer: MixerView::default(),
         underruns: 0,
         decode_errors: 0,
         last_error: None,

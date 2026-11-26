@@ -134,6 +134,7 @@ fn checks_the_default_device_at_the_songs_rate_without_a_stream() {
         device: None,
         sample_rate,
         buffer_frames: 256,
+        channels: 2,
     };
     assert_eq!(output.check(&request(RATE)), OutputCheck::Fits);
     assert!(matches!(

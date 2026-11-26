@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use app::{
     Command, DeviceInfo, DeviceStatus, FadeState, FadeView, JumpKind, JumpTiming, LossReason,
-    OutputError, PositionInfo, QueuedView, RuntimeError, Snapshot, SongInfo, StreamInfo,
+    MixerView, OutputError, PositionInfo, QueuedView, RuntimeError, Snapshot, SongInfo, StreamInfo,
     TransportState,
 };
 use play_cli::{Action, action_for_key, device_list, status_line};
@@ -55,6 +55,7 @@ fn snapshot() -> Snapshot {
             buffer_frames: 256,
             channels: 2,
         }),
+        mixer: MixerView::default(),
         underruns: 0,
         decode_errors: 0,
         last_error: None,

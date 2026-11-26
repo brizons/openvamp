@@ -66,8 +66,10 @@
 
 mod error;
 mod item;
+mod mixer;
 mod output;
 mod renderer;
+mod routing;
 mod session;
 mod setlist;
 mod song;
@@ -76,6 +78,7 @@ pub mod testing;
 pub use engine::live::{FadeState, JumpKind, JumpTiming};
 pub use error::{OpenError, RuntimeError};
 pub use library::{LoadError, SongProblem};
+pub use mixer::StemView;
 pub use output::{
     AudioOutput, DEFAULT_BUFFER_FRAMES, DeviceChoice, DeviceInfo, LossReason, MAX_BUFFER_FRAMES,
     MIN_BUFFER_FRAMES, OutputCheck, OutputError, OutputRequest, OutputStream, StreamHealth,
@@ -83,8 +86,8 @@ pub use output::{
 };
 pub use renderer::AudioRenderer;
 pub use session::{
-    Command, DeviceStatus, FadeView, PreparedSong, QueuedView, Session, SessionOptions, Snapshot,
-    TransportState,
+    Command, DeviceStatus, FadeView, MixerView, PreparedSong, QueuedView, Session, SessionOptions,
+    Snapshot, TransportState,
 };
 pub use setlist::{
     BlendView, CLICK_ONLY_SAMPLE_RATE, ItemInfo, PreparedSetlist, RateFallback, SetlistCommand,

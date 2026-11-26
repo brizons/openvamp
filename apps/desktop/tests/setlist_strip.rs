@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use app::{
     BlendView, Command, DeviceStatus, FadeState, FadeView, ItemInfo, JumpTiming, LossReason,
-    OutputError, PositionInfo, RateFallback, RuntimeError, SetlistCommand, SetlistCommandError,
-    SetlistInfo, SetlistProblem, SetlistSnapshot, SetlistState, Snapshot, SongInfo, StreamInfo,
-    TransportState,
+    MixerView, OutputError, PositionInfo, RateFallback, RuntimeError, SetlistCommand,
+    SetlistCommandError, SetlistInfo, SetlistProblem, SetlistSnapshot, SetlistState, Snapshot,
+    SongInfo, StreamInfo, TransportState,
 };
 use domain::{ClickItem, SetlistItem, SongItem, TimeSignature, Transition};
 use library::{ArrangementEntry, PositionEntry, SongEntry};
@@ -159,6 +159,7 @@ fn song_snapshot() -> Snapshot {
             buffer_frames: 256,
             channels: 2,
         }),
+        mixer: MixerView::default(),
         underruns: 0,
         decode_errors: 0,
         last_error: None,

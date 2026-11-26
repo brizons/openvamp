@@ -76,6 +76,19 @@ pub enum RuntimeError {
         /// Why the last try failed.
         error: OutputError,
     },
+    /// The lost device came back with fewer outputs than the routing used,
+    /// so the routing was fitted to them ([`domain::Routing::fit`]): the buses
+    /// that no longer fit play on outputs 1 and 2 (output 1 on a one-output
+    /// device).
+    #[error(
+        "audio device \"{device}\" came back with {outputs} output(s); the routing was fitted to them"
+    )]
+    RoutingRefitted {
+        /// Name of the device.
+        device: String,
+        /// The outputs the routing plays on now.
+        outputs: u16,
+    },
     /// The disk thread could not decode some blocks (advisory A5).
     #[error("the disk could not decode {blocks} block(s) of audio; they play as silence")]
     DecodeFailed {
@@ -98,6 +111,32 @@ pub enum RuntimeError {
     QueueFull {
         /// The command that was not sent.
         command: String,
+    },
+    /// A buffer size outside what F8.5 allows.
+    #[error(
+        "the buffer size must be {MIN_BUFFER_FRAMES} to {MAX_BUFFER_FRAMES} frames, not {frames}"
+    )]
+    BufferSize {
+        /// The requested frames.
+        frames: u32,
+    },
+    /// A mixer command for a stem the song does not have.
+    #[error("stem {stem} is not in the song, which has {stems} stem(s)")]
+    UnknownStem {
+        /// The requested stem.
+        stem: usize,
+        /// Stems in the song.
+        stems: usize,
+    },
+    /// A mixer command with a volume that is neither silent nor a number of
+    /// dB up to [`domain::MAX_VOLUME_DB`].
+    #[error(
+        "a volume is silent or at most {} dB, not {db} dB",
+        domain::MAX_VOLUME_DB
+    )]
+    InvalidVolume {
+        /// The requested volume in dB, as written.
+        db: String,
     },
     /// A jump to a position outside the arrangement.
     #[error("position {position} is outside the arrangement, which has {positions} positions")]

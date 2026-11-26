@@ -4,8 +4,10 @@
 //! [`CpalOutput`] lists the output devices with their channel counts (F8.1)
 //! and opens one stream per session: at the song's sample rate (a device that
 //! cannot run at it is an error; nothing resamples), with a fixed buffer of
-//! the size the session asks for (F8.5), stereo on outputs 1 and 2 of one
-//! device. A session that asks for the default output gets the device that
+//! the size the session asks for (F8.5), and the fewest channels the device
+//! offers at or above the ones the session renders (its routing's outputs,
+//! F8.2), which play on the device's first outputs; any other output gets
+//! silence. A session that asks for the default output gets the device that
 //! is the default when it opens, pinned by its id, so the stream never moves
 //! to another device on its own.
 //!
@@ -38,8 +40,8 @@
 //! pinned, and it is going away), one whose name cannot be read is listed
 //! as [`UNNAMED`].
 //!
-//! The data callback obeys the real-time checklist: the stereo scratch buffer
-//! is allocated when the stream is built, and the callback only renders into
+//! The data callback obeys the real-time checklist: the scratch buffer the
+//! renderer fills is allocated when the stream is built, and the callback only renders into
 //! it and converts samples; no allocation, lock, I/O or logging. The error
 //! callback, which some systems call on the audio thread, only stores an
 //! atomic. A stream reports [`StreamHealth::Lost`] once its device is gone
@@ -157,13 +159,16 @@ impl AudioOutput for CpalOutput {
             buffer_size: BufferSize::Fixed(request.buffer_frames),
         };
         let health = Arc::new(AtomicU8::new(RUNNING));
-        let max_frames = request.buffer_frames as usize;
+        let scratch = Scratch {
+            channels: usize::from(request.channels),
+            frames: request.buffer_frames as usize,
+        };
         let built = match choice.format {
-            SampleFormat::F32 => build::<f32>(&device, &config, renderer, &health, max_frames),
-            SampleFormat::I32 => build::<i32>(&device, &config, renderer, &health, max_frames),
-            SampleFormat::I16 => build::<i16>(&device, &config, renderer, &health, max_frames),
-            SampleFormat::F64 => build::<f64>(&device, &config, renderer, &health, max_frames),
-            SampleFormat::U16 => build::<u16>(&device, &config, renderer, &health, max_frames),
+            SampleFormat::F32 => build::<f32>(&device, &config, renderer, &health, scratch),
+            SampleFormat::I32 => build::<i32>(&device, &config, renderer, &health, scratch),
+            SampleFormat::I16 => build::<i16>(&device, &config, renderer, &health, scratch),
+            SampleFormat::F64 => build::<f64>(&device, &config, renderer, &health, scratch),
+            SampleFormat::U16 => build::<u16>(&device, &config, renderer, &health, scratch),
             _ => unreachable!("`choose_config` picks only formats `rank` knows"),
         };
         let stream = built.map_err(device_error)?;
@@ -183,25 +188,35 @@ impl AudioOutput for CpalOutput {
     }
 }
 
+/// The buffer the renderer fills: frames of the request's channels, as many
+/// as one callback holds.
+#[derive(Debug, Clone, Copy)]
+struct Scratch {
+    channels: usize,
+    frames: usize,
+}
+
 /// Builds a stream of samples of type `T` that renders through `renderer`.
 fn build<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     mut renderer: AudioRenderer,
     health: &Arc<AtomicU8>,
-    max_frames: usize,
+    scratch: Scratch,
 ) -> Result<cpal::Stream, cpal::Error>
 where
     T: SizedSample + FromSample<f32> + Send + 'static,
 {
     let channels = usize::from(config.channels);
     // Allocated here, never in the callback.
-    let mut stereo = vec![0.0f32; 2 * max_frames];
+    let mut rendered = vec![0.0f32; scratch.channels * scratch.frames];
     let health = Arc::clone(health);
     device.build_output_stream::<T, _, _>(
         *config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            write_interleaved(data, channels, &mut stereo, |piece| renderer.render(piece));
+            write_interleaved(data, channels, &mut rendered, scratch.channels, |piece| {
+                renderer.render(piece);
+            });
         },
         move |error: cpal::Error| {
             if let Some(reason) = loss_reason(error.kind()) {
@@ -337,6 +352,7 @@ pub fn plan<T>(
         &ranges,
         request.sample_rate,
         request.buffer_frames,
+        request.channels,
     )
     .map_err(Unplanned::Refused)?;
     Ok(Plan {
@@ -397,39 +413,42 @@ impl OutputStream for CpalStream {
 /// The stream configuration [`choose_config`] picks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamChoice {
-    /// Channels to open; the song plays on the first two.
+    /// Channels to open; the renderer's play on the first
+    /// [`app::OutputRequest::channels`].
     pub channels: u16,
     /// Sample format to write.
     pub format: SampleFormat,
 }
 
 /// Picks, among the configurations a device supports (`ranges`), one with at
-/// least two channels that runs at `sample_rate` with a buffer of `frames`
-/// frames: a float format first, then the fewest channels. Says why there is
-/// none: a device with fewer than two outputs, without the song's rate (with
-/// the rates it has), without the buffer size (with the sizes it takes), or
-/// without a format this adapter writes.
+/// least `channels` channels (one at least) that runs at `sample_rate` with
+/// a buffer of `frames` frames: a float format first, then the fewest
+/// channels. Says why there is none: a device with fewer outputs, without
+/// the song's rate (with the rates it has), without the buffer size (with
+/// the sizes it takes), or without a format this adapter writes.
 pub fn choose_config(
     device: &str,
     ranges: &[SupportedStreamConfigRange],
     sample_rate: u32,
     frames: u32,
+    channels: u16,
 ) -> Result<StreamChoice, OutputError> {
-    let stereo: Vec<&SupportedStreamConfigRange> = ranges
+    let wide: Vec<&SupportedStreamConfigRange> = ranges
         .iter()
-        .filter(|range| range.channels() >= 2)
+        .filter(|range| range.channels() >= channels.max(1))
         .collect();
-    if stereo.is_empty() {
-        return Err(OutputError::NotStereo {
+    if wide.is_empty() {
+        return Err(OutputError::TooFewChannels {
             device: device.to_owned(),
             channels: ranges
                 .iter()
                 .map(|range| range.channels())
                 .max()
                 .unwrap_or(0),
+            needed: channels,
         });
     }
-    let at_rate: Vec<&SupportedStreamConfigRange> = stereo
+    let at_rate: Vec<&SupportedStreamConfigRange> = wide
         .iter()
         .copied()
         .filter(|range| {
@@ -437,7 +456,7 @@ pub fn choose_config(
         })
         .collect();
     if at_rate.is_empty() {
-        let mut supported: Vec<(u32, u32)> = stereo
+        let mut supported: Vec<(u32, u32)> = wide
             .iter()
             .map(|range| (range.min_sample_rate(), range.max_sample_rate()))
             .collect();
@@ -502,20 +521,23 @@ fn rank(format: SampleFormat) -> Option<u8> {
     }
 }
 
-/// Fills `data`, interleaved frames of `channels` samples, from stereo the
-/// renderer writes into `stereo` in pieces of at most `stereo.len() / 2`
-/// frames: left on output 1, right on output 2, silence on the others.
-/// Real-time safe: it only uses the buffers it is given.
+/// Fills `data`, interleaved frames of `channels` samples, from frames of
+/// `rendered_channels` samples the renderer writes into `rendered` in
+/// pieces of at most `rendered.len() / rendered_channels` frames: rendered
+/// channel n on output n, silence on the outputs past them. A device with
+/// fewer channels than the renderer, which [`choose_config`] never picks,
+/// gets silence. Real-time safe: it only uses the buffers it is given.
 pub fn write_interleaved<T>(
     data: &mut [T],
     channels: usize,
-    stereo: &mut [f32],
+    rendered: &mut [f32],
+    rendered_channels: usize,
     mut render: impl FnMut(&mut [f32]),
 ) where
     T: Sample + FromSample<f32>,
 {
-    let piece_frames = stereo.len() / 2;
-    if channels < 2 || piece_frames == 0 {
+    let piece_frames = rendered.len().checked_div(rendered_channels).unwrap_or(0);
+    if rendered_channels == 0 || channels < rendered_channels || piece_frames == 0 {
         data.fill(T::EQUILIBRIUM);
         return;
     }
@@ -523,12 +545,17 @@ pub fn write_interleaved<T>(
     let (frames, rest) = data.split_at_mut(whole);
     rest.fill(T::EQUILIBRIUM);
     for chunk in frames.chunks_mut(piece_frames * channels) {
-        let piece = &mut stereo[..2 * (chunk.len() / channels)];
+        let piece = &mut rendered[..rendered_channels * (chunk.len() / channels)];
         render(piece);
-        for (frame, pair) in chunk.chunks_exact_mut(channels).zip(piece.chunks_exact(2)) {
-            frame[0] = T::from_sample(pair[0]);
-            frame[1] = T::from_sample(pair[1]);
-            frame[2..].fill(T::EQUILIBRIUM);
+        for (frame, heard) in chunk
+            .chunks_exact_mut(channels)
+            .zip(piece.chunks_exact(rendered_channels))
+        {
+            let (played, silent) = frame.split_at_mut(rendered_channels);
+            for (sample, &value) in played.iter_mut().zip(heard) {
+                *sample = T::from_sample(value);
+            }
+            silent.fill(T::EQUILIBRIUM);
         }
     }
 }

@@ -334,7 +334,8 @@ fn the_device_opens_at_the_songs_sample_rate_or_the_session_says_why_not() {
         vec![OutputRequest {
             device: None,
             sample_rate: RATE,
-            buffer_frames: 256
+            buffer_frames: 256,
+            channels: 2
         }]
     );
     assert_eq!(
@@ -344,7 +345,8 @@ fn the_device_opens_at_the_songs_sample_rate_or_the_session_says_why_not() {
             device_id: "fake:1".to_owned(),
             sample_rate: RATE,
             buffer_frames: 256,
-            channels: 8
+            // A stereo session opens two of the eight outputs.
+            channels: 2
         })
     );
 }
@@ -680,7 +682,8 @@ fn unplugging_the_device_pauses_with_a_clear_message_and_plugging_it_back_restor
         OutputRequest {
             device: Some(DeviceChoice::Id(FAKE_DEVICE_ID.to_owned())),
             sample_rate: RATE,
-            buffer_frames: 256
+            buffer_frames: 256,
+            channels: 2
         },
         "the same device, by id"
     );

@@ -2,8 +2,9 @@
 //!
 //! An adapter implements [`AudioOutput`] for real hardware (`io-cpal`);
 //! [`crate::testing::FakeOutput`] implements it for tests. The session asks
-//! for one stream at the song's sample rate and hands it an
-//! [`AudioRenderer`], which the adapter calls from its audio thread.
+//! for one stream at the song's sample rate, with the channels its routing
+//! uses, and hands it an [`AudioRenderer`], which the adapter calls from its
+//! audio thread.
 
 use std::fmt;
 use std::time::Duration;
@@ -97,6 +98,12 @@ pub struct OutputRequest {
     pub sample_rate: u32,
     /// Frames per audio callback.
     pub buffer_frames: u32,
+    /// Channels the renderer fills in each frame, 1 to
+    /// [`domain::MAX_OUTPUTS`]: the stream opens the fewest channels the
+    /// device offers at or above this many, plays the renderer's on outputs
+    /// 1 to `channels`, and silence on the others. A device with fewer
+    /// outputs is refused ([`OutputError::TooFewChannels`]).
+    pub channels: u16,
 }
 
 /// The stream a port opened.
@@ -110,8 +117,9 @@ pub struct StreamInfo {
     pub sample_rate: u32,
     /// Frames per audio callback.
     pub buffer_frames: u32,
-    /// Channels the stream opened on the device; the song plays on the
-    /// first two, the others get silence.
+    /// Channels the stream opened on the device, at least
+    /// [`OutputRequest::channels`]: the renderer's play on the first ones,
+    /// the others get silence.
     pub channels: u16,
 }
 
@@ -213,7 +221,7 @@ pub trait AudioOutput: Send {
 
     /// Checks `request` as [`Self::open`] would before it builds a stream:
     /// that the device it means is there and supports the rate, the buffer
-    /// size and stereo. It never opens a stream and never counts as one; a
+    /// size and the channels. It never opens a stream and never counts as one; a
     /// stream already playing on the device does not count against the
     /// request, since it may be the one about to be replaced. The default,
     /// for ports without a check, is [`OutputCheck::Unknown`].
@@ -225,9 +233,10 @@ pub trait AudioOutput: Send {
     }
 
     /// Opens `request.device` at exactly `request.sample_rate` and
-    /// `request.buffer_frames`, plays the renderer's stereo frames on its
-    /// outputs 1 and 2, and starts calling [`AudioRenderer::render`] from the
-    /// audio thread.
+    /// `request.buffer_frames` with at least `request.channels` channels,
+    /// plays the renderer's frames of `request.channels` channels on its
+    /// first outputs (silence on the others), and starts calling
+    /// [`AudioRenderer::render`] from the audio thread.
     ///
     /// The port calls the renderer from one thread at a time, and drops it
     /// when the returned stream is dropped, or before returning an error.
@@ -294,13 +303,18 @@ pub enum OutputError {
         /// Largest buffer the device takes.
         max: u32,
     },
-    /// The device has fewer than two output channels.
-    #[error("audio device \"{device}\" has {channels} output channel(s); stereo playback needs 2")]
-    NotStereo {
+    /// The device has fewer output channels than the request
+    /// ([`OutputRequest::channels`]).
+    #[error(
+        "audio device \"{device}\" has {channels} output channel(s); the routing needs {needed}"
+    )]
+    TooFewChannels {
         /// Device name.
         device: String,
         /// Its output channels.
         channels: u16,
+        /// The channels requested.
+        needed: u16,
     },
     /// The device takes no sample format the adapter can write.
     #[error("audio device \"{device}\" takes no sample format this player can write")]

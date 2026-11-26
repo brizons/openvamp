@@ -61,6 +61,7 @@ fn request(device: Option<&str>, sample_rate: u32) -> OutputRequest {
         device: device.map(|name| DeviceChoice::Named(name.to_owned())),
         sample_rate,
         buffer_frames: 256,
+        channels: 2,
     }
 }
 
@@ -110,14 +111,19 @@ fn check_refuses_exactly_what_open_refuses_before_it_builds() {
 #[test]
 fn a_device_that_cannot_play_the_request_is_refused_with_opens_reason() {
     let (check, open) = both(found(), &request(None, 96_000));
-    let expected = choose_config("Speakers", &[stereo((44_100, 48_000))], 96_000, 256).unwrap_err();
+    let expected =
+        choose_config("Speakers", &[stereo((44_100, 48_000))], 96_000, 256, 2).unwrap_err();
     assert_eq!(check, OutputCheck::Refused(expected.clone()));
     assert_eq!(open, Err(expected));
 
     let (check, _) = both(found(), &request(Some("Mono"), 48_000));
     assert!(matches!(
         check,
-        OutputCheck::Refused(OutputError::NotStereo { channels: 1, .. })
+        OutputCheck::Refused(OutputError::TooFewChannels {
+            channels: 1,
+            needed: 2,
+            ..
+        })
     ));
     assert_eq!(
         both(Ok(Vec::new()), &request(None, 48_000)).0,

@@ -11,6 +11,7 @@ use engine::live::{self, Controller, JumpTiming, Player, PlayerConfig};
 use library::{DiskMonitor, StreamConfig, StreamingSong, open_streaming};
 
 use crate::error::OpenError;
+use crate::mixer::ItemMix;
 use crate::output::MAX_BUFFER_FRAMES;
 use crate::session::SessionOptions;
 use crate::song::SongInfo;
@@ -23,6 +24,9 @@ pub(crate) struct Item {
     /// handed over ([`Self::carry`]).
     pub(crate) controller: Controller,
     pub(crate) monitor: DiskMonitor,
+    /// The arrangement's mix, from the song's `mix.json`; the session gives
+    /// the player its gains before it plays.
+    pub(crate) mix: ItemMix,
 }
 
 impl Item {
@@ -34,7 +38,9 @@ impl Item {
         arrangement: &str,
         options: &SessionOptions,
     ) -> Result<Self, OpenError> {
-        Self::from_stream(stream(dir, options)?, arrangement, false, options)
+        let streaming = stream(dir, options)?;
+        let mix = ItemMix::read(dir, &streaming.song, arrangement);
+        Self::from_stream(streaming, arrangement, false, options, mix)
     }
 
     /// Opens a setlist song item: the song folder `dir`, its `arrangement`
@@ -52,6 +58,8 @@ impl Item {
         options: &SessionOptions,
     ) -> Result<Self, ItemError> {
         let mut streaming = stream(dir, options)?;
+        // Read against the whole song, which the file was written for.
+        let mix = ItemMix::read(dir, &streaming.song, arrangement);
         if let Some(range) = positions {
             streaming.song = excerpt(streaming.song, arrangement, range)?;
         }
@@ -60,6 +68,7 @@ impl Item {
             arrangement,
             end_fade,
             options,
+            mix,
         )?)
     }
 
@@ -69,6 +78,7 @@ impl Item {
         arrangement: &str,
         end_fade: bool,
         options: &SessionOptions,
+        mix: ItemMix,
     ) -> Result<Self, OpenError> {
         let StreamingSong {
             song,
@@ -97,6 +107,7 @@ impl Item {
             player,
             controller,
             monitor,
+            mix,
         })
     }
 
@@ -124,6 +135,7 @@ impl Item {
             player,
             controller,
             monitor: DiskMonitor::default(),
+            mix: ItemMix::click(),
         })
     }
 
@@ -150,8 +162,7 @@ fn config(sample_rate: u32, options: &SessionOptions) -> PlayerConfig {
         sample_rate,
         max_frames: options.buffer_frames as usize,
         seam_crossfade: options.seam_crossfade,
-        // The output port is stereo until the multichannel open (T4).
-        channels: 2,
+        channels: crate::routing::player_channels(options.routing.as_ref()),
     }
 }
 

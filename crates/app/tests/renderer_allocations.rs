@@ -2,8 +2,9 @@
 //! allocation or deallocation." in `AudioRenderer::render`, which runs the
 //! player, asks the sources whether the playhead is ready, and publishes the
 //! snapshot, while the session is stopped, starting, playing, jumping,
-//! fading and panicking, and while a setlist links one song to the next and
-//! crossfades into a third.
+//! fading and panicking, while a setlist links one song to the next and
+//! crossfades into a third, and while the mixer changes the gains of a
+//! session whose players render more channels than its stream takes.
 //!
 //! This test binary installs a counting global allocator that counts only on
 //! the test thread while it calls `render`; `unsafe` is needed only to
@@ -21,7 +22,7 @@ use app::{
     StreamInfo,
 };
 use common::{IDLE, RATE, write_song, write_song_with};
-use domain::{Setlist, SetlistItem, SongItem, Transition};
+use domain::{Bus, Routing, Setlist, SetlistItem, SongItem, Transition, Volume};
 use library::Library;
 
 struct Counting;
@@ -152,6 +153,89 @@ fn rendering_a_session_allocates_nothing() {
     }
     assert_eq!(allocations, 0);
     assert!(session.poll().output_frame > 0, "the song played");
+}
+
+#[test]
+fn rendering_a_routed_session_through_mixer_changes_allocates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    write_song(dir.path(), RATE);
+    let capture = Capture::default();
+    // The players render eight channels; the stream takes the two the
+    // routing uses.
+    let mut session = Session::open(
+        dir.path(),
+        Box::new(capture.clone()),
+        SessionOptions {
+            buffer_frames: 256,
+            routing: Some(Routing::stereo(8)),
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+    let monitor = session.disk_monitor();
+    let db = Volume::from_db;
+    let script = [
+        (2, Command::Play),
+        (
+            40,
+            Command::SetStemVolume {
+                stem: 0,
+                volume: db(-6.0),
+            },
+        ),
+        (
+            60,
+            Command::SetBusMute {
+                bus: Bus::Drums,
+                mute: true,
+            },
+        ),
+        (
+            80,
+            Command::SetStemBus {
+                stem: 1,
+                bus: Some(Bus::Vocals),
+            },
+        ),
+        (100, Command::SetMasterVolume(db(-3.0))),
+        (
+            120,
+            Command::SetStemSolo {
+                stem: 1,
+                solo: true,
+            },
+        ),
+        (
+            140,
+            Command::SetBusVolume {
+                bus: Bus::ClickGuide,
+                volume: db(-6.0),
+            },
+        ),
+        (
+            160,
+            Command::SetBusMute {
+                bus: Bus::Drums,
+                mute: false,
+            },
+        ),
+    ];
+    let mut out = vec![0.0f32; 2 * 256];
+    let mut allocations = 0;
+    let mut renderer = capture.renderer.lock().unwrap();
+    let renderer = renderer.as_mut().unwrap();
+    for buffer in 0..200 {
+        for (_, command) in script.iter().filter(|(at, _)| *at == buffer) {
+            session.send(*command).unwrap();
+        }
+        assert!(monitor.wait_idle(IDLE));
+        COUNT.with(|count| count.set(Some(0)));
+        renderer.render(&mut out);
+        allocations += COUNT.with(|count| count.replace(None)).unwrap();
+        session.poll();
+    }
+    assert_eq!(allocations, 0);
+    assert!(out.iter().any(|&sample| sample != 0.0), "the song played");
 }
 
 #[test]
