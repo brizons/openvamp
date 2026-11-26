@@ -165,11 +165,17 @@ fn an_unknown_device_exits_with_code_1_before_anything_plays() {
     let output = play_cli(&[song.to_str().unwrap(), "--device", "No Such Device"]);
     assert_eq!(output.status.code(), Some(1));
     let errors = stderr(&output);
+    // The host's audio library may print its own lines first (ALSA does on a
+    // machine without a sound card), so the check starts at play-cli's line.
+    let ours = errors
+        .lines()
+        .find(|line| line.starts_with("error: "))
+        .unwrap_or_default();
     // Without any audio system, the host error is reported instead.
     assert!(
-        errors.starts_with(
+        ours.starts_with(
             "error: no audio output device has the name or id \"No Such Device\"; available: "
-        ) || errors.starts_with("error: audio system: "),
+        ) || ours.starts_with("error: audio system: "),
         "{errors}"
     );
 }
