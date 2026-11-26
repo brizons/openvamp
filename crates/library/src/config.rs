@@ -240,6 +240,15 @@ impl ConfigStore {
         parse: impl FnOnce(&str) -> Result<T, domain::MixerFileError>,
     ) -> Read<T> {
         match fs::canonicalize(&self.folder) {
+            // Reading through a file fails as "not found" on some systems
+            // (Windows), so a folder that is a file is reported here.
+            Ok(folder) if !folder.is_dir() => Read {
+                value: T::default(),
+                error: Some(SettingsError::Folder {
+                    path: self.folder.clone(),
+                    source: io::Error::from(io::ErrorKind::NotADirectory),
+                }),
+            },
             Ok(folder) => read_settings(&folder, file, parse),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Read {
                 value: T::default(),
