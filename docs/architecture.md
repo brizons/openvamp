@@ -157,6 +157,14 @@ Render transposed and time-stretched stems **offline**, into a cache keyed by ke
 
 Songs use the [open song package](mvp-spec.md#song-package-format-v1). Lossy imports are transcoded to FLAC so the disk thread can seek to any sample exactly; that costs storage and is listed as an open decision in the spec.
 
+Mixing and routing add three JSON files, each with its own `formatVersion` (1) and documented in the `domain` crate:
+
+| File | Where | Holds | Format docs |
+|------|-------|-------|-------------|
+| `mix.json` | Beside `song.json` in the song folder; `song.json` is never rewritten | Each arrangement's stem volumes, mutes, solos and bus choices | `domain::mix` |
+| Bus settings | App configuration folder | The global bus volumes and mutes and the master volume | `domain::mixer` |
+| Routing | App configuration folder | Each device's bus-to-output routing and split mode | `domain::routing` |
+
 ## Repository layout
 
 ```text
