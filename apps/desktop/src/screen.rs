@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use app::AudioOutput;
+use app::{AudioOutput, SessionOptions};
 use domain::SetlistItem;
 use gpui::{
     App, AppContext, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
@@ -25,10 +25,13 @@ use openvamp_desktop::facts::{self, FactsCache};
 use openvamp_desktop::hold::PanicHold;
 use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, Typed, is_panic_key, typed};
 use openvamp_desktop::library_page::{Dragged, LibraryPage, Opened, library_to_open};
-use openvamp_desktop::mixer::{MixerAction, MixerPage, restore_mix, unsaved_mix};
+use openvamp_desktop::mixer::{MixerAction, MixerPage, UnsavedMix, restore_mix, unsaved_mix};
 use openvamp_desktop::output_page::{OutputAction, OutputPage};
 use openvamp_desktop::reorder::Half;
-use openvamp_desktop::show::{LoadedSetlist, Show, Source, close, replace};
+use openvamp_desktop::show::{
+    LoadedSetlist, OpenFailure, Prepared, Replaced, Show, Source, close, reopen_previous,
+    replace_prepared,
+};
 use openvamp_desktop::tick::Timed;
 use openvamp_desktop::view::{PerformView, SongFacts};
 
@@ -73,6 +76,9 @@ pub struct Perform {
     /// The facts of the song folders read, which the song header and the
     /// bars on Perform show; never read while drawing.
     facts: FactsCache,
+    /// Counts the picks: only the newest one opens once it has prepared
+    /// ([`Self::open`]).
+    opening: u64,
     _poll: Task<()>,
     _quit: Subscription,
     _deactivated: Subscription,
@@ -120,13 +126,14 @@ impl Perform {
             mixer: MixerPage::new(),
             output: OutputPage::new(),
             facts: FactsCache::new(),
+            opening: 0,
             _poll: poll,
             _quit: quit,
             _deactivated: deactivated,
             _blurred: blurred,
         };
         if let Some(path) = path {
-            screen.open_path(&path);
+            screen.open_path(&path, cx);
         }
         screen
     }
@@ -135,6 +142,8 @@ impl Perform {
     /// refuses again within [`openvamp_desktop::song::STOP_WAIT`], then
     /// closes the session and its device; what went wrong goes to stderr.
     pub fn close_song(&mut self) {
+        // A pick still preparing never opens after the show ended.
+        self.opening += 1;
         self.save_waiting_buses();
         if let Some(show) = self.loaded.take() {
             // A buffer size or routing waiting for the device is not kept.
@@ -206,51 +215,157 @@ impl Perform {
 
     /// Opens what `path` names ([`Source::for_path`]); one that cannot be
     /// opened says why.
-    fn open_path(&mut self, path: &Path) {
+    fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
         match Source::for_path(path) {
-            Ok(source) => self.open(&source),
+            Ok(source) => self.open(&source, cx),
             Err(problem) => self.problems = vec![problem],
         }
     }
 
-    /// Opens `source` in place of what plays ([`replace`]): a pick that
-    /// does not open leaves the current song or setlist loaded and
+    /// Opens `source` in place of what plays ([`Self::open_with`]).
+    fn open(&mut self, source: &Source, cx: &mut Context<Self>) {
+        self.open_with(source, None, cx);
+    }
+
+    /// Opens `source` in place of what plays: it prepares on the background
+    /// executor ([`Source::prepare`]) while what plays goes on, Panic
+    /// included, since reading its files can wait seconds for a slow,
+    /// sleeping or unplugged volume. Once it has, unless a newer pick came
+    /// meanwhile, it takes the place of what plays ([`replace_prepared`]): a
+    /// pick that does not open leaves the current song or setlist loaded and
     /// playing, and the reasons show on screen; otherwise what plays stops
     /// with its ramp and closes its device before the pick opens the
-    /// device.
-    fn open(&mut self, source: &Source) {
+    /// device. `unsaved`, a mix not saved yet, plays again once it opens.
+    fn open_with(&mut self, source: &Source, unsaved: Option<UnsavedMix>, cx: &mut Context<Self>) {
         // The saved routing of the device it opens on, and the bus settings,
         // with the last bus changes in them.
         self.save_waiting_buses();
         let listed = CpalOutput::new().devices();
-        let (options, fallback) = self.settings.open_options(&listed);
-        let replaced = replace(
-            &mut self.loaded,
-            source,
-            &options,
-            || Box::new(CpalOutput::new()),
-            thread::sleep,
+        let (options, _) = self.settings.open_options(&listed);
+        self.opening += 1;
+        let ticket = self.opening;
+        let pick = source.clone();
+        let used = options.clone();
+        self.prepare_then(
+            ticket,
+            source.clone(),
+            options,
+            cx,
+            move |screen, prepared, cx| {
+                screen.prepared(ticket, &pick, &used, prepared, unsaved, cx);
+            },
         );
-        match replaced {
-            Ok(replaced) => {
-                // What plays closed: a buffer size or routing waiting for
-                // its device is not kept.
-                self.output.song_closed();
-                // Its song.json may have changed: read every folder again.
-                self.facts.forget();
-                self.hold = PanicHold::new();
-                self.problems = replaced.problems();
-                for problem in &self.problems {
-                    eprintln!("warning: {problem}");
+    }
+
+    /// Prepares `source` with `options` on the background executor, then
+    /// hands what it gave to `then` on the screen, unless a newer pick came
+    /// meanwhile: what that pick left is dropped on the background
+    /// executor, since dropping it waits for its disk thread.
+    fn prepare_then(
+        &mut self,
+        ticket: u64,
+        source: Source,
+        options: SessionOptions,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, Result<Prepared, OpenFailure>, &mut Context<Self>) + 'static,
+    ) {
+        let background = cx.background_executor().clone();
+        let prepare = background.spawn(async move { source.prepare(&options) });
+        cx.spawn(async move |this, cx| {
+            let prepared = prepare.await;
+            let _ = this.update(cx, |screen, cx| {
+                if screen.opening == ticket {
+                    then(screen, prepared, cx);
+                } else {
+                    background.spawn(async move { drop(prepared) }).detach();
                 }
-            }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The pick `source`, prepared with `used`, takes the place of what
+    /// plays ([`replace_prepared`]). When the settings it opens with changed
+    /// while it prepared (a device plugged in, a bus moved), it prepares
+    /// again with them first. When its device does not start, the show it
+    /// replaced prepares again and opens, stopped at the start.
+    fn prepared(
+        &mut self,
+        ticket: u64,
+        source: &Source,
+        used: &SessionOptions,
+        prepared: Result<Prepared, OpenFailure>,
+        unsaved: Option<UnsavedMix>,
+        cx: &mut Context<Self>,
+    ) {
+        self.save_waiting_buses();
+        let listed = CpalOutput::new().devices();
+        let (options, fallback) = self.settings.open_options(&listed);
+        if !same_settings(&options, used) {
+            cx.background_executor()
+                .spawn(async move { drop(prepared) })
+                .detach();
+            self.open_with(source, unsaved, cx);
+            return;
+        }
+        let replaced = prepared.and_then(|prepared| {
+            replace_prepared(
+                &mut self.loaded,
+                source,
+                prepared,
+                Box::new(CpalOutput::new()),
+                thread::sleep,
+            )
+        });
+        let mut replaced = match replaced {
+            Ok(replaced) => replaced,
             Err(error) => {
                 self.problems = error.lines();
                 self.problems
                     .insert(0, format!("Could not open {}:", source.describe()));
+                self.notice_fallback(fallback);
+                return;
             }
+        };
+        // What plays closed: a buffer size or routing waiting for its
+        // device is not kept.
+        self.output.song_closed();
+        // Its song.json may have changed: read every folder again.
+        self.facts.forget();
+        self.hold = PanicHold::new();
+        let Some(previous) = replaced.to_reopen().cloned() else {
+            self.opened(&replaced, fallback, unsaved);
+            return;
+        };
+        self.prepare_then(ticket, previous, options, cx, move |screen, prepared, _| {
+            reopen_previous(&mut screen.loaded, &mut replaced, prepared, || {
+                Box::new(CpalOutput::new())
+            });
+            screen.opened(&replaced, fallback, unsaved);
+        });
+    }
+
+    /// A pick opened (or the show it replaced opened again): its problems
+    /// show, and `unsaved` plays again when it is the same song.
+    fn opened(
+        &mut self,
+        replaced: &Replaced,
+        fallback: Option<String>,
+        unsaved: Option<UnsavedMix>,
+    ) {
+        self.problems = replaced.problems();
+        for problem in &self.problems {
+            eprintln!("warning: {problem}");
         }
-        // Not the device asked for: say which one plays instead.
+        self.notice_fallback(fallback);
+        if let (Some(show), Some(unsaved)) = (&mut self.loaded, &unsaved) {
+            restore_mix(show, unsaved);
+        }
+    }
+
+    /// Not the device asked for: say which one plays instead.
+    fn notice_fallback(&mut self, fallback: Option<String>) {
         if let Some(notice) = fallback {
             eprintln!("warning: {notice}");
             self.problems.push(notice);
@@ -352,7 +467,7 @@ impl Perform {
                 }
                 self.follow_library_moves();
             }
-            Intent::PerformSetlist => self.perform_setlist(),
+            Intent::PerformSetlist => self.perform_setlist(cx),
             Intent::DismissProblems => self.problems.clear(),
         }
         cx.notify();
@@ -397,9 +512,9 @@ impl Perform {
             if let Some(path) = chosen {
                 let _ = this.update(cx, |screen, cx| {
                     match pick {
-                        Pick::Song => screen.open(&Source::Song(path)),
+                        Pick::Song => screen.open(&Source::Song(path), cx),
                         Pick::Setlist => match Source::picked_setlist(&path) {
-                            Ok(source) => screen.open(&source),
+                            Ok(source) => screen.open(&source, cx),
                             Err(problem) => screen.problems = vec![problem],
                         },
                         Pick::Library => screen.open_library(&path, None, Opened::Picked),
@@ -482,10 +597,7 @@ impl Perform {
             // A mix not saved yet carries onto the new device.
             let unsaved = unsaved_mix(show);
             let source = show.source();
-            self.open(&source);
-            if let (Some(show), Some(unsaved)) = (&mut self.loaded, &unsaved) {
-                restore_mix(show, unsaved);
-            }
+            self.open_with(&source, unsaved, cx);
         }
         if let Some(show) = &mut self.loaded {
             show.poll();
@@ -647,7 +759,7 @@ impl Perform {
 
     /// Opens the setlist in the Library screen's editor on the Perform
     /// screen, as Open setlist… does.
-    fn perform_setlist(&mut self) {
+    fn perform_setlist(&mut self, cx: &mut Context<Self>) {
         let Some(library) = &self.library else {
             return;
         };
@@ -658,7 +770,7 @@ impl Perform {
             library: library.root().to_owned(),
             file: file.to_owned(),
         };
-        self.open(&source);
+        self.open(&source, cx);
         self.page = Page::Perform;
     }
 
@@ -887,4 +999,14 @@ pub fn open_window(path: Option<PathBuf>, cx: &mut App) -> gpui::Result<()> {
         screen
     })?;
     Ok(())
+}
+
+/// Whether a show prepared with `used` opens as one prepared with `options`
+/// would: on the same device, with the same buffer size, routing and bus
+/// settings.
+fn same_settings(options: &SessionOptions, used: &SessionOptions) -> bool {
+    options.device == used.device
+        && options.buffer_frames == used.buffer_frames
+        && options.routing == used.routing
+        && options.bus_settings == used.bus_settings
 }
