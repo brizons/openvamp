@@ -72,6 +72,11 @@ impl Valve {
         assert!(valve.holding > 0, "the read is held");
     }
 
+    /// How many reads are held right now.
+    fn holding(&self) -> usize {
+        self.state.0.lock().unwrap().holding
+    }
+
     /// Whether a read is held right now, never let through by the limit.
     fn still_holding(&self) -> bool {
         let valve = self.state.0.lock().unwrap();
@@ -360,4 +365,69 @@ fn a_selected_item_whose_load_fails_reports_why_and_stays_unselected() {
     assert_eq!(snapshot.setlist.current, 0, "A stays selected");
     assert_eq!(snapshot.song.transport, TransportState::Stopped);
     assert!(!snapshot.setlist.next_ready);
+}
+
+#[test]
+fn selecting_back_and_forth_on_a_hung_folder_reads_it_once_and_the_newest_selection_wins() {
+    let shelf = Shelf::new();
+    let fake = FakeOutput::new();
+    let valve = Valve::default();
+    let mut session = shelf.open(
+        &[
+            ("A", Transition::CueNext),
+            ("B", Transition::CueNext),
+            ("C", Transition::CueNext),
+        ],
+        &fake,
+        &valve,
+    );
+    session.poll();
+    valve.wait_held();
+
+    // B's folder does not answer; the operator goes back and forth.
+    for _ in 0..6 {
+        promptly("select B", || session.send(SetlistCommand::Select(1))).unwrap();
+        promptly("select C", || session.send(SetlistCommand::Select(2))).unwrap();
+        promptly("a poll", || session.poll());
+    }
+    promptly("select B", || session.send(SetlistCommand::Select(1))).unwrap();
+    promptly("a poll", || session.poll());
+    assert_eq!(
+        valve.holding(),
+        1,
+        "B is read once, however often it is picked"
+    );
+
+    // C is picked last, then B's read comes back: it does not land.
+    promptly("select C", || session.send(SetlistCommand::Select(2))).unwrap();
+    assert_eq!(session.poll().setlist.current, 2);
+    assert!(valve.still_holding());
+    valve.release();
+    let mut snapshot = session.poll();
+    for _ in 0..20 {
+        for disk in session.disk_monitors() {
+            assert!(disk.wait_idle(IDLE));
+        }
+        snapshot = session.poll();
+    }
+    assert_eq!(
+        snapshot.setlist.current, 2,
+        "C, picked last, stays selected"
+    );
+    assert_eq!(snapshot.setlist.problem, None);
+
+    // B selected again now loads and is selected.
+    session.send(SetlistCommand::Select(1)).unwrap();
+    let mut snapshot = session.poll();
+    for _ in 0..200 {
+        if snapshot.setlist.current == 1 {
+            break;
+        }
+        for disk in session.disk_monitors() {
+            assert!(disk.wait_idle(IDLE));
+        }
+        snapshot = session.poll();
+    }
+    assert_eq!(snapshot.setlist.current, 1);
+    assert_eq!(valve.holding(), 0);
 }

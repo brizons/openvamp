@@ -381,6 +381,13 @@ struct Loading {
     load: Load<Result<Item, String>>,
 }
 
+impl Loading {
+    /// Whether its thread is done.
+    fn is_done(&self) -> bool {
+        self.load.peek(|_| ()).is_some()
+    }
+}
+
 /// A selection made once its item has loaded: the operator's, or the one
 /// the current item's transition makes at its end.
 #[derive(Debug, Clone, Copy)]
@@ -433,7 +440,7 @@ impl PreparedSetlist {
             cued: None,
             withdrawn: None,
             pending: None,
-            loading: None,
+            loads: Vec::new(),
             awaiting: None,
             reopen: None,
             play_after_reopen: false,
@@ -550,8 +557,13 @@ pub struct SetlistSession {
     /// The item cued last, sent back; never set while one is cued.
     withdrawn: Option<Withdrawn>,
     pending: Option<Pending>,
-    /// The song item loading: the next one, or the one a selection awaits.
-    loading: Option<Loading>,
+    /// The song items loading, at most one load per item: the next one,
+    /// the one a selection awaits, and those picked before them whose load
+    /// has not come back. A load is kept until it is taken, or until it is
+    /// done and its item no longer wanted, so an item picked again adopts
+    /// its load instead of starting another: a folder that does not answer
+    /// holds up one thread, however often its item is picked.
+    loads: Vec<Loading>,
     /// A selection waiting for its item to load.
     awaiting: Option<Awaiting>,
     /// An item at another rate waiting for the current one to stop before
@@ -649,8 +661,8 @@ impl SetlistSession {
     /// Watches the disk threads of the current item, the item a crossfade
     /// fades out while it does, and the items prepared ahead; for tests and
     /// diagnostics. A song item still loading has no disk thread yet: this
-    /// first waits for its load, at most 10 seconds, so its thread is
-    /// watched too.
+    /// first waits for the loads under way, at most 10 seconds in all, so
+    /// their threads are watched too.
     pub fn disk_monitors(&self) -> Vec<DiskMonitor> {
         let mut monitors = vec![self.session.disk_monitor()];
         monitors.extend(self.fading.clone());
@@ -666,8 +678,9 @@ impl SetlistSession {
                 .chain(&self.reopen)
                 .map(|pending| pending.item.monitor.clone()),
         );
-        if let Some(loading) = &self.loading {
-            loading.load.wait(Instant::now() + MONITOR_PATIENCE);
+        let deadline = Instant::now() + MONITOR_PATIENCE;
+        for loading in &self.loads {
+            loading.load.wait(deadline);
             let loaded = loading
                 .load
                 .peek(|loaded| loaded.as_ref().ok().map(|item| item.monitor.clone()));
@@ -1022,7 +1035,6 @@ impl SetlistSession {
                 .as_mut()
                 .map(|withdrawn| &mut withdrawn.staged.index),
             self.pending.as_mut().map(|pending| &mut pending.index),
-            self.loading.as_mut().map(|loading| &mut loading.index),
             self.awaiting.as_mut().map(|awaiting| &mut awaiting.index),
             self.reopen.as_mut().map(|pending| &mut pending.index),
             self.failed.as_mut(),
@@ -1036,6 +1048,9 @@ impl SetlistSession {
         ];
         for index in indexes.into_iter().flatten() {
             *index = moved_index(*index, from, to);
+        }
+        for loading in &mut self.loads {
+            loading.index = moved_index(loading.index, from, to);
         }
         self.keep_next_ready();
         Ok(())
@@ -1085,13 +1100,9 @@ impl SetlistSession {
         {
             self.pending = None;
         }
-        if self
-            .loading
-            .as_ref()
-            .is_some_and(|loading| Some(loading.index) != want)
-        {
-            self.loading = None;
-        }
+        // A load still under way is kept: its item may be picked again.
+        self.loads
+            .retain(|loading| Some(loading.index) == want || !loading.is_done());
         let Some(want) = want else {
             return;
         };
@@ -1153,8 +1164,9 @@ impl SetlistSession {
 
     /// Item `index`, built at the device's rate. A click-only tile is built
     /// at once. A song item loads on a thread of its own: the first call
-    /// starts its load (one for another item is dropped) and returns
-    /// `Ok(None)`, as does every call until it has loaded.
+    /// starts its load, or adopts the one already under way for it
+    /// ([`Self::loads`]), and returns `Ok(None)`, as does every call until
+    /// it has loaded.
     fn prepare_item(&mut self, index: usize) -> Result<Option<Pending>, SetlistCommandError> {
         let prepare_error = |error: String| SetlistCommandError::Prepare { item: index, error };
         let plan = match self.plans.get(index).and_then(Option::as_ref) {
@@ -1167,13 +1179,9 @@ impl SetlistSession {
             }
             Some(plan) => plan.clone(),
         };
-        let Some(loading) = self
-            .loading
-            .as_ref()
-            .filter(|loading| loading.index == index)
-        else {
+        let Some(at) = self.loads.iter().position(|loading| loading.index == index) else {
             let (rate, options) = (self.session.sample_rate(), self.options.clone());
-            self.loading = Some(Loading {
+            self.loads.push(Loading {
                 index,
                 since: Instant::now(),
                 load: Load::spawn(
@@ -1183,10 +1191,10 @@ impl SetlistSession {
             });
             return Ok(None);
         };
-        let Some(loaded) = loading.load.take() else {
+        let Some(loaded) = self.loads[at].load.take() else {
             return Ok(None);
         };
-        self.loading = None;
+        self.loads.swap_remove(at);
         loaded
             .map(|item| Some(Pending { index, item }))
             .map_err(prepare_error)
@@ -1203,7 +1211,7 @@ impl SetlistSession {
         if pending.is_some() || !patient {
             return Ok(pending);
         }
-        if let Some(loading) = &self.loading {
+        if let Some(loading) = self.loading(index) {
             loading.load.wait(loading.since + SELECT_PATIENCE);
         }
         self.prepare_item(index)
@@ -1216,10 +1224,10 @@ impl SetlistSession {
         let Some(awaiting) = self.awaiting else {
             return;
         };
-        let loaded = self.loading.as_ref().is_none_or(|loading| {
-            loading.index != awaiting.index || loading.load.peek(|_| ()).is_some()
-        });
-        if !loaded {
+        if self
+            .loading(awaiting.index)
+            .is_some_and(|loading| !loading.is_done())
+        {
             return;
         }
         self.awaiting = None;
@@ -1229,6 +1237,11 @@ impl SetlistSession {
             }
             self.problem = Some(problem(awaiting.index, error));
         }
+    }
+
+    /// The load of item `index`, if one is under way or not taken yet.
+    fn loading(&self, index: usize) -> Option<&Loading> {
+        self.loads.iter().find(|loading| loading.index == index)
     }
 
     fn next_ready(&mut self, next: Option<usize>) -> bool {
