@@ -2,13 +2,15 @@
 //! that plays, polls it on a timer, turns pointer and key events into
 //! view-model actions, and hands a [`PerformView`] (and, for a setlist, a
 //! [`openvamp_desktop::strip::SetlistView`]) to the presentational code in
-//! [`crate::ui`].
+//! [`crate::ui`], with the song's [`SongFacts`] read from its `song.json`
+//! on a background thread ([`openvamp_desktop::facts`]).
 
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use app::AudioOutput;
+use domain::SetlistItem;
 use gpui::{
     App, AppContext, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
     ModifiersChangedEvent, PathPromptOptions, PromptButton, PromptLevel, Render, Subscription,
@@ -19,6 +21,7 @@ use library::ConfigStore;
 use openvamp_desktop::action::{Intent, Page, UiAction, disarms_removal};
 use openvamp_desktop::audio_settings::AudioSettings;
 use openvamp_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_request};
+use openvamp_desktop::facts::{self, FactsCache};
 use openvamp_desktop::hold::PanicHold;
 use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, Typed, is_panic_key, typed};
 use openvamp_desktop::library_page::{Dragged, LibraryPage, Opened, library_to_open};
@@ -26,7 +29,8 @@ use openvamp_desktop::mixer::{MixerAction, MixerPage, restore_mix, unsaved_mix};
 use openvamp_desktop::output_page::{OutputAction, OutputPage};
 use openvamp_desktop::reorder::Half;
 use openvamp_desktop::show::{LoadedSetlist, Show, Source, close, replace};
-use openvamp_desktop::view::PerformView;
+use openvamp_desktop::tick::Timed;
+use openvamp_desktop::view::{PerformView, SongFacts};
 
 use crate::library_ui::{DraggedItem, DraggedSetlist};
 use crate::ui::DraggedTile;
@@ -34,7 +38,10 @@ use crate::{library_ui, mixer_ui, output_ui, ui};
 
 /// How often the session is polled: about 30 Hz (Decision 3). The timer
 /// keeps running while the window is hidden, since a waiting play starts
-/// only through `Session::poll` (L16).
+/// only through `Session::poll` (L16). A poll asks for a frame while the
+/// song moves or a meter reads above silence
+/// ([`openvamp_desktop::mixer::needs_frames`]), else only when it changed
+/// what the screens show ([`Timed::turn`]).
 const POLL_EVERY: Duration = Duration::from_millis(33);
 
 /// The Perform screen.
@@ -63,6 +70,9 @@ pub struct Perform {
     mixer: MixerPage,
     /// The Audio output screen's own state.
     output: OutputPage,
+    /// The facts of the song folders read, which the song header and the
+    /// bars on Perform show; never read while drawing.
+    facts: FactsCache,
     _poll: Task<()>,
     _quit: Subscription,
     _deactivated: Subscription,
@@ -109,6 +119,7 @@ impl Perform {
             settings: AudioSettings::load(ConfigStore::from_environment()),
             mixer: MixerPage::new(),
             output: OutputPage::new(),
+            facts: FactsCache::new(),
             _poll: poll,
             _quit: quit,
             _deactivated: deactivated,
@@ -125,10 +136,12 @@ impl Perform {
     /// closes the session and its device; what went wrong goes to stderr.
     pub fn close_song(&mut self) {
         self.save_waiting_buses();
-        if let Some(show) = self.loaded.take()
-            && let Some(problem) = close(show, thread::sleep).problem()
-        {
-            eprintln!("warning: {problem}");
+        if let Some(show) = self.loaded.take() {
+            // A buffer size or routing waiting for the device is not kept.
+            self.output.song_closed();
+            if let Some(problem) = close(show, thread::sleep).problem() {
+                eprintln!("warning: {problem}");
+            }
         }
     }
 
@@ -220,6 +233,11 @@ impl Perform {
         );
         match replaced {
             Ok(replaced) => {
+                // What plays closed: a buffer size or routing waiting for
+                // its device is not kept.
+                self.output.song_closed();
+                // Its song.json may have changed: read every folder again.
+                self.facts.forget();
                 self.hold = PanicHold::new();
                 self.problems = replaced.problems();
                 for problem in &self.problems {
@@ -248,29 +266,47 @@ impl Perform {
         cx.notify();
     }
 
-    /// One turn of the timer: moves the session on and fires a panic hold
-    /// that is complete.
+    /// One turn of the timer: moves on everything that changes with time
+    /// alone and draws again only when it changed what the screens show
+    /// ([`Timed::turn`]), then starts reading the facts of a song that
+    /// shows when they are wanted ([`Self::read_facts`]).
     fn tick(&mut self, cx: &mut Context<Self>) {
-        let counting = self.hold.is_counting();
-        let now = Instant::now();
-        let fires = self.hold.tick(now);
-        if let Some(show) = &mut self.loaded {
-            self.mixer.tick(show, &mut self.settings, now);
+        let timed = Timed {
+            show: self.loaded.as_mut(),
+            hold: &mut self.hold,
+            mixer: &mut self.mixer,
+            output: &mut self.output,
+            settings: &mut self.settings,
+        };
+        if timed.turn(Instant::now()) {
+            cx.notify();
         }
-        let Some(show) = &mut self.loaded else {
-            // Nothing moves without a song, except a hold's fill.
-            if counting {
-                cx.notify();
-            }
+        self.read_facts(cx);
+    }
+
+    /// Starts reading the facts of the song on show when the cache wants
+    /// them ([`FactsCache::start_read`]), on the background executor, so a
+    /// volume slow to answer holds up no frame and no control; the screen
+    /// draws again when they arrive. A click-only tile has none to read.
+    fn read_facts(&mut self, cx: &mut Context<Self>) {
+        let Some((folder, _)) = self.loaded.as_ref().and_then(Show::mix_file) else {
             return;
         };
-        if fires {
-            show.send(UiAction::Panic);
+        if !self.facts.start_read(&folder, Instant::now()) {
+            return;
         }
-        show.poll();
-        // A buffer size or routing waiting for the stream to open again.
-        self.output.follow(Some(show), &mut self.settings);
-        cx.notify();
+        let read = cx.background_executor().spawn({
+            let folder = folder.clone();
+            async move { facts::read(&folder) }
+        });
+        cx.spawn(async move |this, cx| {
+            let read = read.await;
+            let _ = this.update(cx, |screen, cx| {
+                screen.facts.finish(folder, read, Instant::now());
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Carries out what the presentational code or a key asks for; while
@@ -436,9 +472,12 @@ impl Perform {
         if self.asking {
             return;
         }
-        let reopen = self
-            .output
-            .act(action, self.loaded.as_mut(), &mut self.settings);
+        let reopen = self.output.act(
+            action,
+            self.loaded.as_mut(),
+            &mut self.settings,
+            Instant::now(),
+        );
         if reopen && let Some(show) = &self.loaded {
             // A mix not saved yet carries onto the new device.
             let unsaved = unsaved_mix(show);
@@ -461,6 +500,20 @@ impl Perform {
             && let Some(show) = &mut self.loaded
         {
             self.mixer.save_buses(show, &mut self.settings);
+        }
+    }
+
+    /// What the song playing's `song.json` says, as far as it has been read
+    /// ([`FactsCache::facts`]); for a setlist's click-only tile, its tempo
+    /// and meter. It reads nothing: until the facts arrive, or while they
+    /// cannot be read, the screen shows what the session says.
+    fn song_facts(&self) -> SongFacts {
+        let Some(show) = &self.loaded else {
+            return SongFacts::default();
+        };
+        match show.mix_file() {
+            Some((folder, _)) => self.facts.facts(&folder),
+            None => current_click(show).unwrap_or_default(),
         }
     }
 
@@ -702,6 +755,26 @@ impl Perform {
     }
 }
 
+/// The facts of the click-only tile `show`'s setlist is on, when it is on
+/// one.
+fn current_click(show: &Show) -> Option<SongFacts> {
+    let setlist = show.setlist()?;
+    let item = setlist
+        .session
+        .info()
+        .items
+        .get(setlist.snapshot.setlist.current)?;
+    let SetlistItem::Click(click) = &item.item else {
+        return None;
+    };
+    let meter = click.time_signature;
+    Some(SongFacts::click(
+        click.bpm,
+        meter.numerator,
+        meter.denominator,
+    ))
+}
+
 /// The modifiers the keyboard rules read; Shift is left out.
 fn mods(modifiers: &Modifiers) -> Mods {
     Mods {
@@ -724,7 +797,12 @@ enum Pick {
 }
 
 impl Render for Perform {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let facts = if self.page == Page::Perform {
+            self.song_facts()
+        } else {
+            SongFacts::default()
+        };
         let body = match (self.page, &self.loaded) {
             (Page::Library, _) => match &self.library {
                 Some(library) => {
@@ -736,11 +814,14 @@ impl Render for Perform {
                 }
             },
             (Page::Perform, Some(show)) => {
-                let view = PerformView::new(show.snapshot(), show.song());
+                let view = PerformView::with_facts(show.snapshot(), show.song(), &facts);
                 let setlist = show.setlist().map(LoadedSetlist::view);
+                let mixer = self.mixer.view(Some(show));
                 ui::perform(
                     &view,
                     setlist.as_ref(),
+                    mixer.as_ref(),
+                    window.viewport_size(),
                     self.hold.fill(Instant::now()),
                     &self.problems,
                     cx,

@@ -24,6 +24,9 @@ pub struct StemView {
     /// The gain it plays at: its volume, mute and solo, its bus and the
     /// master together ([`domain::effective_gains`]).
     pub gain: f32,
+    /// Its level meter, after that gain; `None` for the stems past
+    /// `engine::live::MAX_METERED_STEMS`, which play without one.
+    pub meter: Option<crate::Meter>,
 }
 
 /// One change of one stem's place in the mix, as the player takes it.
@@ -144,17 +147,20 @@ impl ItemMix {
         &self.stems
     }
 
-    /// Each stem as the mixer shows it.
-    pub(crate) fn views(&self) -> Vec<StemView> {
+    /// Each stem as the mixer shows it, with the meter `meter` gives for
+    /// its index (`None` past `engine::live::MAX_METERED_STEMS`).
+    pub(crate) fn views(&self, meter: impl Fn(usize) -> Option<crate::Meter>) -> Vec<StemView> {
         self.stems
             .iter()
             .zip(&self.gains)
-            .map(|(stem, gain)| StemView {
+            .enumerate()
+            .map(|(index, (stem, gain))| StemView {
                 id: stem.id.clone(),
                 part: stem.part.clone(),
                 role: stem.role,
                 bus: gain.bus,
                 gain: gain.gain,
+                meter: meter(index),
             })
             .collect()
     }

@@ -6,7 +6,7 @@
 use domain::Transition;
 use gpui::{
     AnyElement, App, Context, Div, DragMoveEvent, ElementId, Entity, FontWeight, IntoElement,
-    SharedString, Stateful, div, prelude::*, px,
+    SharedString, Stateful, div, font, prelude::*, px,
 };
 use openvamp_desktop::action::Intent;
 use openvamp_desktop::catalog::{TRANSITIONS, transition_name};
@@ -17,7 +17,9 @@ use openvamp_desktop::library_page::{
 
 use crate::screen::Perform;
 use crate::theme;
-use crate::ui::{DragPreview, OneLine, button, chip_button, drag_preview, half_under, icon};
+use crate::ui::{
+    DragPreview, button, chip_button, drag_preview, half_under, hint, icon, one_line_text,
+};
 
 /// An element id made of words and numbers, such as `arrangement-2-1`.
 fn id(name: String) -> ElementId {
@@ -194,31 +196,36 @@ fn warning_line(warning: String, cx: &mut Context<Perform>) -> impl IntoElement 
 }
 
 /// Removes the setlist in two presses: the first arms it and says so, the
-/// second moves its file to the system trash.
+/// second moves its file to the system trash. An icon that names itself in
+/// its hint, as the header's other buttons; armed, it also says what the
+/// next click does beside its icon.
 fn remove_button(view: &EditorView, cx: &mut Context<Perform>) -> impl IntoElement {
     let (bg, fg, border) = if view.remove_armed {
         (theme::danger_bg(), theme::danger_text(), theme::danger())
     } else {
         (theme::raised(), theme::text(), theme::border())
     };
-    // It shrinks, down to its icon, well before the setlist's name does.
-    gives_way_first(button(
-        "remove-setlist",
-        cx,
-        act(LibraryAction::RemoveSetlist),
-    ))
-    .min_w(px(36.))
-    .h(px(36.))
-    .px(px(10.))
-    .rounded(px(8.))
-    .bg(bg)
-    .border_1()
-    .border_color(border)
-    .text_color(fg)
-    .text_size(px(13.))
-    .font_weight(FontWeight::SEMIBOLD)
-    .child(icon("trash", fg, 18.))
-    .child(div().min_w_0().one_line().child(view.remove.clone()))
+    let remove = button("remove-setlist", cx, act(LibraryAction::RemoveSetlist))
+        .min_w(px(36.))
+        .h(px(36.))
+        .justify_center()
+        .rounded(px(8.))
+        .bg(bg)
+        .border_1()
+        .border_color(border)
+        .text_color(fg)
+        .text_size(px(13.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .tooltip(hint(view.remove.clone()))
+        .child(icon("trash", fg, 18.));
+    if view.remove_armed {
+        // It shrinks, down to its icon, well before the setlist's name does.
+        gives_way_first(remove)
+            .px(px(10.))
+            .child(div().min_w_0().child(one_line_text(view.remove.clone())))
+    } else {
+        remove.w(px(36.))
+    }
 }
 
 /// How much faster an element that gives way first shrinks than its
@@ -239,8 +246,23 @@ fn heading(name: &'static str, title: &'static str) -> impl IntoElement {
         .gap(px(8.))
         .text_size(px(22.))
         .font_weight(FontWeight::BOLD)
-        .child(icon(name, theme::text_muted(), 22.))
+        .child(icon(name, theme::text_muted(), 20.))
         .child(title)
+}
+
+/// A muted line of `size` px led by an icon, as the design writes a
+/// setlist's date and length: here the editor's on-Perform line and its
+/// summary.
+fn meta_line(name: &'static str, icon_color: gpui::Rgba, text: String, size: f32) -> Div {
+    div()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .text_size(px(size))
+        .text_color(theme::text_muted())
+        .child(icon(name, icon_color, size + 1.))
+        .child(div().min_w_0().child(one_line_text(text)))
 }
 
 /// The setlists of the library, the one in the editor marked.
@@ -258,7 +280,9 @@ fn setlists(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElement {
                 .child(
                     button("new-setlist", cx, act(LibraryAction::NewSetlist))
                         .h(px(36.))
-                        .px(px(12.))
+                        .pl(px(10.))
+                        .pr(px(12.))
+                        .gap(px(6.))
                         .rounded(px(8.))
                         .bg(theme::text())
                         .text_color(theme::on_fill())
@@ -312,10 +336,9 @@ fn setlists(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElement {
         )
         .child(
             div()
-                .one_line()
                 .text_size(px(12.))
                 .text_color(theme::text_faint())
-                .child(view.folder.clone()),
+                .child(one_line_text(view.folder.clone())),
         )
         .child(
             chip_button("open-library", cx, Intent::OpenLibrary)
@@ -374,18 +397,16 @@ fn setlist_row(
         .child(
             div()
                 .w_full()
-                .one_line()
                 .text_size(px(16.))
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(row.name.clone()),
+                .child(one_line_text(row.name.clone())),
         )
         .child(
             div()
                 .w_full()
-                .one_line()
                 .text_size(px(13.))
                 .text_color(theme::text_muted())
-                .child(meta),
+                .child(one_line_text(meta)),
         );
     // The whole row drags, the grip says so; the arrows stay for the
     // keyboard and as a fallback.
@@ -477,14 +498,14 @@ fn unreadable_row(row: &UnreadableRow, cx: &mut Context<Perform>) -> AnyElement 
             .text_size(px(12.))
             .text_color(fg)
             .child(icon("trash", fg, 14.))
-            .child(div().min_w_0().one_line().child(row.remove.clone())),
+            .child(div().min_w_0().child(one_line_text(row.remove.clone()))),
         )
         .into_any_element()
 }
 
 /// The setlist in the editor: its name, items and their controls.
 fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElement {
-    let panel = panel().flex_1().min_w_0();
+    let panel = panel().flex_1().min_w_0().gap(px(12.));
     let Some(view) = view else {
         return panel.items_center().justify_center().child(
             div()
@@ -493,13 +514,13 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
         );
     };
     let insertion = view.insertion.filter(|_| cx.has_active_drag());
+    let columns = Columns::of(view, cx);
     let title: AnyElement = match &view.renaming {
-        Some(name) => text_field(name, true, "Setlist name").into_any_element(),
+        Some(name) => text_field(name, true, "Setlist name", None).into_any_element(),
         None => div()
-            .one_line()
             .text_size(px(26.))
             .font_weight(FontWeight::BOLD)
-            .child(view.name.clone())
+            .child(one_line_text(view.name.clone()))
             .into_any_element(),
     };
     panel
@@ -508,56 +529,57 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
                 .flex()
                 .items_end()
                 .gap(px(12.))
-                // The name asks for its whole width and takes all the room
-                // the buttons leave; the Remove button gives way first, and
-                // the name ends in an ellipsis only below that.
+                // As on the design canvas: the date line and the name, the
+                // summary and Perform, which keep their whole width; rename,
+                // duplicate and remove are icons that name themselves in
+                // their hints. The name takes the room left and ends in an
+                // ellipsis.
                 .child(
                     div()
                         .flex_grow()
                         .flex_shrink()
-                        .min_w(px(HEADER_NAME_MIN))
+                        .min_w_0()
                         .flex()
                         .flex_col()
                         .gap(px(2.))
-                        .child(title)
-                        .child(
-                            div()
-                                .one_line()
-                                .text_size(px(14.))
-                                .text_color(theme::text_muted())
-                                .child(view.summary.clone()),
-                        ),
+                        // Where the design writes the setlist's date.
+                        .when_some(view.on_perform.clone(), |name, note| {
+                            name.child(meta_line("perform", theme::accent(), note, 13.))
+                        })
+                        .child(title),
                 )
                 .child(
                     small_square("rename-setlist", cx, act(LibraryAction::RenameSetlist))
+                        .tooltip(hint("Rename"))
                         .child(icon("pencil", theme::text(), 18.)),
                 )
                 .child(
-                    small_square("duplicate-setlist", cx, act(LibraryAction::DuplicateSetlist))
-                        .child(icon("copy", theme::text(), 18.)),
+                    small_square(
+                        "duplicate-setlist",
+                        cx,
+                        act(LibraryAction::DuplicateSetlist),
+                    )
+                    .tooltip(hint("Duplicate"))
+                    .child(icon("copy", theme::text(), 18.)),
                 )
                 .child(remove_button(view, cx))
+                .child(
+                    meta_line("clock", theme::text_muted(), view.summary.clone(), 14.)
+                        .flex_none()
+                        .mb(px(10.)),
+                )
                 .child(
                     button("perform-setlist", cx, Intent::PerformSetlist)
                         .h(px(44.))
                         .px(px(16.))
                         .bg(theme::accent())
                         .text_color(theme::on_fill())
+                        .text_size(px(15.))
                         .font_weight(FontWeight::BOLD)
-                        .child(icon("play", theme::on_fill(), 20.))
+                        .child(icon("play", theme::on_fill(), 18.))
                         .child("Perform"),
                 ),
         )
-        .when(view.playing, |panel| {
-            panel.child(
-                div()
-                    .text_size(px(13.))
-                    .text_color(theme::queued())
-                    .child(
-                        "Open on Perform, which plays it as it was when opened: changes are saved and play the next time it is opened.",
-                    ),
-            )
-        })
         .children(view.problems.iter().map(|problem| {
             div()
                 .text_size(px(13.))
@@ -572,11 +594,11 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
                 .text_size(px(12.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme::text_muted())
-                .child(number_column(div()).child("#"))
-                .child(song_column(div()).child("Song"))
-                .child(arrangement_column(div()).one_line().child("Arrangement"))
-                .child(transition_column(div()).one_line().child("Transition out"))
-                .child(length_column(div()).child("Length"))
+                .child(number_column(div()).pl(px(NUMBER_OFFSET)).child("#"))
+                .child(song_column(div()).child(one_line_text("Song")))
+                .child(arrangement_column(div(), columns).child(one_line_text("Arrangement")))
+                .child(transition_column(div(), columns).child(one_line_text("Transition out")))
+                .child(length_column(div()).text_right().child("Length"))
                 .child(remove_column(div())),
         )
         .child(
@@ -589,13 +611,13 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
                 .flex_col()
                 .gap(px(8.))
                 .pt(px(6.))
-                .on_drag_move(cx.listener(
-                    |screen, event: &DragMoveEvent<DraggedItem>, _, cx| {
+                .on_drag_move(
+                    cx.listener(|screen, event: &DragMoveEvent<DraggedItem>, _, cx| {
                         if !event.bounds.contains(&event.event.position) {
                             screen.library_drag_left(cx);
                         }
-                    },
-                ))
+                    }),
+                )
                 .on_drop(cx.listener(|screen, item: &DraggedItem, _, cx| {
                     screen.library_drop(Dragged::Item(item.index), cx);
                 }))
@@ -612,6 +634,7 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
                             .flex_col()
                             .items_center()
                             .gap(px(8.))
+                            .child(icon("setlist", theme::text_faint(), 32.))
                             .child(
                                 div()
                                     .text_size(px(17.))
@@ -629,7 +652,7 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
                 .children(
                     view.rows
                         .iter()
-                        .map(|row| editor_row(row, view.rows.len(), insertion, cx)),
+                        .map(|row| editor_row(row, view.rows.len(), insertion, columns, cx)),
                 )
                 .child(
                     div()
@@ -638,7 +661,7 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
                         .gap(px(8.))
                         .child(
                             dashed_button("add-song", cx, act(LibraryAction::Search))
-                                .child(icon("search", theme::text_muted(), 18.))
+                                .child(icon("note", theme::text_muted(), 18.))
                                 .child("Add song"),
                         )
                         .child(
@@ -650,21 +673,96 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
         )
 }
 
-/// Narrowest the setlist's name in the editor's header gets beside the
-/// header's buttons.
-const HEADER_NAME_MIN: f32 = 140.;
 /// Width of the grip, the move arrows and the number.
 const NUMBER_WIDTH: f32 = 64.;
+/// Size of an item's grip.
+const GRIP_SIZE: f32 = 16.;
+/// Width of an item's move arrows.
+const ARROWS_WIDTH: f32 = 28.;
+/// Gap between an item's grip, arrows and number.
+const NUMBER_GAP: f32 = 2.;
+/// Where an item's number starts in its column, so the "#" label sits
+/// over it.
+const NUMBER_OFFSET: f32 = GRIP_SIZE + NUMBER_GAP + ARROWS_WIDTH + NUMBER_GAP;
 /// Gap between the columns of the item rows.
 const COLUMN_GAP: f32 = 10.;
 /// Where an item's problems and controls start: under its song.
 const DETAILS_INDENT: f32 = NUMBER_WIDTH + COLUMN_GAP;
 
+// An item's dropdown ([`row_dropdown`]) is drawn with these sizes, and
+// [`Columns::of`] adds them up to size its column, so a restyle changes
+// both.
+
+/// The size of the text in an item's dropdowns.
+const DROPDOWN_TEXT: f32 = 13.;
+/// The width of an item's dropdown's border.
+const DROPDOWN_BORDER: f32 = 1.;
+/// The padding at each end of an item's dropdown.
+const DROPDOWN_PADDING: f32 = 10.;
+/// The size of the icon an item's dropdown starts with.
+const DROPDOWN_ICON: f32 = 15.;
+/// The size of the chevron an item's dropdown ends with.
+const DROPDOWN_CHEVRON: f32 = 14.;
+/// The gap between an item's dropdown's icon, text and chevron.
+const DROPDOWN_GAP: f32 = 6.;
+/// What an item's dropdown takes beside its text: its border, padding,
+/// icon, chevron and the gaps between them, and a point for rounding.
+const DROPDOWN_CHROME: f32 = 2. * DROPDOWN_BORDER
+    + 2. * DROPDOWN_PADDING
+    + DROPDOWN_ICON
+    + DROPDOWN_CHEVRON
+    + 2. * DROPDOWN_GAP
+    + 1.;
+/// The design's width of the arrangement and transition columns: the
+/// widest they get.
+const DROPDOWN_MAX: f32 = 150.;
+/// The narrowest the arrangement column gets: its icon, some text and its
+/// chevron.
+const ARRANGEMENT_MIN: f32 = 96.;
+/// The narrowest the transition column gets.
+const TRANSITION_MIN: f32 = 108.;
+/// The narrowest the song column gets: its badge.
+const SONG_MIN: f32 = 46.;
+
 // The item rows' columns, shared by the column labels and every row so
-// they line up. The song takes the room left and never goes below a width
-// that shows a short title in full; the arrangement and the transition
-// start at their full width and give way down to a minimum, cutting their
-// text with an ellipsis; the number, length and remove stay fixed.
+// they line up. As on the design canvas, the arrangement and transition
+// dropdowns keep their values whole and the song's title gives way: they
+// are as wide as the setlist's longest arrangement and transition need,
+// within the design's width, and the song takes the room left. The number,
+// length and remove stay fixed.
+
+/// The widths of the arrangement and transition columns.
+#[derive(Clone, Copy)]
+struct Columns {
+    arrangement: f32,
+    transition: f32,
+}
+
+impl Columns {
+    /// The widths `view`'s rows need to show their arrangement and
+    /// transition in full.
+    fn of(view: &EditorView, cx: &App) -> Self {
+        let text_system = cx.text_system();
+        let font_id = text_system.resolve_font(&font(theme::UI));
+        let width = |text: &str| -> f32 {
+            text.chars()
+                .filter_map(|c| text_system.advance(font_id, px(DROPDOWN_TEXT), c).ok())
+                .map(|advance| f32::from(advance.width))
+                .sum()
+        };
+        let widest = |texts: &mut dyn Iterator<Item = &str>| {
+            texts.map(width).fold(0., f32::max) + DROPDOWN_CHROME
+        };
+        Self {
+            arrangement: widest(&mut view.rows.iter().map(|row| row.arrangement.as_str()))
+                .ceil()
+                .clamp(ARRANGEMENT_MIN, DROPDOWN_MAX),
+            transition: widest(&mut view.rows.iter().map(|row| transition_name(row.transition)))
+                .ceil()
+                .clamp(TRANSITION_MIN, DROPDOWN_MAX),
+        }
+    }
+}
 
 fn number_column<E: Styled>(element: E) -> E {
     element.w(px(NUMBER_WIDTH)).flex_none()
@@ -673,17 +771,17 @@ fn number_column<E: Styled>(element: E) -> E {
 fn song_column<E: Styled>(element: E) -> E {
     element
         .flex_grow()
-        .flex_shrink_0()
+        .flex_shrink()
         .flex_basis(px(0.))
-        .min_w(px(180.))
+        .min_w(px(SONG_MIN))
 }
 
-fn arrangement_column<E: Styled>(element: E) -> E {
-    element.flex_shrink().flex_basis(px(140.)).min_w(px(72.))
+fn arrangement_column<E: Styled>(element: E, columns: Columns) -> E {
+    element.w(px(columns.arrangement)).flex_none()
 }
 
-fn transition_column<E: Styled>(element: E) -> E {
-    element.flex_shrink().flex_basis(px(140.)).min_w(px(104.))
+fn transition_column<E: Styled>(element: E, columns: Columns) -> E {
+    element.w(px(columns.transition)).flex_none()
 }
 
 fn length_column<E: Styled>(element: E) -> E {
@@ -698,6 +796,7 @@ fn editor_row(
     row: &EditorRow,
     rows: usize,
     insertion: Option<usize>,
+    columns: Columns,
     cx: &mut Context<Perform>,
 ) -> AnyElement {
     let index = row.index;
@@ -772,10 +871,12 @@ fn editor_row(
                 number_column(div())
                     .flex()
                     .items_center()
-                    .gap(px(2.))
-                    .child(icon("grip", theme::text_faint(), 14.))
+                    .gap(px(NUMBER_GAP))
+                    .child(icon("grip", theme::text_faint(), GRIP_SIZE))
                     .child(
                         div()
+                            .w(px(ARROWS_WIDTH))
+                            .flex_none()
                             .flex()
                             .flex_col()
                             .child(step("up", index > 0, LibraryAction::MoveUp(index), cx))
@@ -821,42 +922,41 @@ fn editor_row(
                         .gap(px(2.))
                         .child(
                             div()
-                                .one_line()
                                 .text_size(px(16.))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .child(row.title.clone()),
+                                .child(one_line_text(row.title.clone())),
                         )
                         .child(
                             div()
-                                .one_line()
                                 .text_size(px(13.))
                                 .text_color(theme::text_muted())
-                                .child(row.meta.clone()),
+                                .child(one_line_text(row.meta.clone())),
                         ),
                 ),
             )
-            .child(
-                arrangement_column(div())
-                    .one_line()
-                    .text_size(px(13.))
-                    .child(row.arrangement.clone()),
-            )
-            .child(
-                transition_column(div())
-                    .flex()
-                    .items_center()
-                    .gap(px(7.))
-                    .text_size(px(13.))
-                    .child(icon(transition_icon, theme::text_muted(), 16.))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .one_line()
-                            .child(transition_name(row.transition)),
-                    ),
-            )
+            .child(arrangement_column(
+                row_dropdown(
+                    format!("row-arrangement-{index}"),
+                    "arrangement",
+                    row.arrangement.clone(),
+                    row,
+                    cx,
+                ),
+                columns,
+            ))
+            .child(transition_column(
+                row_dropdown(
+                    format!("row-transition-{index}"),
+                    transition_icon,
+                    transition_name(row.transition),
+                    row,
+                    cx,
+                ),
+                columns,
+            ))
             .child(
                 length_column(div())
+                    .text_right()
                     .font_family(theme::MONO)
                     .text_size(px(13.))
                     .child(row.length.clone()),
@@ -887,6 +987,31 @@ fn editor_row(
         }
     }))
     .into_any_element()
+}
+
+/// The arrangement or the transition of an item's row, drawn as the
+/// design's dropdown: it opens the item's controls below the row, where
+/// they are chosen, and closes them again.
+fn row_dropdown(
+    name: String,
+    icon_name: &'static str,
+    label: impl Into<SharedString>,
+    row: &EditorRow,
+    cx: &mut Context<Perform>,
+) -> Stateful<Div> {
+    let chevron = if row.selected { "up" } else { "down" };
+    button(id(name), cx, act(LibraryAction::SelectRow(row.index)))
+        .h(px(40.))
+        .px(px(DROPDOWN_PADDING))
+        .gap(px(DROPDOWN_GAP))
+        .rounded(px(8.))
+        .bg(theme::surface())
+        .border(px(DROPDOWN_BORDER))
+        .border_color(theme::border())
+        .text_size(px(DROPDOWN_TEXT))
+        .child(icon(icon_name, theme::text_faint(), DROPDOWN_ICON))
+        .child(div().flex_1().min_w_0().child(one_line_text(label)))
+        .child(icon(chevron, theme::text(), DROPDOWN_CHEVRON))
 }
 
 /// One labelled line of an item's controls.
@@ -1081,7 +1206,7 @@ fn songs(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElement {
             div()
                 .flex()
                 .items_center()
-                .child(heading("library", "Songs"))
+                .child(heading("note", "Songs"))
                 .child(div().flex_1())
                 .child(
                     div()
@@ -1091,13 +1216,26 @@ fn songs(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElement {
                 ),
         )
         .child(
-            button("search", cx, act(LibraryAction::Search))
-                .w_full()
-                .child(text_field(
-                    &view.search,
-                    view.searching,
-                    "Title, key or tempo",
-                )),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::text_muted())
+                        .child("Search songs"),
+                )
+                .child(
+                    button("search", cx, act(LibraryAction::Search))
+                        .w_full()
+                        .child(text_field(
+                            &view.search,
+                            view.searching,
+                            "Title, key or tempo",
+                            Some("search"),
+                        )),
+                ),
         )
         .children(view.unreadable_songs.iter().map(|line| {
             div()
@@ -1135,21 +1273,23 @@ fn song_row(song: &SongRow, cx: &mut Context<Perform>) -> AnyElement {
                 .gap(px(1.))
                 .child(
                     div()
-                        .one_line()
                         .text_size(px(15.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(song.title.clone()),
+                        .child(one_line_text(song.title.clone())),
                 )
                 .child(
                     div()
-                        .one_line()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .overflow_hidden()
                         .font_family(theme::MONO)
                         .text_size(px(11.))
                         .text_color(theme::text_muted())
-                        .child(format!(
-                            "{} · {} BPM · {} · {}",
-                            song.key, song.bpm, song.length, song.stems
-                        )),
+                        .child(song_fact("note", &song.key))
+                        .child(song_fact("metronome", &song.bpm))
+                        .child(song_fact("clock", &song.length))
+                        .child(song_fact("stems", &song.stems)),
                 ),
         )
         .child(
@@ -1159,14 +1299,31 @@ fn song_row(song: &SongRow, cx: &mut Context<Perform>) -> AnyElement {
                 act(LibraryAction::AddSong(song.index)),
             )
             .size(px(44.))
-            .child(icon("plus", theme::text(), 18.)),
+            .child(icon("plus", theme::text(), 16.)),
         )
         .into_any_element()
 }
 
-/// A one-line field: its text with a caret while it has the focus, or the
-/// placeholder.
-fn text_field(text: &str, focused: bool, placeholder: &'static str) -> impl IntoElement {
+/// One fact of a song of the list, after its icon: its key, tempo, length
+/// or stems.
+fn song_fact(name: &'static str, text: &str) -> Div {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(3.))
+        .child(icon(name, theme::text_faint(), 12.))
+        .child(text.to_owned())
+}
+
+/// A one-line field, after its `leading` icon: its text with a caret while
+/// it has the focus, or the placeholder.
+fn text_field(
+    text: &str,
+    focused: bool,
+    placeholder: &'static str,
+    leading: Option<&'static str>,
+) -> impl IntoElement {
     let (shown, color) = match (text.is_empty(), focused) {
         (true, false) => (placeholder.to_owned(), theme::text_faint()),
         (_, true) => (format!("{text}▏"), theme::text()),
@@ -1189,7 +1346,10 @@ fn text_field(text: &str, focused: bool, placeholder: &'static str) -> impl Into
         })
         .text_size(px(15.))
         .text_color(color)
-        .child(div().min_w_0().one_line().child(shown))
+        .when_some(leading, |field, name| {
+            field.child(icon(name, theme::text_faint(), 18.))
+        })
+        .child(div().min_w_0().child(one_line_text(shown)))
 }
 
 fn small_square(

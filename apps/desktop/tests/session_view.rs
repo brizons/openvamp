@@ -130,10 +130,15 @@ fn the_perform_screen_follows_a_real_session() {
     let labels: Vec<&str> = view.pads.iter().map(|p| p.label.as_str()).collect();
     assert_eq!(labels, ["Intro", "Verse 1", "Chorus", "Outro"]);
     assert_eq!(view.transport.state, "Stopped");
-    assert_eq!(
-        view.status.device,
-        "Fake Output · 8000 Hz · 256 frames · 32.0 ms"
+    // The device plays: the header's chip names it, and the notes say
+    // nothing of it.
+    assert_eq!(view.device.name, "Fake Output");
+    assert!(
+        view.device.meta.ends_with(" · 256 · 32.0 ms"),
+        "{}",
+        view.device.meta
     );
+    assert_eq!(view.status.device_problem, None);
 
     // Play waits for the disk, then the timer's polls start it.
     shell.act(UiAction::TogglePlay);

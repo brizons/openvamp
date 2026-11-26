@@ -1,10 +1,16 @@
 //! The Audio output screen without a window (S3, F8): the output devices
-//! with their output counts, the rate the device runs at, the buffer size
-//! with its latency, split mode for 2-output devices, and the routing
-//! matrix of buses by outputs with its presets. Every change applies to
-//! the song playing at once and is saved for its device (keyed by the
-//! device's id); with nothing playing, the chosen device's routing is
-//! edited and saved for the next session.
+//! with their output counts and whether the one in use plays, the rate the
+//! device runs at against the song's, the buffer size with its latency,
+//! split mode for 2-output devices, and the routing matrix of buses (with
+//! the Mixer's bus icons) by outputs with its presets. Every change
+//! applies to the song playing at once and is saved for its device (keyed
+//! by the device's id); with nothing playing, the chosen device's routing
+//! is edited and saved for the next session. A change that needs the
+//! stream to open again is saved once the stream plays with it, and
+//! otherwise says why it is not ([`OutputPage::follow`]).
+
+use std::fmt;
+use std::time::{Duration, Instant};
 
 use app::{
     DeviceInfo, DeviceStatus, LossReason, MAX_BUFFER_FRAMES, MIN_BUFFER_FRAMES, OutputError,
@@ -13,10 +19,17 @@ use app::{
 use domain::{Bus, Destination, Routing};
 
 use crate::audio_settings::AudioSettings;
+use crate::mixer::bus_icon;
 use crate::show::Show;
 
 /// The buffer sizes offered, in frames (F8.5).
 pub const BUFFER_SIZES: [u32; 5] = [64, 128, 256, 512, 1024];
+
+/// How long a change waits for the device to open with it, at most, when
+/// nothing else settles it: longer than the session waits for a playing
+/// stream's ramp out before it opens the stream again (2 s), and than it
+/// waits between tries of a device it holds (0.5 s).
+pub const APPLY_PATIENCE: Duration = Duration::from_secs(3);
 
 /// The output counts with a preset of their own in the Preset menu.
 const PRESETS: [u16; 6] = [1, 2, 3, 4, 6, 8];
@@ -56,19 +69,55 @@ pub fn output_notice(error: &OutputError) -> Option<String> {
     matches!(error, OutputError::TooFewChannels { .. }).then(|| error.to_string())
 }
 
-/// Why the device the session plays on is held as a lost one after
-/// refusing to open again with new settings; `None` when it is not.
-fn reconfigure_refusal(show: &Show) -> Option<String> {
-    match &show.snapshot().device {
-        DeviceStatus::Disconnected {
-            reason: LossReason::Reconfigured,
-            reopen_error,
-            device,
-        } => Some(reopen_error.as_ref().map_or_else(
-            || format!("{device} refuses the new settings"),
-            ToString::to_string,
-        )),
-        _ => None,
+/// The refusal in the session's answer to a buffer size or a routing:
+/// any error but a full queue ([`RuntimeError::QueueFull`]), after which
+/// the session still takes the change from its next polls.
+pub fn refusal(answer: Result<(), RuntimeError>) -> Option<RuntimeError> {
+    match answer {
+        Ok(()) | Err(RuntimeError::QueueFull { .. }) => None,
+        Err(error) => Some(error),
+    }
+}
+
+/// What the screen says of a buffer size it does not keep, and why.
+fn buffer_not_kept(why: impl fmt::Display) -> String {
+    format!("The buffer size could not be changed: {why}")
+}
+
+/// What the screen says of a routing it does not keep, and why.
+fn routing_not_kept(why: impl fmt::Display) -> String {
+    format!("The routing could not be applied: {why}")
+}
+
+/// Saves `routing` for the device with id `device`; what the screen says
+/// when it could not.
+fn save_routing(settings: &mut AudioSettings, device: &str, routing: &Routing) -> Option<String> {
+    settings
+        .save_routing(device, routing)
+        .err()
+        .map(|error| format!("The routing could not be saved: {error}"))
+}
+
+/// Why the session holds the device `device`, lost for `reason`, instead
+/// of playing on it: why it last refused to open again, else how it was
+/// lost.
+fn held_why(device: &str, reason: LossReason, reopen_error: Option<&OutputError>) -> String {
+    match (reopen_error, reason) {
+        (Some(error), _) => error.to_string(),
+        (None, LossReason::Reconfigured) => format!("{device} refuses the new settings"),
+        (None, reason) => RuntimeError::DeviceLost {
+            device: device.to_owned(),
+            reason,
+        }
+        .to_string(),
+    }
+}
+
+/// The name of the device the session plays on, or holds.
+fn device_name(status: &DeviceStatus) -> &str {
+    match status {
+        DeviceStatus::Connected(stream) => &stream.device,
+        DeviceStatus::Disconnected { device, .. } | DeviceStatus::PlayerLost { device } => device,
     }
 }
 
@@ -95,16 +144,131 @@ fn channels_for(routing: &Routing, outputs: u16) -> u16 {
     highest.max(fitted.outputs.min(2))
 }
 
-/// A change the session took that needs the stream to open again: it is
-/// kept only once the stream plays with it, and refused when the device
-/// refuses it.
-#[derive(Debug, Clone, PartialEq)]
-enum Pending {
-    /// A buffer size; `held_before` when the device was already held after
-    /// an earlier refusal, which is then not this change's.
-    Buffer { frames: u32, held_before: bool },
-    /// A routing for the device `device`.
-    Routing { device: String, routing: Routing },
+/// How a change waiting for the stream to open again ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Verdict {
+    /// A stream plays with it: it is kept (saved).
+    Kept,
+    /// It is not kept, for this reason.
+    NotKept(String),
+}
+
+/// What the session's device, `status`, says of a change made while
+/// `before` played (`None`: the device was held already), once it has
+/// `waited` [`APPLY_PATIENCE`] or not; `takes` is whether a stream plays
+/// with the change, `misses` what one plays instead. `None` while the
+/// change still waits:
+/// - a stream that plays with it keeps it;
+/// - a stream opened since without it (the device rounded or clamped it)
+///   ends it, and so does the stream of before once the patience is over,
+///   since until then it may still be ramping out;
+/// - a hold that came after the change ends it, saying why: the device
+///   refused to open with it ([`LossReason::Reconfigured`]) or was lost
+///   first. A hold already there is no refusal of this change, which the
+///   session tries the device with meanwhile: it ends it only once the
+///   patience is over;
+/// - a player lost for good ends it at once.
+fn verdict(
+    status: &DeviceStatus,
+    before: Option<&StreamInfo>,
+    waited: bool,
+    takes: impl Fn(&StreamInfo) -> bool,
+    misses: impl Fn(&StreamInfo) -> String,
+) -> Option<Verdict> {
+    match status {
+        DeviceStatus::Connected(stream) if takes(stream) => Some(Verdict::Kept),
+        DeviceStatus::Connected(stream) => {
+            (waited || before != Some(stream)).then(|| Verdict::NotKept(misses(stream)))
+        }
+        DeviceStatus::Disconnected {
+            device,
+            reason,
+            reopen_error,
+        } => (waited || before.is_some())
+            .then(|| Verdict::NotKept(held_why(device, *reason, reopen_error.as_ref()))),
+        DeviceStatus::PlayerLost { .. } => {
+            Some(Verdict::NotKept(RuntimeError::PlayerLost.to_string()))
+        }
+    }
+}
+
+/// Whether a change made at `since` has waited [`APPLY_PATIENCE`] at `now`.
+fn waited(since: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(since) >= APPLY_PATIENCE
+}
+
+/// A buffer size the session took that waits for the stream to open again
+/// with it ([`verdict`]). It may be asked for while the device is held:
+/// the session tries the device with it, which may refuse the size.
+#[derive(Debug)]
+struct PendingBuffer {
+    frames: u32,
+    /// When it was asked for.
+    since: Instant,
+    /// The device's name, as the session gave it then.
+    device: String,
+    /// The stream that played then; `None` when the device was held
+    /// already, after an earlier refusal or a loss, which is then not this
+    /// change's.
+    before: Option<StreamInfo>,
+}
+
+impl PendingBuffer {
+    fn verdict(&self, status: &DeviceStatus, now: Instant) -> Option<Verdict> {
+        verdict(
+            status,
+            self.before.as_ref(),
+            waited(self.since, now),
+            |stream| stream.buffer_frames == self.frames,
+            |stream| {
+                format!(
+                    "audio device \"{}\" plays buffers of {} frames, not {}",
+                    stream.device, stream.buffer_frames, self.frames
+                )
+            },
+        )
+    }
+}
+
+/// A routing the session took that needs more outputs than the stream
+/// has, waiting for the stream to open again with them ([`verdict`]).
+/// Unlike a buffer size, it never waits on a device held before it, so
+/// `before` is always a stream: a routing given to a held device is saved
+/// at once ([`OutputPage::apply`]), since the session opens the device
+/// with it fitted to the outputs the device has, which no device refuses.
+/// A hold that comes after it is the refusal of the stream it needs, even
+/// when the device refused a buffer size asked for meanwhile: neither
+/// plays.
+#[derive(Debug)]
+struct PendingRouting {
+    /// The id of the device it is saved for.
+    device: String,
+    routing: Routing,
+    /// When it was given.
+    since: Instant,
+    /// The stream that played then.
+    before: StreamInfo,
+}
+
+impl PendingRouting {
+    /// [`verdict`], with `outputs` the outputs the session now knows the
+    /// device has: one that came back with fewer plays the routing fitted
+    /// to them, which the session took.
+    fn verdict(&self, status: &DeviceStatus, outputs: u16, now: Instant) -> Option<Verdict> {
+        let needed = channels_for(&self.routing, outputs);
+        verdict(
+            status,
+            Some(&self.before),
+            waited(self.since, now),
+            |stream| stream.channels >= needed,
+            |stream| {
+                format!(
+                    "audio device \"{}\" plays {} outputs, not the {needed} the routing needs",
+                    stream.device, stream.channels
+                )
+            },
+        )
+    }
 }
 
 /// The preset `routing` is for a device with `outputs` outputs, such as
@@ -130,6 +294,29 @@ fn outputs_text(outputs: u16) -> String {
     format!("{outputs} output{}", if outputs == 1 { "" } else { "s" })
 }
 
+/// What the screen says after the rate a device runs at, `device`, of the
+/// song's rate `song`: "matches the song", or the song's rate when they
+/// differ (nothing resamples, so the session plays at the song's rate).
+pub fn rate_note(device: u32, song: u32) -> String {
+    if device == song {
+        "matches the song".to_owned()
+    } else {
+        format!("the song is {}", rate_text(song))
+    }
+}
+
+/// What the dot on the device button says of the device in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceState {
+    /// No song is open, so no stream: the screen claims nothing (no dot).
+    Closed,
+    /// A stream is open on the device.
+    Open,
+    /// The session lost the device, or it refused to open again; the
+    /// session keeps trying.
+    Lost,
+}
+
 /// One device of the device menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceRow {
@@ -146,6 +333,8 @@ pub struct RoutingRow {
     pub bus: Bus,
     /// Its name.
     pub name: &'static str,
+    /// Its icon, as the Mixer's bus strip draws it ([`bus_icon`]).
+    pub icon: &'static str,
     /// Whether it plays on each output, from output 1.
     pub cells: Vec<bool>,
 }
@@ -157,10 +346,16 @@ pub struct OutputScreen {
     pub devices: Vec<DeviceRow>,
     /// The device in use, as its row reads; "No output device" without one.
     pub device: String,
+    /// The dot on the device button.
+    pub device_state: DeviceState,
     /// Whether the device menu is open.
     pub device_menu: bool,
-    /// The rate the device runs at, such as "48 kHz".
+    /// The rate the device runs at, such as "48 kHz"; "Set by the song
+    /// that plays" with nothing playing.
     pub sample_rate: String,
+    /// What follows the rate while a stream plays ([`rate_note`]); `None`
+    /// with nothing playing.
+    pub sample_rate_note: Option<String>,
     /// The buffer sizes offered.
     pub buffer_sizes: [u32; 5],
     /// The buffer size in use.
@@ -215,6 +410,18 @@ pub enum OutputAction {
     Reset,
 }
 
+/// What [`OutputPage::follow`] settles, as the Audio output screen shows
+/// it: whether a buffer size or a routing still waits for the device, and
+/// why the last ones were not kept. A turn of the screens' timer that
+/// changes it draws them again ([`crate::tick::Drawn`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settling {
+    buffer_waits: bool,
+    routing_waits: bool,
+    buffer_problem: Option<String>,
+    routing_problem: Option<String>,
+}
+
 /// The device whose routing the screen edits.
 struct Current {
     id: String,
@@ -234,9 +441,9 @@ pub struct OutputPage {
     /// Why the last routing was not kept.
     routing_problem: Option<String>,
     /// The buffer size waiting for the stream to open with it.
-    pending_buffer: Option<Pending>,
+    pending_buffer: Option<PendingBuffer>,
     /// The routing waiting for the stream to open with its outputs.
-    pending_routing: Option<Pending>,
+    pending_routing: Option<PendingRouting>,
 }
 
 impl OutputPage {
@@ -246,50 +453,65 @@ impl OutputPage {
     }
 
     /// Settles the changes waiting for the stream to open again, from the
-    /// session `show` as last polled: one the stream now plays with is kept
-    /// (saved), one the device refused is not, and says why. Called on
-    /// every poll of the screen.
-    pub fn follow(&mut self, show: Option<&mut Show>, settings: &mut AudioSettings) {
+    /// session `show` as last polled and the screen's clock `now`: one the
+    /// stream now plays with is kept (saved); one the device refused, was
+    /// lost before, or plays otherwise (at once for a stream opened again
+    /// without it, after [`APPLY_PATIENCE`] for the stream of before or a
+    /// hold already there) is not, and says why. With no session they
+    /// settle as [`Self::song_closed`] says. Called on every poll of the
+    /// screen.
+    pub fn follow(&mut self, show: Option<&mut Show>, settings: &mut AudioSettings, now: Instant) {
         let Some(show) = show else {
+            self.song_closed();
             return;
         };
-        if let Some(why) = reconfigure_refusal(show) {
-            if matches!(
-                self.pending_buffer,
-                Some(Pending::Buffer {
-                    held_before: false,
-                    ..
-                })
-            ) {
-                self.pending_buffer = None;
-                self.buffer_problem = Some(format!("The buffer size could not be changed: {why}"));
-            }
-            if self.pending_routing.take().is_some() {
-                self.routing_problem = Some(format!("The routing could not be applied: {why}"));
-            }
-            return;
-        }
-        let Some(stream) = stream(show) else {
-            return;
-        };
-        if let Some(Pending::Buffer { frames, .. }) = self.pending_buffer
-            && stream.buffer_frames == frames
+        let snapshot = show.snapshot();
+        if let Some(pending) = &self.pending_buffer
+            && let Some(verdict) = pending.verdict(&snapshot.device, now)
         {
+            self.buffer_problem = match verdict {
+                Verdict::Kept => {
+                    settings.set_buffer_frames(pending.frames);
+                    None
+                }
+                Verdict::NotKept(why) => Some(buffer_not_kept(why)),
+            };
             self.pending_buffer = None;
-            settings.set_buffer_frames(frames);
         }
-        // The outputs the session now knows the device has: one that came
-        // back with fewer plays the routing refitted to them, which the
-        // session took.
-        let outputs = show.snapshot().mixer.routing.outputs;
-        if let Some(Pending::Routing { device, routing }) = &self.pending_routing
-            && stream.channels >= channels_for(routing, outputs)
+        let outputs = snapshot.mixer.routing.outputs;
+        if let Some(pending) = &self.pending_routing
+            && let Some(verdict) = pending.verdict(&snapshot.device, outputs, now)
         {
-            self.routing_problem = settings
-                .save_routing(device, routing)
-                .err()
-                .map(|error| format!("The routing could not be saved: {error}"));
+            self.routing_problem = match verdict {
+                Verdict::Kept => save_routing(settings, &pending.device, &pending.routing),
+                Verdict::NotKept(why) => Some(routing_not_kept(why)),
+            };
             self.pending_routing = None;
+        }
+    }
+
+    /// The song the changes waited on closed (or opened again, on another
+    /// device or not) before the device opened with them: they are not
+    /// kept, and say so. The screen calls it once that song has closed.
+    pub fn song_closed(&mut self) {
+        let closed = |device: &str| {
+            format!("the song closed before audio device \"{device}\" opened with it")
+        };
+        if let Some(pending) = self.pending_buffer.take() {
+            self.buffer_problem = Some(buffer_not_kept(closed(&pending.device)));
+        }
+        if let Some(pending) = self.pending_routing.take() {
+            self.routing_problem = Some(routing_not_kept(closed(&pending.before.device)));
+        }
+    }
+
+    /// What [`Self::follow`] has settled so far ([`Settling`]).
+    pub fn settling(&self) -> Settling {
+        Settling {
+            buffer_waits: self.pending_buffer.is_some(),
+            routing_waits: self.pending_routing.is_some(),
+            buffer_problem: self.buffer_problem.clone(),
+            routing_problem: self.routing_problem.clone(),
         }
     }
 
@@ -331,6 +553,7 @@ impl OutputPage {
         action: OutputAction,
         show: Option<&mut Show>,
         settings: &mut AudioSettings,
+        now: Instant,
     ) -> bool {
         let current = self.current(show.as_deref(), settings);
         let routing = match action {
@@ -352,7 +575,7 @@ impl OutputPage {
                 return changed && show.is_some();
             }
             OutputAction::Buffer(frames) => {
-                self.set_buffer(frames, show, settings);
+                self.set_buffer(frames, show, settings, now);
                 return false;
             }
             OutputAction::ToggleSplit => current.as_ref().map(|current| {
@@ -374,94 +597,96 @@ impl OutputPage {
                 .map(|current| Routing::preset(current.outputs)),
         };
         if let (Some(current), Some(routing)) = (current, routing) {
-            self.apply(&current.id, routing, show, settings);
+            self.apply(&current.id, routing, show, settings, now);
         }
         false
     }
 
     /// Plays `show` with buffers of `frames` frames, and keeps the size for
-    /// the next sessions once the device takes it. While a song plays the
-    /// stream opens again only once it has ramped out, so the verdict comes
-    /// from later polls ([`Self::follow`]).
-    fn set_buffer(&mut self, frames: u32, show: Option<&mut Show>, settings: &mut AudioSettings) {
+    /// the next sessions once the device plays with it. While a song plays
+    /// the stream opens again only once it has ramped out, and a device
+    /// held already is tried with the size later, so the verdict comes from
+    /// later polls ([`Self::follow`]).
+    fn set_buffer(
+        &mut self,
+        frames: u32,
+        show: Option<&mut Show>,
+        settings: &mut AudioSettings,
+        now: Instant,
+    ) {
         self.pending_buffer = None;
-        let refused =
-            |error: RuntimeError| Some(format!("The buffer size could not be changed: {error}"));
         let Some(show) = show else {
             self.buffer_problem = if (MIN_BUFFER_FRAMES..=MAX_BUFFER_FRAMES).contains(&frames) {
                 settings.set_buffer_frames(frames);
                 None
             } else {
-                refused(RuntimeError::BufferSize { frames })
+                Some(buffer_not_kept(RuntimeError::BufferSize { frames }))
             };
             return;
         };
-        let held = reconfigure_refusal(show).is_some();
-        let unchanged = stream(show).is_some_and(|stream| stream.buffer_frames == frames);
-        if let Err(error) = show.set_buffer_frames(frames) {
-            self.buffer_problem = refused(error);
+        let before = stream(show).cloned();
+        let device = device_name(&show.snapshot().device).to_owned();
+        if let Some(error) = refusal(show.set_buffer_frames(frames)) {
+            self.buffer_problem = Some(buffer_not_kept(error));
             return;
         }
         self.buffer_problem = None;
-        if unchanged && !held {
+        if before
+            .as_ref()
+            .is_some_and(|stream| stream.buffer_frames == frames)
+        {
             settings.set_buffer_frames(frames);
             return;
         }
-        // A device already held keeps trying with the new size: it is kept
-        // once a stream opens with it, and that hold is not its refusal.
-        self.pending_buffer = Some(Pending::Buffer {
+        self.pending_buffer = Some(PendingBuffer {
             frames,
-            held_before: held,
+            since: now,
+            device,
+            before,
         });
         show.poll();
-        self.follow(Some(show), settings);
+        self.follow(Some(show), settings, now);
     }
 
     /// Plays `show` with `routing` and saves it for the device `device`
-    /// once the session took it: at once when the
-    /// stream already has the outputs it needs (a full queue still counts,
-    /// since the routing reaches the players later), else once the stream
-    /// has opened again with them ([`Self::follow`]). A device held after
-    /// an earlier refusal is not this change's refusal.
+    /// once the session took it ([`refusal`]: a full queue still counts):
+    /// at once when the stream already has the outputs it needs, or when
+    /// the device is held and opens with it once back ([`PendingRouting`]);
+    /// else once the stream has opened again with them ([`Self::follow`]).
     fn apply(
         &mut self,
         device: &str,
         routing: Routing,
         show: Option<&mut Show>,
         settings: &mut AudioSettings,
+        now: Instant,
     ) {
         self.pending_routing = None;
-        let save = |settings: &mut AudioSettings| {
-            settings
-                .save_routing(device, &routing)
-                .err()
-                .map(|error| format!("The routing could not be saved: {error}"))
-        };
         let Some(show) = show else {
-            self.routing_problem = save(settings);
+            self.routing_problem = save_routing(settings, device, &routing);
             return;
         };
-        let held = reconfigure_refusal(show).is_some();
         let channels = channels_for(&routing, show.snapshot().mixer.routing.outputs);
-        let wide_enough = stream(show).is_some_and(|stream| stream.channels >= channels);
-        match show.set_routing(routing.clone()) {
-            Ok(()) | Err(RuntimeError::QueueFull { .. }) => {}
-            Err(error) => {
-                self.routing_problem = Some(format!("The routing could not be applied: {error}"));
-                return;
-            }
-        }
-        if wide_enough || held {
-            self.routing_problem = save(settings);
+        let narrow = stream(show)
+            .filter(|stream| stream.channels < channels)
+            .cloned();
+        if let Some(error) = refusal(show.set_routing(routing.clone())) {
+            self.routing_problem = Some(routing_not_kept(error));
             return;
         }
+        let Some(before) = narrow else {
+            self.routing_problem = save_routing(settings, device, &routing);
+            return;
+        };
         self.routing_problem = None;
-        self.pending_routing = Some(Pending::Routing {
+        self.pending_routing = Some(PendingRouting {
             device: device.to_owned(),
             routing,
+            since: now,
+            before,
         });
         show.poll();
-        self.follow(Some(show), settings);
+        self.follow(Some(show), settings, now);
     }
 
     /// What the screen shows of the song `show` plays and the settings.
@@ -501,6 +726,7 @@ impl OutputPage {
                 RoutingRow {
                     bus,
                     name: bus.name(),
+                    icon: bus_icon(bus),
                     cells: (1..=outputs).map(|output| on.contains(&output)).collect(),
                 }
             })
@@ -527,11 +753,20 @@ impl OutputPage {
         OutputScreen {
             devices,
             device,
+            device_state: show.map_or(DeviceState::Closed, |show| match show.snapshot().device {
+                DeviceStatus::Connected(_) => DeviceState::Open,
+                DeviceStatus::Disconnected { .. } | DeviceStatus::PlayerLost { .. } => {
+                    DeviceState::Lost
+                }
+            }),
             device_menu: self.device_menu,
             sample_rate: stream.as_ref().map_or_else(
                 || "Set by the song that plays".to_owned(),
                 |stream| rate_text(stream.sample_rate),
             ),
+            sample_rate_note: show
+                .zip(stream.as_ref())
+                .map(|(show, stream)| rate_note(stream.sample_rate, show.song().sample_rate)),
             buffer_sizes: BUFFER_SIZES,
             buffer: stream
                 .as_ref()

@@ -15,6 +15,7 @@ use domain::{
 };
 use rtrb::{Consumer, RingBuffer};
 
+use super::meters::{MeterWindows, Meters, raise};
 use super::ramp::Ramp;
 use super::source::StemSource;
 use super::status::{ClickSource, FadeState, FadeStatus, JumpKind, QueuedJump, Status, Transport};
@@ -175,13 +176,49 @@ struct Block<'a> {
     source: u64,
     tails: &'a [Tail],
     track_gain: &'a [f32],
+    /// The master gain and transport ramp of each frame, for the meters.
+    master: &'a [f32],
+    /// The block's frames from `meter_from` to `meter_split` belong to the
+    /// meters' window before the one under way once the block ends, those
+    /// from `meter_split` on to that one, and earlier ones to neither.
+    meter_from: usize,
+    meter_split: usize,
     envelope: Envelope,
     envelope_start: u64,
 }
 
+/// Where a stem's meter readings go while it is mixed: its peaks in the
+/// meters' two windows the block reaches (none past
+/// [`super::MAX_METERED_STEMS`]), a bus meter buffer to add it to when its
+/// bus is not a buffer of its own (the plain stereo path), and scratch for
+/// the sum of its tails and its current section.
+struct StemMeter<'a> {
+    peaks: Option<(&'a mut [f32; 2], &'a mut [f32; 2])>,
+    bus: Option<&'a mut [f32]>,
+    heard: &'a mut [f32],
+}
+
+impl StemMeter<'_> {
+    /// Raises the peak of frame `i` of the block to `left` and `right`.
+    fn raise(&mut self, block: &Block<'_>, i: usize, left: f32, right: f32) {
+        if let Some((before, after)) = &mut self.peaks
+            && i >= block.meter_from
+        {
+            let peak = if i < block.meter_split {
+                &mut **before
+            } else {
+                &mut **after
+            };
+            let master = block.master[i];
+            raise(peak, left * master, right * master);
+        }
+    }
+}
+
 /// Adds `stem`'s fading-out tails, then its current section, `block.n`
 /// frames, to the stereo buffer `out`, in that order: the order
-/// [`crate::render_offline`] sums in. `live` and `read` are scratch.
+/// [`crate::render_offline`] sums in. `live` and `read` are scratch. The
+/// meter only reads what is added: `out` gets exactly the same samples.
 fn add_stem(
     stem: &mut Stem,
     block: &Block<'_>,
@@ -189,10 +226,19 @@ fn add_stem(
     read: &mut [f32],
     out: &mut [f32],
     underruns: &mut u64,
+    mut meter: StemMeter<'_>,
 ) {
     let n = block.n;
     for value in &mut live[..n] {
         *value = stem.live.next();
+    }
+    // With tails, the stem's frames are the sum of two passes: the meter
+    // keeps the first in `heard`.
+    let tails = meter.peaks.is_some() && !block.tails.is_empty();
+    let heard = mem::take(&mut meter.heard);
+    let heard_frames = &mut heard[..2 * n];
+    if tails {
+        heard_frames.fill(0.0);
     }
     for tail in block.tails {
         let k = (n as u64).min(tail.remaining()) as usize;
@@ -203,20 +249,46 @@ fn add_stem(
         }
         for i in 0..k {
             let gain = stem.gain_at(live, block.track_gain, i) * tail.gain(tail.played + i as u64);
-            out[2 * i] += read[2 * i] * gain;
-            out[2 * i + 1] += read[2 * i + 1] * gain;
+            let (left, right) = (read[2 * i] * gain, read[2 * i + 1] * gain);
+            out[2 * i] += left;
+            out[2 * i + 1] += right;
+            if let Some(bus) = meter.bus.as_deref_mut() {
+                bus[2 * i] += left;
+                bus[2 * i + 1] += right;
+            }
+            if tails {
+                heard_frames[2 * i] += left;
+                heard_frames[2 * i + 1] += right;
+            }
         }
     }
     let read = &mut read[..2 * n];
     if !stem.source.read(block.source, read) {
         *underruns += 1;
+        // Only the tails sounded.
+        if tails {
+            for (i, frame) in heard_frames.chunks_exact(2).enumerate() {
+                meter.raise(block, i, frame[0], frame[1]);
+            }
+        }
         return;
     }
     for i in 0..n {
         let gain = stem.gain_at(live, block.track_gain, i)
             * block.envelope.at(block.envelope_start + i as u64);
-        out[2 * i] += read[2 * i] * gain;
-        out[2 * i + 1] += read[2 * i + 1] * gain;
+        let (left, right) = (read[2 * i] * gain, read[2 * i + 1] * gain);
+        out[2 * i] += left;
+        out[2 * i + 1] += right;
+        if let Some(bus) = meter.bus.as_deref_mut() {
+            bus[2 * i] += left;
+            bus[2 * i + 1] += right;
+        }
+        let (left, right) = if tails {
+            (heard_frames[2 * i] + left, heard_frames[2 * i + 1] + right)
+        } else {
+            (left, right)
+        };
+        meter.raise(block, i, left, right);
     }
 }
 
@@ -385,6 +457,19 @@ pub struct Player {
     stem_mix: Vec<f32>,
     /// One stereo buffer per bus, in [`Bus::ALL`] order.
     buses: Vec<f32>,
+    /// The meters' windows, and the peaks of the block being rendered in
+    /// the two windows it reaches ([`MeterWindows::segments`]).
+    meters: MeterWindows,
+    block_meters: [Meters; 2],
+    meter_segments: (usize, usize),
+    /// The buses as the meters read them on the plain stereo path, where
+    /// the stems sum straight into outputs 1 and 2; laid out as `buses`.
+    meter_buses: Vec<f32>,
+    /// One stem's tails, for its meter.
+    meter_heard: Vec<f32>,
+    /// Frames rendered in the current [`Player::process`] call: the others
+    /// were silent.
+    rendered: u64,
 }
 
 impl Player {
@@ -460,7 +545,7 @@ impl Player {
             None if matches!(source.role(), StemRole::Click | StemRole::Guide) => Bus::ClickGuide,
             None => DEFAULT_BUS,
         };
-        let stems = sources
+        let stems: Vec<Stem> = sources
             .into_iter()
             .map(|source| {
                 let bus = bus_of(source.as_ref());
@@ -476,6 +561,7 @@ impl Player {
                 }
             })
             .collect();
+        let stem_count = stems.len();
         let (producer, commands) = RingBuffer::new(COMMAND_CAPACITY);
         let click_level = if settings.click.enabled { 1.0 } else { 0.0 };
         let positions = entries.len();
@@ -537,6 +623,12 @@ impl Player {
             mix: vec![0.0; 2 * max_frames],
             stem_mix: vec![0.0; 2 * max_frames],
             buses: vec![0.0; BUSES * 2 * max_frames],
+            meters: MeterWindows::new(sample_rate, stem_count),
+            block_meters: [Meters::SILENT; 2],
+            meter_segments: (0, 0),
+            meter_buses: vec![0.0; BUSES * 2 * max_frames],
+            meter_heard: vec![0.0; 2 * max_frames],
+            rendered: 0,
         };
         player.set_routes(Routes::STEREO);
         player.update_hints();
@@ -561,9 +653,12 @@ impl Player {
         out.fill(0.0);
         let usable = out.len() - out.len() % self.channels;
         let piece = self.channels * self.max_frames;
+        self.rendered = 0;
         for chunk in out[..usable].chunks_mut(piece) {
             self.render(chunk);
         }
+        let frames = (usable / self.channels) as u64;
+        self.meters.silence(frames - self.rendered);
     }
 
     /// A snapshot of the transport.
@@ -598,6 +693,7 @@ impl Player {
             } else {
                 ClickSource::Recorded
             },
+            meters: self.meters.published(),
             underruns: self.underruns,
         }
     }
@@ -1192,6 +1288,11 @@ impl Player {
             self.click_gain[i] = self.click.next() * self.click_level.next();
             self.master[i] = self.master_gain * self.transport_gain.next();
         }
+        let stems = self.meters.stems();
+        for meters in &mut self.block_meters {
+            meters.clear(stems);
+        }
+        self.meter_segments = self.meters.segments(n);
         if !self.plain() {
             self.render_buses(out, n);
         } else if channels == 2 {
@@ -1207,6 +1308,9 @@ impl Player {
             }
             self.mix = mix;
         }
+        let [before, after] = &self.block_meters;
+        self.meters.add(before, after, n as u64);
+        self.rendered += n as u64;
     }
 
     /// The stereo mix of every stem in stem order, then the click, then the
@@ -1220,15 +1324,25 @@ impl Player {
             stem.bus_fade.skip(n as u64);
         }
         let source = self.source_frame();
+        let stride = 2 * self.max_frames;
+        let mut meter_buses = mem::take(&mut self.meter_buses);
+        for bus in 0..BUSES {
+            meter_buses[bus * stride..bus * stride + 2 * n].fill(0.0);
+        }
         let block = Block {
             n,
             source,
             tails: &self.tails,
             track_gain: &self.track_gain,
+            master: &self.master,
+            meter_from: self.meter_segments.0,
+            meter_split: self.meter_segments.1,
             envelope: Envelope::FadeIn(self.voice.fade_in),
             envelope_start: self.voice.envelope_position(),
         };
-        for stem in &mut self.stems {
+        let [before, after] = &mut self.block_meters;
+        for (index, stem) in self.stems.iter_mut().enumerate() {
+            let bus = stem.bus.index();
             add_stem(
                 stem,
                 &block,
@@ -1236,13 +1350,37 @@ impl Player {
                 &mut self.read,
                 out,
                 &mut self.underruns,
+                StemMeter {
+                    peaks: before.stems.get_mut(index).zip(after.stems.get_mut(index)),
+                    bus: Some(&mut meter_buses[bus * stride..bus * stride + 2 * n]),
+                    heard: &mut self.meter_heard,
+                },
             );
         }
-        self.add_clicks(out, source);
+        let click = Bus::ClickGuide.index();
+        self.add_clicks(
+            out,
+            Some(&mut meter_buses[click * stride..click * stride + 2 * n]),
+            source,
+        );
         for (frame, gain) in out.chunks_exact_mut(2).zip(&self.master) {
             frame[0] *= gain;
             frame[1] *= gain;
         }
+        let (from, split) = self.meter_segments;
+        for bus in 0..BUSES {
+            let signal = &meter_buses[bus * stride..bus * stride + 2 * n];
+            let frames = signal.chunks_exact(2).zip(&self.master).enumerate();
+            for (i, (frame, gain)) in frames.skip(from) {
+                let meters = &mut self.block_meters[usize::from(i >= split)];
+                raise(&mut meters.buses[bus], frame[0] * gain, frame[1] * gain);
+            }
+        }
+        for (i, frame) in out.chunks_exact(2).enumerate().skip(from) {
+            let meters = &mut self.block_meters[usize::from(i >= split)];
+            raise(&mut meters.master, frame[0], frame[1]);
+        }
+        self.meter_buses = meter_buses;
     }
 
     /// Each stem into its bus (crossfading between two while it moves), the
@@ -1262,10 +1400,19 @@ impl Player {
             source,
             tails: &self.tails,
             track_gain: &self.track_gain,
+            master: &self.master,
+            meter_from: self.meter_segments.0,
+            meter_split: self.meter_segments.1,
             envelope: Envelope::FadeIn(self.voice.fade_in),
             envelope_start: self.voice.envelope_position(),
         };
-        for stem in &mut self.stems {
+        let [before, after] = &mut self.block_meters;
+        for (index, stem) in self.stems.iter_mut().enumerate() {
+            let meter = StemMeter {
+                peaks: before.stems.get_mut(index).zip(after.stems.get_mut(index)),
+                bus: None,
+                heard: &mut self.meter_heard,
+            };
             if stem.bus_fade.is_done() {
                 let bus = stem.bus.index();
                 used[bus] = true;
@@ -1277,6 +1424,7 @@ impl Player {
                     &mut self.read,
                     target,
                     &mut self.underruns,
+                    meter,
                 );
                 continue;
             }
@@ -1290,6 +1438,7 @@ impl Player {
                 &mut self.read,
                 heard,
                 &mut self.underruns,
+                meter,
             );
             for (i, frame) in heard.chunks_exact(2).enumerate() {
                 let reached = stem.bus_fade.next();
@@ -1308,7 +1457,11 @@ impl Player {
         if self.bursts.is_some() {
             let click = Bus::ClickGuide.index();
             used[click] = true;
-            self.add_clicks(&mut buses[click * stride..click * stride + 2 * n], source);
+            self.add_clicks(
+                &mut buses[click * stride..click * stride + 2 * n],
+                None,
+                source,
+            );
         }
         for bus in (0..BUSES).filter(|&bus| used[bus]) {
             let signal = &mut buses[bus * stride..bus * stride + 2 * n];
@@ -1316,6 +1469,21 @@ impl Player {
                 frame[0] *= gain;
                 frame[1] *= gain;
             }
+            let (from, split) = self.meter_segments;
+            for (i, frame) in signal.chunks_exact(2).enumerate().skip(from) {
+                let meters = &mut self.block_meters[usize::from(i >= split)];
+                raise(&mut meters.buses[bus], frame[0], frame[1]);
+            }
+        }
+        let (from, split) = self.meter_segments;
+        for i in from..n {
+            let (mut left, mut right) = (0.0, 0.0);
+            for bus in (0..BUSES).filter(|&bus| used[bus]) {
+                left += buses[bus * stride + 2 * i];
+                right += buses[bus * stride + 2 * i + 1];
+            }
+            let meters = &mut self.block_meters[usize::from(i >= split)];
+            raise(&mut meters.master, left, right);
         }
 
         let moving = !self.route_fade.is_done();
@@ -1348,8 +1516,9 @@ impl Player {
     }
 
     /// Adds the bursts still sounding, then the bursts of the ticks in the
-    /// source range being played, in the order they start.
-    fn add_clicks(&mut self, out: &mut [f32], source: u64) {
+    /// source range being played, in the order they start; to `meter` too,
+    /// the Click & Guide bus as the meters read it, when given.
+    fn add_clicks(&mut self, out: &mut [f32], mut meter: Option<&mut [f32]>, source: u64) {
         let Some(bursts) = &self.bursts else {
             return;
         };
@@ -1359,6 +1528,14 @@ impl Player {
             let table = &bursts.table(burst.level)[burst.offset..];
             let k = n.min(table.len());
             add_burst(&mut out[..2 * k], &table[..k], burst.gain, &click_gain[..k]);
+            if let Some(meter) = meter.as_deref_mut() {
+                add_burst(
+                    &mut meter[..2 * k],
+                    &table[..k],
+                    burst.gain,
+                    &click_gain[..k],
+                );
+            }
             burst.offset += k;
         }
         self.active
@@ -1377,6 +1554,14 @@ impl Player {
                 gain,
                 &click_gain[start..start + k],
             );
+            if let Some(meter) = meter.as_deref_mut() {
+                add_burst(
+                    &mut meter[2 * start..2 * (start + k)],
+                    &table[..k],
+                    gain,
+                    &click_gain[start..start + k],
+                );
+            }
             if k < table.len() && self.active.len() < self.max_bursts {
                 self.active.push(ActiveBurst {
                     level: click.level,

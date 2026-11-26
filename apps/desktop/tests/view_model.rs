@@ -1,7 +1,7 @@
 //! S6: the Perform screen's view-model, without a window. One test per
 //! element: song map, queued-jump marker, Now/Next, pads, transport, fade,
-//! hold-to-panic, jump timing, loop and infinite, the status area, and the
-//! keys.
+//! hold-to-panic, jump timing, loop and infinite, what the notes say about
+//! the device and the song, and the keys.
 
 use std::time::{Duration, Instant};
 
@@ -16,7 +16,10 @@ use openvamp_desktop::keys::{
     HeldKeys, KeyAction, KeyPlatform, KeyPress, Mods, PANIC_KEY, SECONDARY_IS_PLATFORM,
     is_panic_key, key_down,
 };
-use openvamp_desktop::view::{Level, PerformView, SectionKind, open_error_lines, short_label};
+use openvamp_desktop::view::{
+    Level, PadGrid, PerformView, SectionKind, SongFacts, open_error_lines, pad_grid, section_icon,
+    short_label,
+};
 
 const RATE: u32 = 48_000;
 const SECTION: u64 = 96_000;
@@ -134,7 +137,6 @@ fn song_map_playhead_follows_the_position_in_the_arrangement() {
     // 2 s of intro plus 0.5 s into the verse, of 7 s.
     let view = PerformView::new(&snapshot(), &song());
     close(view.map.playhead, 2.5 / 7.0);
-    assert_eq!(view.clock, "00:02 / 00:07");
     assert_eq!(view.bar_beat, "Bar 3 · beat 2");
 
     // A repeated or jumped-to section places the playhead by position, not
@@ -487,16 +489,16 @@ fn loop_section_and_infinite_toggle_from_their_state() {
 }
 
 #[test]
-fn status_area_shows_the_device_underruns_and_the_last_error_in_the_apps_words() {
+fn the_notes_say_why_the_device_plays_nothing_and_the_last_error_in_the_apps_words() {
     let mut song = song();
     song.warnings = vec!["stem \"pad\" is silent".to_owned()];
     let mut snapshot = snapshot();
+    // The device plays: nothing to say of it (the header's chip names it).
     let status = PerformView::new(&snapshot, &song).status;
-    assert_eq!(status.device, "Speakers · 48000 Hz · 256 frames · 5.3 ms");
-    assert_eq!(status.device_level, Level::Ok);
-    assert_eq!(status.underruns, "Underruns: 0");
+    assert_eq!(status.device_problem, None);
     assert_eq!(status.last_error, None);
     assert_eq!(status.warnings, ["stem \"pad\" is silent"]);
+    assert_eq!(status.facts_problem, None);
 
     let error = RuntimeError::JumpWaiting {
         section: "Chorus".to_owned(),
@@ -517,12 +519,10 @@ fn status_area_shows_the_device_underruns_and_the_last_error_in_the_apps_words()
         )
     );
     assert_eq!(status.last_error, Some(error.to_string()));
-    assert_eq!(status.underruns, "Underruns: 3");
     assert_eq!(
-        status.device,
-        "No device: \"Speakers\" (the device was unplugged)"
+        status.device_problem.as_deref(),
+        Some("No device: \"Speakers\" (the device was unplugged)")
     );
-    assert_eq!(status.device_level, Level::Error);
 
     let refused = OutputError::NoDevice;
     snapshot.device = DeviceStatus::Disconnected {
@@ -531,8 +531,10 @@ fn status_area_shows_the_device_underruns_and_the_last_error_in_the_apps_words()
         reopen_error: Some(refused.clone()),
     };
     assert_eq!(
-        PerformView::new(&snapshot, &song).status.device,
-        format!("No device: \"Speakers\" (cannot open it again: {refused})")
+        PerformView::new(&snapshot, &song).status.device_problem,
+        Some(format!(
+            "No device: \"Speakers\" (cannot open it again: {refused})"
+        ))
     );
     // The session closed the stream itself for new settings the device
     // refuses: the device is there.
@@ -548,8 +550,10 @@ fn status_area_shows_the_device_underruns_and_the_last_error_in_the_apps_words()
         reopen_error: Some(refused.clone()),
     };
     assert_eq!(
-        PerformView::new(&snapshot, &song).status.device,
-        format!("Paused: \"Speakers\" refuses the new settings ({refused})")
+        PerformView::new(&snapshot, &song).status.device_problem,
+        Some(format!(
+            "Paused: \"Speakers\" refuses the new settings ({refused})"
+        ))
     );
     snapshot.device = DeviceStatus::Disconnected {
         device: "Speakers".to_owned(),
@@ -557,15 +561,21 @@ fn status_area_shows_the_device_underruns_and_the_last_error_in_the_apps_words()
         reopen_error: None,
     };
     assert_eq!(
-        PerformView::new(&snapshot, &song).status.device,
-        "No device: \"Speakers\" (the stream closed to open again with new settings)"
+        PerformView::new(&snapshot, &song)
+            .status
+            .device_problem
+            .as_deref(),
+        Some("No device: \"Speakers\" (the stream closed to open again with new settings)")
     );
     snapshot.device = DeviceStatus::PlayerLost {
         device: "Speakers".to_owned(),
     };
     assert_eq!(
-        PerformView::new(&snapshot, &song).status.device,
-        "No device: \"Speakers\" (the output kept the player; open the song again)"
+        PerformView::new(&snapshot, &song)
+            .status
+            .device_problem
+            .as_deref(),
+        Some("No device: \"Speakers\" (the output kept the player; open the song again)")
     );
 }
 
@@ -859,4 +869,541 @@ fn section_families_and_short_labels_come_from_the_label() {
         assert_eq!(SectionKind::of(label), kind, "{label}");
         assert_eq!(short_label(label), short, "{label}");
     }
+}
+
+// The design canvas's Main artboard: what the header, the song map, the
+// Now and Next cards and the pads show beyond the session's own words.
+
+/// Frames per bar at 120 BPM in 4/4 at [`RATE`].
+const BAR: u64 = 96_000;
+
+/// Intro (8 bars), Verse 1 (16), Chorus (16), Turnaround (2), the Chorus
+/// again, Tag (4) and Outro (8), at 120 BPM in 4/4. Each section ends where
+/// the next one in the song starts, except the Outro, the song's last.
+fn bars_song() -> SongInfo {
+    let position = |id: &str, label: &str, start_bar: u64, bars: u64| PositionInfo {
+        section_id: id.to_owned(),
+        label: label.to_owned(),
+        start_frame: (start_bar - 1) * BAR,
+        length_frames: bars * BAR,
+        start_bar,
+    };
+    SongInfo {
+        title: "First Light".to_owned(),
+        artist: None,
+        sample_rate: RATE,
+        arrangement: "default".to_owned(),
+        positions: vec![
+            position("intro", "Intro", 1, 8),
+            position("verse", "Verse 1", 9, 16),
+            position("chorus", "Chorus", 25, 16),
+            position("turn", "Turnaround", 41, 2),
+            position("chorus", "Chorus", 25, 16),
+            position("tag", "Tag", 43, 4),
+            position("outro", "Outro", 47, 8),
+        ],
+        warnings: Vec::new(),
+    }
+}
+
+/// A `song.json` with `key`, the tempo changes `tempo` and the time
+/// signature changes `meters`, and the arrangements `default` ("Default")
+/// and `long` ("Long ending").
+fn manifest(key: Option<&str>, tempo: &[(u64, f64)], meters: &[(u64, u32, u32)]) -> String {
+    let key = key.map_or_else(String::new, |key| format!("\"key\": \"{key}\","));
+    let tempo: Vec<String> = tempo
+        .iter()
+        .map(|(at, bpm)| format!("{{\"at\": {at}, \"bpm\": {bpm}}}"))
+        .collect();
+    let meters: Vec<String> = meters
+        .iter()
+        .map(|(at, numerator, denominator)| {
+            format!("{{\"at\": {at}, \"numerator\": {numerator}, \"denominator\": {denominator}}}")
+        })
+        .collect();
+    format!(
+        r#"{{
+            "formatVersion": 1,
+            "title": "First Light",
+            "sampleRate": 48000,
+            {key}
+            "tempoMap": [{}],
+            "timeSignatureMap": [{}],
+            "stems": [],
+            "sections": [],
+            "arrangements": [
+                {{"id": "default", "name": "Default", "sections": []}},
+                {{"id": "long", "name": "Long ending", "sections": []}}
+            ]
+        }}"#,
+        tempo.join(", "),
+        meters.join(", ")
+    )
+}
+
+/// The facts of [`bars_song`]: 120 BPM in 4/4 throughout.
+fn bars_facts() -> SongFacts {
+    SongFacts::from_manifest(&manifest(Some("G"), &[(0, 120.0)], &[(0, 4, 4)]))
+        .expect("the manifest parses")
+}
+
+/// Playing bar `bar` of arrangement position `position` of [`bars_song`].
+fn at_bar(position: usize, bar: u64) -> Snapshot {
+    let song = bars_song();
+    let info = &song.positions[position];
+    let mut snapshot = snapshot();
+    snapshot.position = position;
+    snapshot.section = info.label.clone();
+    snapshot.bar = bar;
+    snapshot.beat = 1;
+    snapshot.source_frame = info.start_frame + (bar - info.start_bar) * BAR;
+    snapshot
+}
+
+#[test]
+fn a_tag_without_a_number_keeps_its_name_and_repeated_sections_are_numbered() {
+    assert_eq!(short_label("Tag"), "Tag");
+    assert_eq!(short_label("Tag 2"), "T2");
+
+    let view = PerformView::new(&at_bar(1, 10), &bars_song());
+    let shorts: Vec<&str> = view.map.blocks.iter().map(|b| b.short.as_str()).collect();
+    assert_eq!(shorts, ["In", "V1", "C1", "TA", "C2", "Tag", "Out"]);
+    let abbreviations: Vec<&str> = view.pads.iter().map(|p| p.abbr.as_str()).collect();
+    assert_eq!(abbreviations, shorts);
+    // The pads keep the section's full name, numbered as the map numbers it.
+    assert_eq!(view.pads[4].label, "Chorus 2");
+}
+
+#[test]
+fn now_next_pads_and_map_name_a_repeated_section_by_its_turn() {
+    let song = bars_song();
+    let names = [
+        "Intro",
+        "Verse 1",
+        "Chorus 1",
+        "Turnaround",
+        "Chorus 2",
+        "Tag",
+        "Outro",
+    ];
+
+    // The first Chorus plays; the Turnaround is next.
+    let view = PerformView::new(&at_bar(2, 30), &song);
+    assert_eq!(view.now.name, "Chorus 1");
+    assert_eq!(view.next.name, "Turnaround");
+    let pads: Vec<&str> = view.pads.iter().map(|p| p.label.as_str()).collect();
+    assert_eq!(pads, names);
+    let blocks: Vec<&str> = view.map.blocks.iter().map(|b| b.label.as_str()).collect();
+    assert_eq!(blocks, names);
+
+    // The Turnaround plays; the Chorus after it is the second one: C2.
+    let view = PerformView::new(&at_bar(3, 41), &song);
+    assert_eq!(view.next.name, "Chorus 2");
+    assert_eq!(view.map.blocks[4].short, "C2");
+
+    // The second Chorus plays.
+    let view = PerformView::new(&at_bar(4, 30), &song);
+    assert_eq!(view.now.name, "Chorus 2");
+    assert_eq!(view.now.kind, SectionKind::Chorus);
+    assert_eq!(view.now.icon, "star");
+
+    // A jump queued back to the first Chorus names it so.
+    let mut snapshot = at_bar(4, 30);
+    snapshot.queued = Some(QueuedView {
+        target: 2,
+        target_label: "Chorus".to_owned(),
+        kind: JumpKind::Jump,
+        executes_at: 0,
+        frames_until: 48_000,
+        deferrals: 0,
+    });
+    let view = PerformView::new(&snapshot, &song);
+    assert_eq!(view.next.name, "Chorus 1");
+    assert_eq!(view.next.heading, "Jump queued");
+
+    // A section played once keeps its name: "Tag", not "Tag 1".
+    let view = PerformView::new(&at_bar(5, 44), &song);
+    assert_eq!(view.now.name, "Tag");
+    assert_eq!(view.next.name, "Outro");
+}
+
+#[test]
+fn a_tag_that_plays_more_than_once_stays_tag_on_the_map_the_pads_and_now_and_next() {
+    // Intro, Verse 1, Chorus, the Tag twice, Outro.
+    let mut song = bars_song();
+    let positions = song.positions.clone();
+    song.positions = [0, 1, 2, 5, 5, 6].map(|i| positions[i].clone()).to_vec();
+    let names = ["Intro", "Verse 1", "Chorus", "Tag", "Tag", "Outro"];
+    let shorts = ["In", "V1", "C", "Tag", "Tag", "Out"];
+
+    // The first Tag plays; the second one is next.
+    let mut snapshot = snapshot();
+    snapshot.position = 3;
+    snapshot.section = "Tag".to_owned();
+    snapshot.bar = 44;
+    snapshot.beat = 1;
+    snapshot.source_frame = song.positions[3].start_frame + BAR;
+    let view = PerformView::new(&snapshot, &song);
+    let pads: Vec<&str> = view.pads.iter().map(|p| p.label.as_str()).collect();
+    assert_eq!(pads, names);
+    let abbreviations: Vec<&str> = view.pads.iter().map(|p| p.abbr.as_str()).collect();
+    assert_eq!(abbreviations, shorts);
+    let blocks: Vec<&str> = view.map.blocks.iter().map(|b| b.label.as_str()).collect();
+    assert_eq!(blocks, names);
+    let blocks: Vec<&str> = view.map.blocks.iter().map(|b| b.short.as_str()).collect();
+    assert_eq!(blocks, shorts);
+    assert_eq!(view.now.name, "Tag");
+    assert_eq!(view.next.name, "Tag");
+}
+
+#[test]
+fn a_label_is_numbered_by_its_turn_unless_it_ends_in_a_number() {
+    let mut song = bars_song();
+    // A label of two words with no number, played twice.
+    song.positions[2].label = "Guitar solo".to_owned();
+    song.positions[4].label = "Guitar solo".to_owned();
+    let view = PerformView::new(&at_bar(1, 10), &song);
+    let pads: Vec<&str> = view.pads.iter().map(|p| p.label.as_str()).collect();
+    assert_eq!(
+        pads,
+        [
+            "Intro",
+            "Verse 1",
+            "Guitar solo 1",
+            "Turnaround",
+            "Guitar solo 2",
+            "Tag",
+            "Outro"
+        ]
+    );
+}
+
+#[test]
+fn each_section_family_has_the_design_canvas_icon() {
+    let expected = [
+        ("Count-off", "metronome"),
+        ("Intro", "enter"),
+        ("Verse 2", "lines"),
+        ("Pre-chorus", "rise"),
+        ("Chorus 3", "star"),
+        ("Post-chorus", "star"),
+        ("Bridge 1", "bridge"),
+        ("Instrumental", "note"),
+        ("Interlude", "note"),
+        ("Breakdown", "bridge"),
+        ("Tag", "tag"),
+        ("Vamp", "loop"),
+        ("Turnaround", "turn"),
+        ("Outro", "exit"),
+        ("Ending", "flag"),
+    ];
+    for (label, icon) in expected {
+        assert_eq!(section_icon(label), icon, "{label}");
+    }
+    let view = PerformView::new(&at_bar(1, 10), &bars_song());
+    let icons: Vec<&str> = view.pads.iter().map(|p| p.icon).collect();
+    assert_eq!(
+        icons,
+        ["enter", "lines", "star", "turn", "star", "tag", "exit"]
+    );
+}
+
+#[test]
+fn sections_count_their_bars_and_the_ruler_numbers_the_bars_in_play_order() {
+    let song = bars_song();
+    let view = PerformView::with_facts(&at_bar(1, 10), &song, &bars_facts());
+    let bars: Vec<Option<u64>> = view.map.blocks.iter().map(|b| b.bars).collect();
+    assert_eq!(
+        bars,
+        [
+            Some(8),
+            Some(16),
+            Some(16),
+            Some(2),
+            Some(16),
+            Some(4),
+            Some(8)
+        ]
+    );
+    let texts: Vec<Option<&str>> = view.pads.iter().map(|p| p.bars.as_deref()).collect();
+    assert_eq!(
+        texts,
+        [
+            Some("8 bars"),
+            Some("16 bars"),
+            Some("16 bars"),
+            Some("2 bars"),
+            Some("16 bars"),
+            Some("4 bars"),
+            Some("8 bars")
+        ]
+    );
+    // The bar each block starts at, counted in play order; a block shorter
+    // than 4 bars has no room for its number.
+    let ruler: Vec<Option<&str>> = view.map.blocks.iter().map(|b| b.ruler.as_deref()).collect();
+    assert_eq!(
+        ruler,
+        [
+            Some("1"),
+            Some("9"),
+            Some("25"),
+            None,
+            Some("43"),
+            Some("59"),
+            Some("63")
+        ]
+    );
+
+    // Without the song's tempo, the song's last section cannot be counted:
+    // no other section starts where it ends.
+    let view = PerformView::new(&at_bar(1, 10), &song);
+    assert_eq!(view.map.blocks[6].bars, None);
+    assert_eq!(view.pads[6].bars, None);
+    assert_eq!(view.map.blocks[6].ruler, None);
+    assert_eq!(view.map.blocks[5].ruler.as_deref(), Some("59"));
+
+    // A one-bar section says "bar".
+    let mut short = song.clone();
+    short.positions[6].length_frames = BAR;
+    let view = PerformView::with_facts(&at_bar(1, 10), &short, &bars_facts());
+    assert_eq!(view.pads[6].bars.as_deref(), Some("1 bar"));
+
+    // A tempo change counts the last section at the tempo it starts in:
+    // 60 BPM in 3/4 from bar 47 makes a bar 3 s, 144 000 frames.
+    let facts = SongFacts::from_manifest(&manifest(
+        None,
+        &[(0, 120.0), (46 * BAR, 60.0)],
+        &[(0, 4, 4), (46 * BAR, 3, 4)],
+    ))
+    .unwrap();
+    let mut slow = song;
+    slow.positions[6].length_frames = 4 * 144_000;
+    let view = PerformView::with_facts(&at_bar(1, 10), &slow, &facts);
+    assert_eq!(view.pads[6].bars.as_deref(), Some("4 bars"));
+}
+
+#[test]
+fn now_and_next_show_their_section_icon_and_the_bars_left() {
+    let song = bars_song();
+    let facts = bars_facts();
+    // Bar 30 of the Chorus, bars 25 to 40.
+    let view = PerformView::with_facts(&at_bar(2, 30), &song, &facts);
+    // The first of the song's two Choruses.
+    assert_eq!(view.now.name, "Chorus 1");
+    assert_eq!(view.now.kind, SectionKind::Chorus);
+    assert_eq!(view.now.icon, "star");
+    assert_eq!(view.now.bars_left.as_deref(), Some("11 bars left"));
+    assert_eq!(view.next.name, "Turnaround");
+    assert_eq!(view.next.kind, SectionKind::Neutral);
+    assert_eq!(view.next.icon, "turn");
+    assert_eq!(
+        view.next.bars_detail.as_deref(),
+        Some("Plays in 11 bars · tap a section to jump")
+    );
+
+    // The section's last bar.
+    let view = PerformView::with_facts(&at_bar(2, 40), &song, &facts);
+    assert_eq!(view.now.bars_left.as_deref(), Some("1 bar left"));
+
+    // The infinite loop repeats it.
+    let mut snapshot = at_bar(2, 30);
+    snapshot.infinite = true;
+    let view = PerformView::with_facts(&snapshot, &song, &facts);
+    assert_eq!(view.next.icon, "star");
+    assert_eq!(
+        view.next.bars_detail.as_deref(),
+        Some("Repeats in 11 bars · infinite loop")
+    );
+
+    // A queued jump says when in time; the bars give way to it.
+    let mut snapshot = at_bar(2, 30);
+    snapshot.queued = Some(QueuedView {
+        target: 5,
+        target_label: "Tag".to_owned(),
+        kind: JumpKind::Jump,
+        executes_at: 0,
+        frames_until: 48_000,
+        deferrals: 0,
+    });
+    let view = PerformView::with_facts(&snapshot, &song, &facts);
+    assert_eq!(view.next.icon, "tag");
+    assert_eq!(view.next.kind, SectionKind::Tag);
+    assert_eq!(view.next.bars_detail, None);
+    assert_eq!(view.next.detail, "Executes in 1.0 s");
+
+    // The song's last section, then the end of the song.
+    let view = PerformView::with_facts(&at_bar(6, 50), &song, &facts);
+    assert_eq!(view.now.icon, "exit");
+    assert_eq!(view.now.bars_left.as_deref(), Some("5 bars left"));
+    assert_eq!(view.next.name, "End of song");
+    assert_eq!(view.next.icon, "flag");
+    assert_eq!(view.next.kind, SectionKind::Neutral);
+    assert_eq!(view.next.bars_detail.as_deref(), Some("Ends in 5 bars"));
+
+    // Bars that cannot be counted leave the time in seconds.
+    let view = PerformView::new(&at_bar(6, 50), &song);
+    assert_eq!(view.now.bars_left, None);
+    assert_eq!(view.next.bars_detail, None);
+    assert_eq!(view.now.detail, "10.0 s left");
+}
+
+#[test]
+fn the_song_header_shows_key_tempo_meter_and_the_arrangement_by_name() {
+    let song = bars_song();
+    let facts = SongFacts::from_manifest(&manifest(
+        Some("G"),
+        &[(0, 104.0), (BAR, 72.5)],
+        &[(0, 6, 8), (BAR, 4, 4)],
+    ))
+    .unwrap();
+    // The tempo and meter the song starts in.
+    let header = PerformView::with_facts(&snapshot(), &song, &facts).header;
+    assert_eq!(header.key.as_deref(), Some("G"));
+    assert_eq!(header.tempo.as_deref(), Some("104 BPM"));
+    assert_eq!(header.meter.as_deref(), Some("6/8"));
+    assert_eq!(header.arrangement, "Default");
+
+    let mut long = song.clone();
+    long.arrangement = "long".to_owned();
+    let facts = SongFacts::from_manifest(&manifest(None, &[(0, 72.5)], &[(0, 4, 4)])).unwrap();
+    let header = PerformView::with_facts(&snapshot(), &long, &facts).header;
+    assert_eq!(header.key, None);
+    assert_eq!(header.tempo.as_deref(), Some("72.5 BPM"));
+    assert_eq!(header.arrangement, "Long ending");
+
+    // Without the manifest: the arrangement's id, and nothing else.
+    let header = PerformView::new(&snapshot(), &song).header;
+    assert_eq!(header.key, None);
+    assert_eq!(header.tempo, None);
+    assert_eq!(header.meter, None);
+    assert_eq!(header.arrangement, "default");
+
+    // A click-only tile: its tempo and meter.
+    let header = PerformView::with_facts(&snapshot(), &song, &SongFacts::click(70.0, 6, 8)).header;
+    assert_eq!(header.key, None);
+    assert_eq!(header.tempo.as_deref(), Some("70 BPM"));
+    assert_eq!(header.meter.as_deref(), Some("6/8"));
+    assert_eq!(header.arrangement, "Default");
+
+    // A manifest that does not parse gives no facts.
+    assert_eq!(SongFacts::from_manifest("{"), None);
+}
+
+#[test]
+fn the_notes_say_why_the_songs_facts_are_missing() {
+    let unread = SongFacts {
+        unread: Some("Key, tempo and meter missing: song.json: gone. Trying again.".to_owned()),
+        ..SongFacts::default()
+    };
+    let view = PerformView::with_facts(&at_bar(1, 10), &bars_song(), &unread);
+    assert_eq!(view.status.facts_problem, unread.unread);
+    assert_eq!(
+        (view.header.key, view.header.tempo, view.header.meter),
+        (None, None, None)
+    );
+
+    // Facts that were read leave nothing to say.
+    let view = PerformView::with_facts(&at_bar(1, 10), &bars_song(), &bars_facts());
+    assert_eq!(view.status.facts_problem, None);
+}
+
+#[test]
+fn the_device_chip_names_the_device_its_outputs_buffer_and_latency() {
+    let mut snapshot = snapshot();
+    let device = PerformView::new(&snapshot, &song()).device;
+    assert_eq!(device.name, "Speakers");
+    assert_eq!(device.meta, "2 out · 256 · 5.3 ms");
+    assert_eq!(device.level, Level::Ok);
+
+    // Underruns show on it.
+    snapshot.underruns = 3;
+    let device = PerformView::new(&snapshot, &song()).device;
+    assert_eq!(device.meta, "2 out · 256 · 5.3 ms · 3 underruns");
+    assert_eq!(device.level, Level::Warning);
+    snapshot.underruns = 1;
+    let device = PerformView::new(&snapshot, &song()).device;
+    assert_eq!(device.meta, "2 out · 256 · 5.3 ms · 1 underrun");
+
+    // No device: it says so, and the status says why.
+    snapshot.device = DeviceStatus::Disconnected {
+        device: "Speakers".to_owned(),
+        reason: LossReason::Unplugged,
+        reopen_error: None,
+    };
+    let view = PerformView::new(&snapshot, &song());
+    assert_eq!(view.device.name, "Speakers");
+    assert_eq!(view.device.meta, "Disconnected");
+    assert_eq!(view.device.level, Level::Error);
+    assert!(view.status.device_problem.is_some());
+    snapshot.device = DeviceStatus::Disconnected {
+        device: "Speakers".to_owned(),
+        reason: LossReason::Reconfigured,
+        reopen_error: Some(OutputError::NoDevice),
+    };
+    let device = PerformView::new(&snapshot, &song()).device;
+    assert_eq!(device.meta, "Refuses the new settings");
+    assert_eq!(device.level, Level::Error);
+    snapshot.device = DeviceStatus::PlayerLost {
+        device: "Speakers".to_owned(),
+    };
+    let device = PerformView::new(&snapshot, &song()).device;
+    assert_eq!(device.meta, "Disconnected");
+    assert_eq!(device.level, Level::Error);
+}
+
+#[test]
+fn the_clock_gives_the_time_and_the_arrangement_length_apart() {
+    // 2.5 s into the arrangement, of 7 s; the Mixer header shows the same
+    // two without reading one text in two.
+    let view = PerformView::new(&snapshot(), &song());
+    assert_eq!(view.time, "00:02");
+    assert_eq!(view.total, "00:07");
+}
+
+#[test]
+fn the_clock_names_the_transport_state_only_while_it_changes() {
+    let mut snapshot = snapshot();
+    let expected = [
+        (TransportState::Stopped, None),
+        (TransportState::Starting, Some("Loading…")),
+        (TransportState::Playing, None),
+        (TransportState::Pausing, None),
+        (TransportState::Paused, None),
+        (TransportState::Stopping, Some("Stopping")),
+        (TransportState::Panicking, Some("Panic")),
+    ];
+    for (transport, note) in expected {
+        snapshot.transport = transport;
+        let view = PerformView::new(&snapshot, &song());
+        assert_eq!(view.transport.note.as_deref(), note, "{transport:?}");
+    }
+}
+
+#[test]
+fn pads_share_one_row_when_they_fit_and_get_compact_past_twelve() {
+    // 11 pads of at least 100 points and 8 between them fit in 1 180.
+    assert_eq!(
+        pad_grid(1_250.0, 11),
+        PadGrid {
+            columns: 11,
+            height: 100.0,
+            compact: false
+        }
+    );
+    // Fewer pads share the row's width.
+    assert_eq!(pad_grid(1_250.0, 8).columns, 8);
+    // A narrower row wraps them.
+    assert_eq!(pad_grid(700.0, 11).columns, 6);
+    // More than twelve: shorter pads of at least 92 points.
+    assert_eq!(
+        pad_grid(1_250.0, 14),
+        PadGrid {
+            columns: 12,
+            height: 46.0,
+            compact: true
+        }
+    );
+    // Always one column, even with no room or no pads.
+    assert_eq!(pad_grid(50.0, 3).columns, 1);
+    assert_eq!(pad_grid(1_250.0, 0).columns, 1);
 }

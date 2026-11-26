@@ -63,6 +63,7 @@ fn main() -> ExitCode {
     }
 
     Application::new().with_assets(theme::Icons).run(move |cx| {
+        theme::load_fonts(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();

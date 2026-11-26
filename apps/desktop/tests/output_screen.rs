@@ -6,10 +6,15 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use app::testing::FakeOutput;
-use app::{AudioOutput, OutputError, RuntimeError, SessionOptions};
+use app::{
+    AudioOutput, AudioRenderer, DeviceInfo, OutputCheck, OutputError, OutputRequest, OutputStream,
+    RuntimeError, SessionOptions, StreamHealth, StreamInfo,
+};
 use domain::{
     Arrangement, Bus, Destination, Routing, SectionMarker, SectionType, SongPackage, Stem,
     StemRole, TempoPoint, TimeSignaturePoint,
@@ -17,11 +22,16 @@ use domain::{
 use hound::{SampleFormat, WavSpec, WavWriter};
 use library::ConfigStore;
 use openvamp_desktop::audio_settings::AudioSettings;
-use openvamp_desktop::mixer::{MixerPage, restore_mix, unsaved_mix};
+use openvamp_desktop::hold::{PANIC_HOLD, PanicHold};
+use openvamp_desktop::mixer::{
+    BUS_SAVE_DELAY, MixerAction, MixerPage, bus_icon, restore_mix, unsaved_mix,
+};
 use openvamp_desktop::output_page::{
-    OutputAction, OutputPage, OutputScreen, click_cell, problem_notice,
+    APPLY_PATIENCE, DeviceState, OutputAction, OutputPage, OutputScreen, click_cell,
+    problem_notice, rate_note, refusal,
 };
 use openvamp_desktop::show::{Show, Source, replace};
+use openvamp_desktop::tick::{Drawn, Timed};
 
 const RATE: u32 = 8_000;
 
@@ -88,12 +98,70 @@ fn wait_disks(show: &Show) {
     }
 }
 
+/// [`FakeOutput`] as a device that opens buffers of another size than
+/// asked, as one that rounds or clamps the size does: every stream opened
+/// while `frames` is not 0 plays buffers of that many frames.
+struct Rounding {
+    fake: FakeOutput,
+    frames: Arc<AtomicU32>,
+}
+
+/// A stream of [`Rounding`]: the fake's, with the size it plays.
+struct Rounded {
+    stream: Box<dyn OutputStream>,
+    info: StreamInfo,
+}
+
+impl OutputStream for Rounded {
+    fn info(&self) -> &StreamInfo {
+        &self.info
+    }
+
+    fn health(&self) -> StreamHealth {
+        self.stream.health()
+    }
+}
+
+impl AudioOutput for Rounding {
+    fn devices(&self) -> Result<Vec<DeviceInfo>, OutputError> {
+        self.fake.devices()
+    }
+
+    fn check(&self, request: &OutputRequest) -> OutputCheck {
+        self.fake.check(request)
+    }
+
+    fn open(
+        &mut self,
+        request: &OutputRequest,
+        renderer: AudioRenderer,
+    ) -> Result<Box<dyn OutputStream>, OutputError> {
+        let stream = self.fake.open(request, renderer)?;
+        let mut info = stream.info().clone();
+        match self.frames.load(Ordering::SeqCst) {
+            0 => {}
+            frames => info.buffer_frames = frames,
+        }
+        Ok(Box::new(Rounded { stream, info }))
+    }
+}
+
 struct Bench {
     dir: tempfile::TempDir,
     fake: FakeOutput,
+    /// The size the device plays whatever it is asked ([`Rounding`]); 0
+    /// for the size asked.
+    rounds_to: Arc<AtomicU32>,
     show: Option<Show>,
     settings: AudioSettings,
     page: OutputPage,
+    /// The Mixer screen, for the bus changes a turn of the timer saves.
+    mixer: MixerPage,
+    /// The Panic control's hold, which a turn of the timer moves on.
+    hold: PanicHold,
+    /// The screen's clock: it stands still unless a test moves it on, so a
+    /// change waits for the device however slow the machine is.
+    clock: Instant,
 }
 
 impl Bench {
@@ -118,9 +186,13 @@ impl Bench {
         let mut bench = Self {
             dir,
             fake,
+            rounds_to: Arc::new(AtomicU32::new(0)),
             show: None,
             settings,
             page: OutputPage::new(),
+            mixer: MixerPage::new(),
+            hold: PanicHold::new(),
+            clock: Instant::now(),
         };
         bench.open();
         bench
@@ -135,15 +207,16 @@ impl Bench {
         self.page.set_devices(devices.clone());
         let options: SessionOptions = self.settings.options(&devices);
         let source = Source::Song(self.dir.path().join("Rivers Rise.song"));
-        let fake = self.fake.clone();
-        replace(
-            &mut self.show,
-            &source,
-            &options,
-            || Box::new(fake.clone()),
-            |_| {},
-        )
-        .unwrap_or_else(|_| panic!("the song opens"));
+        let output = || {
+            Box::new(Rounding {
+                fake: self.fake.clone(),
+                frames: Arc::clone(&self.rounds_to),
+            }) as Box<dyn AudioOutput>
+        };
+        replace(&mut self.show, &source, &options, output, |_| {})
+            .unwrap_or_else(|_| panic!("the song opens"));
+        // As the screen does once what played has closed.
+        self.page.song_closed();
     }
 
     /// Does `action`; reopens the song when the screen asks for it.
@@ -153,7 +226,7 @@ impl Bench {
         let unsaved = self.show.as_ref().and_then(unsaved_mix);
         let reopen = self
             .page
-            .act(action, self.show.as_mut(), &mut self.settings);
+            .act(action, self.show.as_mut(), &mut self.settings, self.clock);
         if reopen {
             self.open();
             if let (Some(show), Some(unsaved)) = (&mut self.show, &unsaved) {
@@ -186,9 +259,14 @@ impl Bench {
     /// by time, not by a count of callbacks, since the disk thread may be
     /// slow under load.
     fn settle(&mut self) {
+        self.run_until("a change never settled", |bench| !bench.view().applying);
+    }
+
+    /// [`Self::settle`] until `done`, else fails saying `never`.
+    fn run_until(&mut self, never: &str, done: impl Fn(&Self) -> bool) {
         let deadline = Instant::now() + WAIT;
-        while self.view().applying {
-            assert!(Instant::now() < deadline, "a change never settled");
+        while !done(self) {
+            assert!(Instant::now() < deadline, "{never}");
             if let Some(show) = &self.show {
                 wait_disks(show);
             }
@@ -196,8 +274,64 @@ impl Bench {
             if let Some(show) = &mut self.show {
                 show.poll();
             }
-            self.page.follow(self.show.as_mut(), &mut self.settings);
+            self.page
+                .follow(self.show.as_mut(), &mut self.settings, self.clock);
         }
+    }
+
+    /// The screen's clock moved on by `by`, and the screen polled once.
+    fn later(&mut self, by: Duration) {
+        self.clock += by;
+        if let Some(show) = &mut self.show {
+            show.poll();
+        }
+        self.page
+            .follow(self.show.as_mut(), &mut self.settings, self.clock);
+    }
+
+    /// A turn of the screen's timer, its clock moved on by `by`
+    /// ([`Timed::turn`]): whether the screen draws again.
+    fn turn(&mut self, by: Duration) -> bool {
+        self.clock += by;
+        Timed {
+            show: self.show.as_mut(),
+            hold: &mut self.hold,
+            mixer: &mut self.mixer,
+            output: &mut self.page,
+            settings: &mut self.settings,
+        }
+        .turn(self.clock)
+    }
+
+    /// Turns of the timer, the clock standing still, until one draws
+    /// nothing; bounded by time, since the disk thread may be slow under
+    /// load.
+    fn until_still(&mut self) {
+        let deadline = Instant::now() + WAIT;
+        while self.turn(Duration::ZERO) {
+            assert!(Instant::now() < deadline, "the screen never stood still");
+            if let Some(show) = &self.show {
+                wait_disks(show);
+            }
+        }
+    }
+
+    /// What the screens draw now that a turn can change ([`Drawn`]).
+    fn drawn(&self) -> Drawn {
+        Drawn::of(
+            self.show.as_ref().expect("a song is open"),
+            &self.mixer,
+            &self.page,
+        )
+    }
+
+    /// The session's last snapshot.
+    fn snapshot(&self) -> app::Snapshot {
+        self.show
+            .as_ref()
+            .expect("a song is open")
+            .snapshot()
+            .clone()
     }
 
     /// The routing saved for `device`, as the settings file holds it.
@@ -754,4 +888,469 @@ fn a_routing_for_more_outputs_than_the_device_now_has_plays_refitted_and_is_save
         Some(Routing::preset(8)),
         "saved as asked, for when the device has its eight outputs again"
     );
+}
+
+#[test]
+fn the_device_button_dot_says_whether_the_device_plays_the_song() {
+    let mut bench = Bench::on("fake:2");
+    assert_eq!(bench.view().device_state, DeviceState::Open);
+
+    bench.fake.unplug("fake:2");
+    bench.show.as_mut().unwrap().poll();
+
+    let view = bench.view();
+    assert_eq!(view.device_state, DeviceState::Lost);
+    assert_eq!(
+        view.device, "Interface · 8 outputs",
+        "the device it waits for"
+    );
+
+    bench.show = None;
+    assert_eq!(
+        bench.view().device_state,
+        DeviceState::Closed,
+        "nothing plays: no claim"
+    );
+}
+
+#[test]
+fn the_sample_rate_says_it_matches_the_song_only_while_one_plays() {
+    let mut bench = Bench::on("fake:2");
+
+    let view = bench.view();
+    assert_eq!(view.sample_rate, "8 kHz");
+    assert_eq!(view.sample_rate_note.as_deref(), Some("matches the song"));
+
+    bench.show = None;
+    let view = bench.view();
+    assert_eq!(view.sample_rate, "Set by the song that plays");
+    assert_eq!(view.sample_rate_note, None);
+}
+
+#[test]
+fn the_rate_note_compares_the_device_with_the_song() {
+    assert_eq!(rate_note(48_000, 48_000), "matches the song");
+    assert_eq!(rate_note(48_000, 44_100), "the song is 44.1 kHz");
+}
+
+#[test]
+fn each_matrix_row_carries_its_bus_icon_as_the_mixer_draws_it() {
+    let view = Bench::on("fake:2").view();
+
+    let icons: Vec<&str> = view.rows.iter().map(|row| row.icon).collect();
+    assert_eq!(
+        icons,
+        [
+            "headphones",
+            "drum",
+            "bass",
+            "piano",
+            "electric-guitar",
+            "mic"
+        ]
+    );
+    assert!(view.rows.iter().all(|row| row.icon == bus_icon(row.bus)));
+}
+
+const BUFFER_NOT_KEPT: &str = "The buffer size could not be changed: ";
+const ROUTING_NOT_KEPT: &str = "The routing could not be applied: ";
+
+/// The notices that start with `start`.
+fn notices_of<'a>(view: &'a OutputScreen, start: &str) -> Vec<&'a str> {
+    view.notices
+        .iter()
+        .map(String::as_str)
+        .filter(|notice| notice.starts_with(start))
+        .collect()
+}
+
+#[test]
+fn a_buffer_size_the_device_rounds_is_not_kept_and_says_what_it_plays() {
+    let mut bench = Bench::on("fake:2");
+    bench.play();
+    // From now on the interface plays buffers of 200 frames, whatever it
+    // is asked for.
+    bench.rounds_to.store(200, Ordering::SeqCst);
+
+    bench.act(OutputAction::Buffer(128));
+    bench.settle();
+
+    let view = bench.view();
+    assert_eq!(view.buffer, 200, "what the device plays");
+    assert_eq!(
+        notices_of(&view, BUFFER_NOT_KEPT),
+        [
+            "The buffer size could not be changed: audio device \"Interface\" plays buffers of 200 frames, not 128"
+        ]
+    );
+    assert_eq!(bench.settings.buffer_frames(), 256, "not kept");
+}
+
+#[test]
+fn a_buffer_size_the_device_clamps_to_the_size_it_played_is_not_kept_after_the_patience() {
+    let mut bench = Bench::on("fake:2");
+    bench.play();
+    // The interface plays 256 frames whatever it is asked for: the stream
+    // it opens again looks the same as the one before.
+    bench.rounds_to.store(256, Ordering::SeqCst);
+
+    bench.act(OutputAction::Buffer(128));
+    bench.run_until("the stream never opened again", |bench| {
+        bench.fake.opened().len() == 2
+    });
+    bench.later(APPLY_PATIENCE - Duration::from_millis(1));
+    assert!(bench.view().applying, "it may still be ramping out");
+    bench.later(Duration::from_millis(1));
+
+    let view = bench.view();
+    assert!(!view.applying);
+    assert_eq!(
+        notices_of(&view, BUFFER_NOT_KEPT),
+        [
+            "The buffer size could not be changed: audio device \"Interface\" plays buffers of 256 frames, not 128"
+        ]
+    );
+    assert_eq!(bench.settings.buffer_frames(), 256);
+}
+
+#[test]
+fn changes_waiting_when_the_device_is_unplugged_are_not_kept_and_say_why() {
+    // Saved on outputs 1/2 only, so the stream opens with two channels.
+    let mut bench = Bench::with_saved("fake:2", Some(Routing::stereo(8)));
+    bench.play();
+    bench.act(OutputAction::Reset);
+    bench.act(OutputAction::Buffer(512));
+    assert!(bench.view().applying);
+
+    bench.fake.unplug("fake:2");
+    bench.settle();
+
+    let view = bench.view();
+    let unplugged =
+        "audio device \"Interface\" was unplugged; playback is paused until it is plugged back in";
+    assert_eq!(
+        notices_of(&view, BUFFER_NOT_KEPT),
+        [format!("{BUFFER_NOT_KEPT}{unplugged}")]
+    );
+    assert_eq!(
+        notices_of(&view, ROUTING_NOT_KEPT),
+        [format!("{ROUTING_NOT_KEPT}{unplugged}")]
+    );
+    assert_eq!(bench.settings.buffer_frames(), 256);
+    assert_eq!(bench.stored("fake:2"), Some(Routing::stereo(8)));
+}
+
+#[test]
+fn changes_waiting_when_the_song_closes_are_not_kept_and_say_why() {
+    let mut bench = Bench::with_saved("fake:2", Some(Routing::stereo(8)));
+    bench.play();
+    bench.act(OutputAction::Reset);
+    bench.act(OutputAction::Buffer(512));
+    assert!(bench.view().applying);
+
+    bench.show = None;
+    bench.page.follow(None, &mut bench.settings, bench.clock);
+
+    let view = bench.view();
+    assert!(!view.applying);
+    let closed = "the song closed before audio device \"Interface\" opened with it";
+    assert_eq!(
+        notices_of(&view, BUFFER_NOT_KEPT),
+        [format!("{BUFFER_NOT_KEPT}{closed}")]
+    );
+    assert_eq!(
+        notices_of(&view, ROUTING_NOT_KEPT),
+        [format!("{ROUTING_NOT_KEPT}{closed}")]
+    );
+    assert_eq!(bench.settings.buffer_frames(), 256);
+    assert_eq!(bench.stored("fake:2"), Some(Routing::stereo(8)));
+}
+
+#[test]
+fn a_buffer_size_set_while_an_earlier_refusal_holds_the_device_is_kept_once_it_opens_with_it() {
+    let mut bench = Bench::on("fake:2");
+    bench.fake.set_buffer_range("fake:2", Some((256, 256)));
+    bench.act(OutputAction::Buffer(128));
+    assert_eq!(notices_of(&bench.view(), BUFFER_NOT_KEPT).len(), 1);
+    bench.fake.set_buffer_range("fake:2", None);
+
+    // The session opens the held device with it on its next try.
+    bench.act(OutputAction::Buffer(512));
+    assert!(bench.view().applying, "that hold is not its refusal");
+    bench.settle();
+
+    let view = bench.view();
+    assert_eq!((view.buffer, bench.settings.buffer_frames()), (512, 512));
+    assert_eq!(view.notices, Vec::<String>::new());
+}
+
+#[test]
+fn a_buffer_size_set_while_an_earlier_refusal_holds_the_device_is_not_kept_when_it_keeps_refusing()
+{
+    let mut bench = Bench::on("fake:2");
+    bench.fake.set_buffer_range("fake:2", Some((256, 256)));
+    bench.act(OutputAction::Buffer(128));
+    let attempts = bench.fake.open_attempts();
+
+    bench.act(OutputAction::Buffer(64));
+    assert!(bench.view().applying, "that hold is not its refusal");
+    bench.run_until("the session never tried the device again", |bench| {
+        bench.fake.open_attempts() > attempts
+    });
+    bench.later(APPLY_PATIENCE - Duration::from_millis(1));
+    assert!(bench.view().applying);
+    bench.later(Duration::from_millis(1));
+
+    let view = bench.view();
+    assert!(!view.applying);
+    assert_eq!(
+        notices_of(&view, BUFFER_NOT_KEPT),
+        [
+            "The buffer size could not be changed: audio device \"Interface\" cannot use a buffer of 64 frames; it supports 256 to 256"
+        ]
+    );
+    assert_eq!(bench.settings.buffer_frames(), 256);
+}
+
+#[test]
+fn a_routing_waiting_when_another_device_is_chosen_is_not_saved_for_the_device_it_left() {
+    let mut bench = Bench::with_saved("fake:2", Some(Routing::stereo(8)));
+    bench.play();
+    bench.act(OutputAction::Reset);
+    assert!(bench.view().applying);
+
+    bench.act(OutputAction::ChooseDevice(0));
+    bench.settle();
+
+    assert_eq!(bench.view().device, "Laptop · 2 outputs");
+    assert_eq!(bench.stored("fake:2"), Some(Routing::stereo(8)));
+    assert_eq!(bench.stored("fake:1"), None);
+    assert_eq!(
+        notices_of(&bench.view(), ROUTING_NOT_KEPT),
+        [
+            "The routing could not be applied: the song closed before audio device \"Interface\" opened with it"
+        ]
+    );
+}
+
+#[test]
+fn a_routing_waiting_when_another_device_is_chosen_is_not_blamed_on_the_new_device() {
+    let mut bench = Bench::with_saved("fake:2", Some(Routing::stereo(8)));
+    bench.play();
+    bench.act(OutputAction::Reset);
+    bench.act(OutputAction::ChooseDevice(0));
+    // The laptop then refuses a buffer size: its hold is not the routing's.
+    bench.fake.set_buffer_range("fake:1", Some((256, 256)));
+
+    bench.act(OutputAction::Buffer(128));
+
+    let view = bench.view();
+    assert_eq!(
+        notices_of(&view, BUFFER_NOT_KEPT).len(),
+        1,
+        "{:?}",
+        view.notices
+    );
+    let routing = notices_of(&view, ROUTING_NOT_KEPT);
+    assert!(
+        routing.iter().all(|notice| !notice.contains("Laptop")),
+        "{routing:?}"
+    );
+    assert_eq!(bench.stored("fake:2"), Some(Routing::stereo(8)));
+}
+
+#[test]
+fn a_full_queue_is_no_refusal_of_a_buffer_size_or_a_routing() {
+    // The session still takes the change from its next polls; both
+    // setters' answers read the same way.
+    let full = RuntimeError::QueueFull {
+        command: "SetRouting".to_owned(),
+    };
+    assert_eq!(refusal(Err(full)), None);
+    assert_eq!(refusal(Ok(())), None);
+    let size = RuntimeError::BufferSize { frames: 32 };
+    assert_eq!(refusal(Err(size.clone())), Some(size));
+}
+
+#[test]
+fn a_routing_given_while_the_device_is_unplugged_is_saved_and_plays_once_it_is_back() {
+    let mut bench = Bench::with_saved("fake:2", Some(Routing::stereo(8)));
+    bench.fake.unplug("fake:2");
+    bench.show.as_mut().unwrap().poll();
+
+    // The session opens the device with it, fitted to its outputs, when it
+    // is back: nothing to wait for.
+    bench.act(OutputAction::Reset);
+
+    let view = bench.view();
+    assert!(!view.applying);
+    assert_eq!(view.notices, Vec::<String>::new());
+    assert_eq!(bench.stored("fake:2"), Some(Routing::preset(8)));
+    bench.fake.plug("fake:2");
+    bench.run_until("the device never played again", |bench| {
+        bench.view().device_state == DeviceState::Open
+    });
+    assert_eq!(bench.routing(), Routing::preset(8));
+    assert_eq!(
+        bench.fake.opened().last().map(|request| request.channels),
+        Some(8)
+    );
+}
+
+/// Asks the interface, which plays 256 frames whatever it is asked for,
+/// for 128 with the song stopped: the stream opens again at once and looks
+/// the same as the one before, so only [`APPLY_PATIENCE`] settles the
+/// change, and the session shows nothing new when it does.
+fn clamped_buffer_waiting() -> Bench {
+    let mut bench = Bench::on("fake:2");
+    bench.rounds_to.store(256, Ordering::SeqCst);
+    bench.act(OutputAction::Buffer(128));
+    bench.until_still();
+    assert!(bench.view().applying, "the change waits for its patience");
+    bench
+}
+
+#[test]
+fn what_the_screens_draw_changes_when_a_waiting_change_settles_though_the_session_shows_the_same() {
+    let mut bench = clamped_buffer_waiting();
+    let (snapshot, before) = (bench.snapshot(), bench.drawn());
+    assert_eq!(bench.drawn(), before, "nothing changed, nothing to draw");
+
+    bench.later(APPLY_PATIENCE);
+
+    assert_eq!(bench.snapshot(), snapshot);
+    assert!(!bench.view().applying);
+    assert_ne!(bench.drawn(), before);
+}
+
+#[test]
+fn a_change_its_patience_alone_settles_draws_the_screen_again() {
+    let mut bench = clamped_buffer_waiting();
+    let snapshot = bench.snapshot();
+    assert!(
+        !bench.turn(APPLY_PATIENCE - Duration::from_millis(1)),
+        "it may still be ramping out: nothing new to draw"
+    );
+
+    assert!(
+        bench.turn(Duration::from_millis(1)),
+        "the screen draws the verdict"
+    );
+    assert_eq!(bench.snapshot(), snapshot, "the session shows the same");
+    let view = bench.view();
+    assert!(!view.applying);
+    assert_eq!(
+        notices_of(&view, BUFFER_NOT_KEPT),
+        [
+            "The buffer size could not be changed: audio device \"Interface\" plays buffers of 256 frames, not 128"
+        ]
+    );
+    assert!(!bench.turn(Duration::ZERO), "and nothing after it");
+}
+
+/// The song open with settings that cannot be written, after a bus change
+/// waiting to be saved.
+fn bus_change_waiting_unsavable() -> Bench {
+    let mut bench = Bench::on("fake:2");
+    let blocked = bench.dir.path().join("blocked");
+    fs::write(&blocked, "a file, not a folder").unwrap();
+    bench.settings = AudioSettings::load(Some(ConfigStore::new(blocked.join("config"))));
+    let show = bench.show.as_mut().expect("a song is open");
+    bench.mixer.act(
+        MixerAction::BusFader {
+            bus: Bus::Drums,
+            position: 0.3,
+        },
+        show,
+        bench.clock,
+    );
+    bench.until_still();
+    assert!(bench.mixer.buses_waiting());
+    bench
+}
+
+#[test]
+fn what_the_screens_draw_changes_when_bus_changes_stop_waiting_though_the_session_shows_the_same() {
+    let mut bench = bus_change_waiting_unsavable();
+    let (snapshot, before) = (bench.snapshot(), bench.drawn());
+
+    let show = bench.show.as_mut().expect("a song is open");
+    bench
+        .mixer
+        .tick(show, &mut bench.settings, bench.clock + BUS_SAVE_DELAY);
+
+    assert_eq!(bench.snapshot(), snapshot, "the session still has them");
+    assert!(!bench.mixer.buses_waiting());
+    assert_ne!(bench.drawn(), before);
+}
+
+#[test]
+fn bus_changes_that_could_not_be_saved_once_they_settled_draw_the_screen_again() {
+    let mut bench = bus_change_waiting_unsavable();
+    let snapshot = bench.snapshot();
+
+    assert!(bench.turn(BUS_SAVE_DELAY), "the screen says why");
+    assert_eq!(bench.snapshot(), snapshot);
+    let show = bench.show.as_ref().expect("a song is open");
+    let notices = bench
+        .mixer
+        .view(Some(show))
+        .expect("a song is open")
+        .notices;
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|notice| notice.starts_with("The bus levels could not be saved: "))
+            .count(),
+        1,
+        "{notices:?}"
+    );
+    assert!(!bench.turn(Duration::ZERO));
+}
+
+#[test]
+fn a_still_screen_draws_nothing_however_long_it_waits() {
+    let mut bench = Bench::on("fake:2");
+    bench.until_still();
+
+    assert!(!bench.turn(Duration::from_secs(60)));
+}
+
+#[test]
+fn a_playing_song_draws_on_every_turn() {
+    let mut bench = Bench::on("fake:2");
+    bench.play();
+
+    assert!(bench.turn(Duration::ZERO));
+    assert!(bench.turn(Duration::ZERO));
+}
+
+#[test]
+fn a_hold_of_panic_draws_on_every_turn_while_it_counts_with_or_without_a_song() {
+    let mut bench = Bench::on("fake:2");
+    bench.until_still();
+    bench.hold.press(bench.clock);
+    assert!(bench.turn(PANIC_HOLD / 4), "the fill grows");
+    assert!(bench.turn(PANIC_HOLD / 4), "the fill grows");
+    bench.hold.cancel();
+    assert!(!bench.turn(PANIC_HOLD / 4), "no hold, nothing to draw");
+
+    // With no song open, as the screen starts.
+    let mut mixer = MixerPage::new();
+    let mut turn = |hold: &mut PanicHold, now| {
+        Timed {
+            show: None,
+            hold,
+            mixer: &mut mixer,
+            output: &mut bench.page,
+            settings: &mut bench.settings,
+        }
+        .turn(now)
+    };
+    let now = Instant::now();
+    let mut hold = PanicHold::new();
+    hold.press(now);
+    assert!(turn(&mut hold, now + PANIC_HOLD / 4), "the fill grows");
+    hold.cancel();
+    assert!(!turn(&mut hold, now + PANIC_HOLD / 2));
 }

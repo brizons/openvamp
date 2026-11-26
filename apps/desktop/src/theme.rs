@@ -158,28 +158,75 @@ pub fn faded(color: Rgba, alpha: f32) -> Rgba {
     Rgba { a: alpha, ..color }
 }
 
-/// Monospace family for times, counts and keys; the system UI font is
-/// used for everything else (the canvas's Barlow and JetBrains Mono are not
-/// bundled).
-pub const MONO: &str = if cfg!(target_os = "macos") {
-    "Menlo"
-} else if cfg!(target_os = "windows") {
-    "Consolas"
-} else {
-    "DejaVu Sans Mono"
-};
+/// The design canvas's UI font, for every text not named otherwise.
+pub const UI: &str = "Barlow";
 
-/// The icons, by the path [`gpui::svg`] asks for.
+/// The canvas's condensed font, for strip, pad and stem labels and M/S.
+pub const CONDENSED: &str = "Barlow Semi Condensed";
+
+/// The canvas's monospace font, for times, dB, counts and meta lines.
+pub const MONO: &str = "JetBrains Mono";
+
+/// The fonts the app carries (SIL Open Font License, each with its
+/// license file in `assets/fonts`), loaded at startup ([`load_fonts`]).
+const FONTS: &[&[u8]] = &[
+    include_bytes!("../assets/fonts/Barlow-Regular.ttf"),
+    include_bytes!("../assets/fonts/Barlow-Medium.ttf"),
+    include_bytes!("../assets/fonts/Barlow-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/Barlow-Bold.ttf"),
+    include_bytes!("../assets/fonts/BarlowSemiCondensed-Medium.ttf"),
+    include_bytes!("../assets/fonts/BarlowSemiCondensed-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/BarlowSemiCondensed-Bold.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMono[wght].ttf"),
+];
+
+/// Gives GPUI the fonts the app carries; a font it refuses leaves its
+/// texts in the system font.
+pub fn load_fonts(cx: &mut gpui::App) {
+    let fonts = FONTS.iter().map(|font| Cow::Borrowed(*font)).collect();
+    if let Err(error) = cx.text_system().add_fonts(fonts) {
+        eprintln!("warning: the app's fonts could not be loaded: {error}");
+    }
+}
+
+/// The icons, by the path [`gpui::svg`] asks for ([`icon_path`]).
 pub struct Icons;
 
+/// The path [`Icons`] carries the icon `name` at (a file of `assets/icons`
+/// without `.svg`).
+pub fn icon_path(name: &str) -> SharedString {
+    SharedString::from(format!("icons/{name}.svg"))
+}
+
 const ICONS: &[(&str, &[u8])] = &[
+    (
+        "icons/acoustic-guitar.svg",
+        include_bytes!("../assets/icons/acoustic-guitar.svg"),
+    ),
+    (
+        "icons/arrangement.svg",
+        include_bytes!("../assets/icons/arrangement.svg"),
+    ),
+    (
+        "icons/arrow-right.svg",
+        include_bytes!("../assets/icons/arrow-right.svg"),
+    ),
     (
         "icons/back-to-start.svg",
         include_bytes!("../assets/icons/back-to-start.svg"),
     ),
+    ("icons/bass.svg", include_bytes!("../assets/icons/bass.svg")),
+    (
+        "icons/bridge.svg",
+        include_bytes!("../assets/icons/bridge.svg"),
+    ),
     (
         "icons/check.svg",
         include_bytes!("../assets/icons/check.svg"),
+    ),
+    (
+        "icons/clock.svg",
+        include_bytes!("../assets/icons/clock.svg"),
     ),
     (
         "icons/close.svg",
@@ -196,12 +243,27 @@ const ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/device.svg"),
     ),
     ("icons/down.svg", include_bytes!("../assets/icons/down.svg")),
+    ("icons/drum.svg", include_bytes!("../assets/icons/drum.svg")),
+    (
+        "icons/electric-guitar.svg",
+        include_bytes!("../assets/icons/electric-guitar.svg"),
+    ),
+    (
+        "icons/enter.svg",
+        include_bytes!("../assets/icons/enter.svg"),
+    ),
+    ("icons/exit.svg", include_bytes!("../assets/icons/exit.svg")),
     ("icons/fade.svg", include_bytes!("../assets/icons/fade.svg")),
+    ("icons/flag.svg", include_bytes!("../assets/icons/flag.svg")),
     (
         "icons/folder.svg",
         include_bytes!("../assets/icons/folder.svg"),
     ),
     ("icons/grip.svg", include_bytes!("../assets/icons/grip.svg")),
+    (
+        "icons/headphones.svg",
+        include_bytes!("../assets/icons/headphones.svg"),
+    ),
     (
         "icons/infinite.svg",
         include_bytes!("../assets/icons/infinite.svg"),
@@ -211,12 +273,21 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/library.svg",
         include_bytes!("../assets/icons/library.svg"),
     ),
+    (
+        "icons/lines.svg",
+        include_bytes!("../assets/icons/lines.svg"),
+    ),
     ("icons/link.svg", include_bytes!("../assets/icons/link.svg")),
     ("icons/loop.svg", include_bytes!("../assets/icons/loop.svg")),
+    (
+        "icons/maraca.svg",
+        include_bytes!("../assets/icons/maraca.svg"),
+    ),
     (
         "icons/metronome.svg",
         include_bytes!("../assets/icons/metronome.svg"),
     ),
+    ("icons/mic.svg", include_bytes!("../assets/icons/mic.svg")),
     (
         "icons/minus.svg",
         include_bytes!("../assets/icons/minus.svg"),
@@ -225,6 +296,7 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/mixer.svg",
         include_bytes!("../assets/icons/mixer.svg"),
     ),
+    ("icons/mute.svg", include_bytes!("../assets/icons/mute.svg")),
     ("icons/next.svg", include_bytes!("../assets/icons/next.svg")),
     (
         "icons/next-bar.svg",
@@ -244,6 +316,10 @@ const ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/output.svg"),
     ),
     (
+        "icons/output-ports.svg",
+        include_bytes!("../assets/icons/output-ports.svg"),
+    ),
+    (
         "icons/panic.svg",
         include_bytes!("../assets/icons/panic.svg"),
     ),
@@ -259,11 +335,24 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/perform.svg",
         include_bytes!("../assets/icons/perform.svg"),
     ),
+    (
+        "icons/piano.svg",
+        include_bytes!("../assets/icons/piano.svg"),
+    ),
     ("icons/play.svg", include_bytes!("../assets/icons/play.svg")),
     ("icons/plus.svg", include_bytes!("../assets/icons/plus.svg")),
     (
         "icons/previous.svg",
         include_bytes!("../assets/icons/previous.svg"),
+    ),
+    (
+        "icons/reset.svg",
+        include_bytes!("../assets/icons/reset.svg"),
+    ),
+    ("icons/rise.svg", include_bytes!("../assets/icons/rise.svg")),
+    (
+        "icons/routing.svg",
+        include_bytes!("../assets/icons/routing.svg"),
     ),
     (
         "icons/search.svg",
@@ -277,13 +366,46 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/setlist.svg",
         include_bytes!("../assets/icons/setlist.svg"),
     ),
+    ("icons/sine.svg", include_bytes!("../assets/icons/sine.svg")),
+    (
+        "icons/sliders.svg",
+        include_bytes!("../assets/icons/sliders.svg"),
+    ),
+    (
+        "icons/sparkle.svg",
+        include_bytes!("../assets/icons/sparkle.svg"),
+    ),
+    (
+        "icons/speaker.svg",
+        include_bytes!("../assets/icons/speaker.svg"),
+    ),
+    (
+        "icons/speech.svg",
+        include_bytes!("../assets/icons/speech.svg"),
+    ),
+    ("icons/star.svg", include_bytes!("../assets/icons/star.svg")),
     ("icons/stay.svg", include_bytes!("../assets/icons/stay.svg")),
+    (
+        "icons/stems.svg",
+        include_bytes!("../assets/icons/stems.svg"),
+    ),
     ("icons/stop.svg", include_bytes!("../assets/icons/stop.svg")),
+    ("icons/tag.svg", include_bytes!("../assets/icons/tag.svg")),
     (
         "icons/trash.svg",
         include_bytes!("../assets/icons/trash.svg"),
     ),
+    ("icons/turn.svg", include_bytes!("../assets/icons/turn.svg")),
     ("icons/up.svg", include_bytes!("../assets/icons/up.svg")),
+    (
+        "icons/violin.svg",
+        include_bytes!("../assets/icons/violin.svg"),
+    ),
+    (
+        "icons/voices.svg",
+        include_bytes!("../assets/icons/voices.svg"),
+    ),
+    ("icons/wave.svg", include_bytes!("../assets/icons/wave.svg")),
 ];
 
 impl AssetSource for Icons {
@@ -300,5 +422,24 @@ impl AssetSource for Icons {
             .filter(|(name, _)| name.starts_with(path))
             .map(|(name, _)| SharedString::from(*name))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::AssetSource;
+    use openvamp_desktop::{mixer, view};
+
+    use super::{Icons, icon_path};
+
+    #[test]
+    fn every_icon_a_stem_bus_or_section_can_name_is_registered() {
+        for name in mixer::strip_icons().chain(view::section_icons()) {
+            let path = icon_path(name);
+            assert!(
+                Icons.load(&path).unwrap().is_some(),
+                "{path} is not in ICONS"
+            );
+        }
     }
 }

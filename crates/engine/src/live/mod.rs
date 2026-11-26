@@ -52,6 +52,7 @@
 //! stop, panic, mixer gains, routing) ramps per frame.
 
 mod deck;
+mod meters;
 mod player;
 mod ramp;
 mod source;
@@ -63,6 +64,7 @@ use std::fmt;
 use domain::DEFAULT_SEAM_CROSSFADE;
 
 pub use deck::{BlendStatus, Deck, DeckController, DeckError, DeckFull, DeckStatus, Handoff};
+pub use meters::{MAX_METERED_STEMS, METER_WINDOW_MILLISECONDS, Meters};
 pub use player::Player;
 pub use source::{MemorySource, StemSource, memory_sources};
 pub use status::{ClickSource, FadeState, FadeStatus, JumpKind, QueuedJump, Status, Transport};

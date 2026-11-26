@@ -381,3 +381,73 @@ fn a_32_channel_deck_allocates_nothing_through_a_crossfade_with_routing_changes(
     assert!(blended, "the crossfade ran");
     assert_eq!(deck.status().item, 2);
 }
+
+#[test]
+fn meters_on_32_channels_with_more_stems_than_they_follow_allocate_nothing() {
+    use common::{SongSpec, mono};
+    use domain::{Destination, SectionType};
+    use engine::live::{Gain, MAX_METERED_STEMS, Routes};
+
+    let frames = 96_000;
+    let count = MAX_METERED_STEMS + 6;
+    let ids: Vec<&'static str> = (0..count)
+        .map(|i| &*Box::leak(format!("pad{i}").into_boxed_str()))
+        .collect();
+    let song = SongSpec::new(
+        48_000,
+        frames as u64,
+        vec![("verse", SectionType::Verse, 0)],
+        ids.iter().map(|&id| (id, StemRole::Track)).collect(),
+    )
+    .build();
+    let stems = ids
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| mono(id, StemRole::Track, noise(i as u64, frames)))
+        .collect();
+    let channels = 32;
+    let (mut player, mut controller) = Player::new(
+        &song,
+        "default",
+        &MixSettings::default(),
+        &PlayerConfig {
+            channels,
+            ..PlayerConfig::new(48_000, 256)
+        },
+        memory_sources(stems).unwrap(),
+    )
+    .unwrap();
+    let mut spread = Routes::STEREO;
+    spread.buses[3] = Destination::Stereo {
+        left: 31,
+        right: 32,
+    };
+    let script = [
+        (0, Command::Play),
+        (
+            20,
+            Command::SetStemGain {
+                stem: 70,
+                gain: Gain::new(0.5),
+            },
+        ),
+        (40, Command::SetRouting(spread)),
+        (100, Command::Pause),
+        (140, Command::Play),
+    ];
+    let mut output = vec![0.0f32; usize::from(channels) * 256];
+    let mut allocations = 0;
+    let mut heard = 0.0f32;
+    for call in 0..300 {
+        for &(_, command) in script.iter().filter(|(at, _)| *at == call) {
+            controller.send(command).unwrap();
+        }
+        COUNT.with(|count| count.set(Some(0)));
+        player.process(&mut output);
+        let meters = player.status().meters;
+        allocations += COUNT.with(|count| count.replace(None)).unwrap_or(0);
+        heard = heard.max(meters.master[0]);
+    }
+    assert_eq!(allocations, 0, "the meters allocated or freed memory");
+    assert!(heard > 0.0, "the meters read the stems");
+}

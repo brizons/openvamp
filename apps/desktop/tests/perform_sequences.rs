@@ -18,7 +18,7 @@ use domain::{
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
 use openvamp_desktop::action::{UiAction, command_for};
-use openvamp_desktop::view::{Level, PerformView, SectionKind};
+use openvamp_desktop::view::{PerformView, SectionKind};
 
 const RATE: u32 = 8_000;
 const BAR: u64 = 2 * RATE as u64;
@@ -332,10 +332,9 @@ fn device_lost_then_reopen_refused_then_back() {
     shell.fake.unplug(FAKE_DEVICE_ID);
     shell.snapshot = shell.session.poll();
     let view = shell.view();
-    assert_eq!(view.status.device_level, Level::Error);
     assert_eq!(
-        view.status.device,
-        "No device: \"Fake Output\" (the device was unplugged)"
+        view.status.device_problem.as_deref(),
+        Some("No device: \"Fake Output\" (the device was unplugged)")
     );
     assert_eq!(view.transport.state, "Paused");
     assert_eq!(view.transport.play_label, "Play");
@@ -354,18 +353,12 @@ fn device_lost_then_reopen_refused_then_back() {
     std::thread::sleep(Duration::from_millis(5));
     shell.snapshot = shell.session.poll();
     let view = shell.view();
+    let problem = view.status.device_problem.clone().unwrap_or_default();
     assert!(
-        view.status
-            .device
-            .starts_with("No device: \"Fake Output\" (cannot open it again: "),
-        "{}",
-        view.status.device
+        problem.starts_with("No device: \"Fake Output\" (cannot open it again: "),
+        "{problem}"
     );
-    assert!(
-        view.status.device.contains("8000 Hz"),
-        "{}",
-        view.status.device
-    );
+    assert!(problem.contains("8000 Hz"), "{problem}");
     assert!(
         view.status
             .last_error
@@ -380,7 +373,7 @@ fn device_lost_then_reopen_refused_then_back() {
     std::thread::sleep(Duration::from_millis(5));
     shell.snapshot = shell.session.poll();
     let view = shell.view();
-    assert_eq!(view.status.device_level, Level::Ok);
+    assert_eq!(view.status.device_problem, None);
     assert_eq!(view.status.last_error, None);
     assert_eq!(view.transport.state, "Paused");
     shell.play();
@@ -412,8 +405,8 @@ fn a_decode_failure_shows_as_the_last_problem() {
     let view = shell.view();
     let error = view.status.last_error.clone().expect("a problem shows");
     assert!(error.contains("could not decode"), "{error}");
-    // Device status stays fine: the problem is in the last-problem line.
-    assert_eq!(view.status.device_level, Level::Ok);
+    // The device stays fine: the problem is in the last-problem line.
+    assert_eq!(view.status.device_problem, None);
     // A jump waiting and cancelled falls back to the decode failure.
     shell.act(UiAction::QueueSection(0));
     shell.act(UiAction::CancelJump);
