@@ -9,9 +9,13 @@
 //! The retry rule: a read that fails is not kept for good. While its song
 //! is on show, the folder is read again [`RETRY_AFTER`] after it failed,
 //! and every folder is read again when a song or setlist opens
-//! ([`FactsCache::forget`]). Meanwhile the notes say why ([`unread_note`]).
-//! A folder is never read twice at once, so a volume that does not answer
-//! holds up one background thread per folder at most.
+//! ([`FactsCache::forget`]). Meanwhile the notes say why ([`unread_note`]),
+//! unless an earlier read gave facts: a re-read that fails keeps them. A
+//! read that has not come back after [`READ_TIMEOUT`] counts as failed, so
+//! a volume that does not answer is tried again too. A folder is read once
+//! at a time until then, and never by more than [`MAX_READS_OUT`] reads, so
+//! a volume that never answers holds up that many background threads per
+//! folder at most; whichever read comes back last decides what shows.
 
 use std::collections::HashMap;
 use std::fs;
@@ -25,6 +29,13 @@ use crate::view::SongFacts;
 /// How long a folder whose read failed waits before it is read again.
 pub const RETRY_AFTER: Duration = Duration::from_secs(5);
 
+/// How long a read may take before it counts as failed.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most reads of one folder under way at once: one, and a retry after
+/// it timed out.
+pub const MAX_READS_OUT: usize = 2;
+
 /// What the reads of song folders gave, by folder.
 #[derive(Debug, Default)]
 pub struct FactsCache {
@@ -34,21 +45,17 @@ pub struct FactsCache {
 /// One song folder's reads.
 #[derive(Debug, Default)]
 struct Entry {
-    /// What the last read that came back gave; `None` before one does.
-    last: Option<Outcome>,
-    /// A read is under way.
-    reading: bool,
+    /// What the last read that gave facts gave.
+    facts: Option<SongFacts>,
+    /// Why the last read failed ([`unread_note`]), and when; `None` once
+    /// one gives facts.
+    failed: Option<(String, Instant)>,
+    /// When the read under way started, until it comes back or times out.
+    reading: Option<Instant>,
+    /// Reads started that have not come back, timed out ones included.
+    out: usize,
     /// A song or setlist opened since the last read came back.
     stale: bool,
-}
-
-/// What a read gave.
-#[derive(Debug)]
-enum Outcome {
-    /// The facts.
-    Read(SongFacts),
-    /// Why it failed ([`unread_note`]), and when.
-    Failed { note: String, at: Instant },
 }
 
 impl FactsCache {
@@ -59,56 +66,65 @@ impl FactsCache {
 
     /// Whether to start a read of `folder` at `now`: it was never read, a
     /// song or setlist opened since, or its last read failed at least
-    /// [`RETRY_AFTER`] ago; never while a read of it is under way. When it
-    /// says so, the read counts as under way until [`Self::finish`].
+    /// [`RETRY_AFTER`] ago. Never while a read of it is under way: one that
+    /// started [`READ_TIMEOUT`] ago or more fails at `now` instead
+    /// ([`timeout_reason`]), and is waited for no longer; and never while
+    /// [`MAX_READS_OUT`] reads of it have not come back. When it says so,
+    /// the read counts as under way until [`Self::finish`].
     pub fn start_read(&mut self, folder: &Path, now: Instant) -> bool {
-        let wanted = self.folders.get(folder).is_none_or(|entry| {
-            !entry.reading
-                && (entry.stale
-                    || match &entry.last {
-                        None => true,
-                        Some(Outcome::Read(_)) => false,
-                        Some(Outcome::Failed { at, .. }) => {
-                            now.saturating_duration_since(*at) >= RETRY_AFTER
-                        }
-                    })
-        });
+        let entry = self.folders.entry(folder.to_owned()).or_default();
+        if let Some(started) = entry.reading {
+            if now.saturating_duration_since(started) < READ_TIMEOUT {
+                return false;
+            }
+            entry.reading = None;
+            entry.fail(&timeout_reason(), now);
+        }
+        let wanted = entry.out < MAX_READS_OUT
+            && (entry.stale
+                || match &entry.failed {
+                    Some((_, at)) => now.saturating_duration_since(*at) >= RETRY_AFTER,
+                    None => entry.facts.is_none(),
+                });
         if wanted {
-            self.folders.entry(folder.to_owned()).or_default().reading = true;
+            entry.reading = Some(now);
+            entry.out += 1;
         }
         wanted
     }
 
-    /// The read of `folder` came back at `now` with `read`: the facts, or
-    /// why there are none ([`read`]). Its facts replace what it had.
+    /// A read of `folder` came back at `now` with `read`: the facts, which
+    /// replace what it had, or why there are none ([`read`]), which keeps
+    /// the facts an earlier read gave.
     pub fn finish(&mut self, folder: PathBuf, read: Result<SongFacts, String>, now: Instant) {
         let entry = self.folders.entry(folder).or_default();
-        entry.reading = false;
-        entry.stale = false;
-        entry.last = Some(match read {
-            Ok(facts) => Outcome::Read(facts),
-            Err(reason) => Outcome::Failed {
-                note: unread_note(&reason),
-                at: now,
-            },
-        });
+        entry.reading = None;
+        entry.out = entry.out.saturating_sub(1);
+        match read {
+            Ok(facts) => {
+                entry.stale = false;
+                entry.facts = Some(facts);
+                entry.failed = None;
+            }
+            Err(reason) => entry.fail(&reason, now),
+        }
     }
 
-    /// What to show for `folder`: what its last read gave, and while it
-    /// failed, no facts and why ([`SongFacts::unread`]); nothing before a
-    /// read comes back. A read under way shows what the last one gave.
+    /// What to show for `folder`: the facts its last read that gave any
+    /// gave; with none, while its reads fail, no facts and why
+    /// ([`SongFacts::unread`]); nothing before a read comes back. A read
+    /// under way shows what the last one gave.
     pub fn facts(&self, folder: &Path) -> SongFacts {
-        match self
-            .folders
-            .get(folder)
-            .and_then(|entry| entry.last.as_ref())
-        {
-            Some(Outcome::Read(facts)) => facts.clone(),
-            Some(Outcome::Failed { note, .. }) => SongFacts {
+        let Some(entry) = self.folders.get(folder) else {
+            return SongFacts::default();
+        };
+        match (&entry.facts, &entry.failed) {
+            (Some(facts), _) => facts.clone(),
+            (None, Some((note, _))) => SongFacts {
                 unread: Some(note.clone()),
                 ..SongFacts::default()
             },
-            None => SongFacts::default(),
+            (None, None) => SongFacts::default(),
         }
     }
 
@@ -120,6 +136,24 @@ impl FactsCache {
             entry.stale = true;
         }
     }
+}
+
+impl Entry {
+    /// A read failed at `now` for `reason`: the retry rule applies from
+    /// `now`, and the facts an earlier read gave stay.
+    fn fail(&mut self, reason: &str, now: Instant) {
+        self.stale = false;
+        self.failed = Some((unread_note(reason), now));
+    }
+}
+
+/// Why a read that has not come back after [`READ_TIMEOUT`] failed: "song.json:
+/// the drive did not answer within 5 seconds".
+pub fn timeout_reason() -> String {
+    format!(
+        "{MANIFEST_FILE}: the drive did not answer within {} seconds",
+        READ_TIMEOUT.as_secs()
+    )
 }
 
 /// The facts of the song folder `folder`, from its `song.json`, or why

@@ -29,11 +29,18 @@
 //!   deck's state: no allocation, no lock, no I/O.
 //! - The **disk threads** belong to the streamed songs (`library`): the
 //!   current item's and the next one's.
+//! - A **load thread** opens each song item a setlist prepares ahead or
+//!   selects, so reading its `song.json` and opening its stems never holds
+//!   up the control thread; the control thread picks the item up when it
+//!   polls ([`SetlistSession`], "Loading"). Opening a song or a setlist
+//!   ([`Session::prepare`], [`SetlistSession::prepare`]) still reads on
+//!   the thread that calls it: a shell calls it off its UI thread.
 //!
-//! A player is only ever dropped on the control thread: a closed stream's
-//! renderer hands the deck back instead of dropping it, and the deck hands
-//! back every player it no longer needs, because dropping one joins
-//! the disk thread.
+//! A player is never dropped on the audio thread, because dropping one
+//! joins the disk thread: a closed stream's renderer hands the deck back
+//! instead of dropping it, and the deck hands back every player it no
+//! longer needs, to the control thread. A player whose load was no longer
+//! wanted when it finished is dropped on its load thread.
 //!
 //! # Rules the session adds to the engine
 //!
@@ -66,6 +73,7 @@
 
 mod error;
 mod item;
+mod loader;
 mod meter;
 mod mixer;
 mod output;
@@ -88,8 +96,8 @@ pub use output::{
 };
 pub use renderer::AudioRenderer;
 pub use session::{
-    Command, DeviceStatus, FadeView, MixerView, PreparedSong, QueuedView, Session, SessionOptions,
-    Snapshot, TransportState,
+    Command, DeviceStatus, FadeView, MixerView, OpenGate, PreparedSong, QueuedView, Session,
+    SessionOptions, Snapshot, TransportState,
 };
 pub use setlist::{
     BlendView, CLICK_ONLY_SAMPLE_RATE, ItemInfo, PreparedSetlist, RateFallback, SetlistCommand,

@@ -3,6 +3,11 @@
 //! same care as a song in place of a song ([`crate::song::replace`]): the
 //! pick and the device are checked before what plays stops, and the device
 //! opens only once the old show has closed it.
+//!
+//! Preparing a pick reads its files ([`Source::prepare`]), which a slow,
+//! sleeping or unplugged volume can hold up for seconds, so the screen runs
+//! it on its background executor while what plays goes on, Panic
+//! included, and then hands the result to [`replace_prepared`].
 
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
@@ -106,11 +111,17 @@ impl Source {
 
     /// Checks and prepares the show with no device ([`Session::prepare`],
     /// [`SetlistSession::prepare`]); a setlist also lists the library's
-    /// songs to name its items.
-    fn prepare(&self, options: &SessionOptions) -> Result<Prepared, OpenFailure> {
+    /// songs to name its items. It reads the song folder or the setlist and
+    /// its first song, so it waits for the volume: the screen runs it off
+    /// its UI thread.
+    pub fn prepare(&self, options: &SessionOptions) -> Result<Prepared, OpenFailure> {
+        self.prepare_show(options).map(Prepared)
+    }
+
+    fn prepare_show(&self, options: &SessionOptions) -> Result<PreparedShow, OpenFailure> {
         match self {
             Self::Song(dir) => Session::prepare(dir, options.clone())
-                .map(|prepared| Prepared::Song(dir.clone(), Box::new(prepared)))
+                .map(|prepared| PreparedShow::Song(dir.clone(), Box::new(prepared)))
                 .map_err(OpenFailure::Song),
             Self::Setlist { library, file } => {
                 // Kept canonical, so comparing it with the Library
@@ -138,7 +149,7 @@ impl Source {
                 let prepared =
                     SetlistSession::prepare(&Library::new(&library), &file, options.clone())
                         .map_err(OpenFailure::Setlist)?;
-                Ok(Prepared::Setlist {
+                Ok(PreparedShow::Setlist {
                     library,
                     file,
                     prepared: Box::new(prepared),
@@ -181,8 +192,13 @@ impl OpenFailure {
     }
 }
 
+/// A show checked and loaded with no device ([`Source::prepare`]), ready
+/// to take the place of what plays ([`replace_prepared`]). It can move to
+/// another thread.
+pub struct Prepared(PreparedShow);
+
 /// A show checked with no device.
-enum Prepared {
+enum PreparedShow {
     Song(PathBuf, Box<PreparedSong>),
     Setlist {
         library: PathBuf,
@@ -193,6 +209,16 @@ enum Prepared {
 }
 
 impl Prepared {
+    fn check(&self, output: &dyn AudioOutput) -> OutputCheck {
+        self.0.check(output)
+    }
+
+    fn start(self, output: Box<dyn AudioOutput>) -> Result<Show, OpenError> {
+        self.0.start(output)
+    }
+}
+
+impl PreparedShow {
     fn check(&self, output: &dyn AudioOutput) -> OutputCheck {
         match self {
             Self::Song(_, prepared) => prepared.check(output),
@@ -628,6 +654,13 @@ pub struct Replaced {
 }
 
 impl Replaced {
+    /// The show to open again: the previous one, when the pick's device did
+    /// not start ([`reopen_previous`]).
+    pub fn to_reopen(&self) -> Option<&Source> {
+        self.start_error.as_ref()?;
+        self.previous.as_ref().map(|(_, source)| source)
+    }
+
     /// What to show and report, one line each; empty when the previous show
     /// stopped with its ramp and the pick opened.
     pub fn problems(&self) -> Vec<String> {
@@ -678,7 +711,27 @@ pub fn replace(
     sleep: impl FnMut(Duration),
 ) -> Result<Replaced, OpenFailure> {
     let prepared = source.prepare(options)?;
-    let device = output();
+    let mut replaced = replace_prepared(current, source, prepared, output(), sleep)?;
+    if let Some(previous) = replaced.to_reopen().cloned() {
+        let prepared = previous.prepare(options);
+        reopen_previous(current, &mut replaced, prepared, output);
+    }
+    Ok(replaced)
+}
+
+/// [`replace`] once `source` has prepared ([`Source::prepare`]), with
+/// `device` to open: the device is asked first, and a device that refuses
+/// leaves `current` playing; then `current` stops with its ramp and closes
+/// its device, and the pick opens `device`. When that fails, nothing plays
+/// and [`Replaced::to_reopen`] names the previous show, for the caller to
+/// prepare again and hand to [`reopen_previous`].
+pub fn replace_prepared(
+    current: &mut Option<Show>,
+    source: &Source,
+    prepared: Prepared,
+    device: Box<dyn AudioOutput>,
+    sleep: impl FnMut(Duration),
+) -> Result<Replaced, OpenFailure> {
     if let OutputCheck::Refused(error) = prepared.check(device.as_ref()) {
         return Err(failure(source, error.into()));
     }
@@ -694,21 +747,32 @@ pub fn replace(
     };
     match prepared.start(device) {
         Ok(show) => *current = Some(show),
-        Err(error) => {
-            replaced.start_error = Some(error);
-            if let Some((_, previous)) = &replaced.previous {
-                match previous.prepare(options).and_then(|prepared| {
-                    prepared
-                        .start(output())
-                        .map_err(|error| failure(previous, error))
-                }) {
-                    Ok(show) => *current = Some(show),
-                    Err(error) => replaced.reopen_error = Some(error),
-                }
-            }
-        }
+        Err(error) => replaced.start_error = Some(error),
     }
     Ok(replaced)
+}
+
+/// Opens the previous show again, stopped at the start, after the pick's
+/// device did not start ([`Replaced::to_reopen`]): `prepared` is its
+/// preparation, and `output` gives the device. Why it could not goes to
+/// [`Replaced::reopen_error`].
+pub fn reopen_previous(
+    current: &mut Option<Show>,
+    replaced: &mut Replaced,
+    prepared: Result<Prepared, OpenFailure>,
+    output: impl FnOnce() -> Box<dyn AudioOutput>,
+) {
+    let Some(previous) = replaced.to_reopen().cloned() else {
+        return;
+    };
+    match prepared.and_then(|prepared| {
+        prepared
+            .start(output())
+            .map_err(|error| failure(&previous, error))
+    }) {
+        Ok(show) => *current = Some(show),
+        Err(error) => replaced.reopen_error = Some(error),
+    }
 }
 
 /// `error` from opening `source`'s device.

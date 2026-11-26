@@ -4,10 +4,12 @@
 
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use app::testing::FakeOutput;
-use app::{AudioOutput, SessionOptions};
+use app::{AudioOutput, OpenGate, SessionOptions, TransportState};
 use domain::{
     Arrangement, ClickItem, SectionMarker, SectionType, Setlist, SetlistItem, SongItem,
     SongPackage, Stem, StemRole, TempoPoint, TimeSignature, TimeSignaturePoint, Transition,
@@ -17,7 +19,7 @@ use library::Library;
 use openvamp_desktop::action::UiAction;
 use openvamp_desktop::library_page::{LibraryAction, LibraryPage};
 use openvamp_desktop::reorder::Half;
-use openvamp_desktop::show::{LoadedSetlist, Show, Source, replace};
+use openvamp_desktop::show::{LoadedSetlist, Show, Source, replace, replace_prepared};
 use openvamp_desktop::strip::ItemState;
 use openvamp_desktop::view::PerformView;
 
@@ -906,4 +908,111 @@ fn an_order_of_other_items_than_the_setlist_holds_is_refused() {
         songs_on_disk(dir.path(), &loaded.file),
         ["Songs/Two.song", "Songs/Three.song", "Songs/One.song"]
     );
+}
+
+/// How many opens a [`held_open`] gate holds right now, and whether it was
+/// released; with the condition it signals.
+type Valve = Arc<(Mutex<(usize, bool)>, Condvar)>;
+
+/// Holds every open of a song folder ending in `held`, as a volume that does
+/// not answer would, until the returned flag is set (at most ten seconds);
+/// the count says how many opens are held right now.
+fn held_open(held: &'static str) -> (OpenGate, Valve) {
+    let valve = Arc::new((Mutex::new((0, false)), Condvar::new()));
+    let state = Arc::clone(&valve);
+    let gate: OpenGate = Arc::new(move |dir: &Path| {
+        if !dir.ends_with(held) {
+            return;
+        }
+        let (lock, changed) = &*state;
+        let mut valve = lock.lock().unwrap();
+        valve.0 += 1;
+        changed.notify_all();
+        let (mut valve, _) = changed
+            .wait_timeout_while(valve, Duration::from_secs(10), |valve| !valve.1)
+            .unwrap();
+        valve.0 -= 1;
+    });
+    (gate, valve)
+}
+
+#[test]
+fn a_pick_prepares_away_from_the_screen_while_the_show_plays_on_and_takes_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path();
+    write_song(&library.join("Songs/One.song"), "First", 8_000);
+    write_song(&library.join("Songs/Two.song"), "Second", 8_000);
+    let fake = FakeOutput::new();
+    let mut current = None;
+    replace(
+        &mut current,
+        &Source::Song(library.join("Songs/One.song")),
+        &SessionOptions::default(),
+        output(&fake),
+        |_| {},
+    )
+    .unwrap();
+    let show = current.as_mut().unwrap();
+    show.send(UiAction::TogglePlay);
+    for _ in 0..1_000 {
+        if show.snapshot().transport == TransportState::Playing {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+        fake.render(256);
+        show.poll();
+    }
+    assert_eq!(show.snapshot().transport, TransportState::Playing);
+
+    // A setlist is picked whose first song's volume does not answer: it
+    // prepares on another thread, as the screen prepares it on its
+    // background executor.
+    let pick = save_setlist(library, "Sunday", vec![song("Songs/Two.song")]);
+    let (gate, valve) = held_open("Two.song");
+    let options = SessionOptions {
+        open_gate: Some(gate),
+        ..SessionOptions::default()
+    };
+    let preparing = thread::spawn({
+        let pick = pick.clone();
+        move || pick.prepare(&options)
+    });
+    {
+        let (lock, changed) = &*valve;
+        let held = changed
+            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(10), |v| v.0 == 0)
+            .unwrap()
+            .0;
+        assert_eq!(held.0, 1, "the pick's read is held");
+    }
+
+    // Meanwhile what plays polls and takes Panic at once.
+    let started = Instant::now();
+    show.send(UiAction::Panic);
+    for _ in 0..40 {
+        fake.render(256);
+        show.poll();
+    }
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(show.snapshot().transport, TransportState::Stopped);
+    assert_eq!(show.song().title, "First");
+    assert_eq!(valve.0.lock().unwrap().0, 1, "the read still hangs");
+
+    // The read comes back: the pick takes the place of what played.
+    valve.0.lock().unwrap().1 = true;
+    valve.1.notify_all();
+    let prepared = preparing.join().unwrap().expect("the setlist prepares");
+    let replaced = replace_prepared(
+        &mut current,
+        &pick,
+        prepared,
+        Box::new(fake.clone()),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(replaced.problems(), Vec::<String>::new());
+    assert_eq!(replaced.previous.as_ref().unwrap().0.title, "First");
+    let show = current.as_mut().unwrap();
+    assert_eq!(show.song().title, "Second");
+    assert_eq!(setlist_view(show).name, "Sunday");
 }

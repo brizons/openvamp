@@ -3,6 +3,7 @@
 
 use std::mem;
 use std::path::Path;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,11 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 /// longer than the longest ramp, a panic's.
 const REOPEN_PATIENCE: Duration = Duration::from_secs(2);
 
+/// A test and diagnostics hook called with each song folder just before it
+/// is opened, on the thread that opens it ([`SessionOptions::open_gate`]):
+/// returning late stages a slow, sleeping or hanging volume.
+pub type OpenGate = Arc<dyn Fn(&Path) + Send + Sync>;
+
 /// How a session opens; [`Default`] gives the usual values.
 #[derive(Clone)]
 pub struct SessionOptions {
@@ -65,6 +71,9 @@ pub struct SessionOptions {
     /// Test and diagnostics hook passed to the disk thread; see
     /// [`library::Gate`]. Default: `None`.
     pub disk_gate: Option<Gate>,
+    /// Test and diagnostics hook called with each song folder before it is
+    /// opened; see [`OpenGate`]. Default: `None`.
+    pub open_gate: Option<OpenGate>,
     /// Where each bus plays (F8.2-F8.4): the device's saved routing
     /// (`library::ConfigStore::load_routing`) or [`Routing::preset`] for its
     /// outputs; `None` for plain stereo on outputs 1 and 2, exactly what
@@ -97,6 +106,7 @@ impl Default for SessionOptions {
             start_timeout: Duration::from_secs(5),
             reconnect_interval: Duration::from_millis(500),
             disk_gate: None,
+            open_gate: None,
             routing: None,
             bus_settings: BusSettings::new(),
         }

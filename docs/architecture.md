@@ -104,6 +104,7 @@ Song + Arrangement + Settings ──compile()──▶ RenderPlan
 |--------|------|---------------|
 | Audio (OS callback) | Renders the current plan: mix, click, guide, routing | Reads per-stem ring buffers (`rtrb`); publishes state through `triple_buffer` |
 | Disk | Decodes stems ahead of the playhead and prefetches jump targets | Writes the ring buffers |
+| Load | Opens a setlist's next song item (its `song.json` and stems) and builds its player, one thread per load, so a slow, sleeping or unplugged volume never holds up the control thread | Leaves the item for the control thread's next poll to pick up |
 | Control | Runs use cases, compiles plans, handles MIDI input | Sends commands to the audio thread over a lock-free queue |
 | UI | Platform shell (SwiftUI, Compose or GPUI); draws state snapshots | Calls the `app` API; polls snapshots at about 30 Hz |
 
