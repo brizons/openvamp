@@ -1,7 +1,10 @@
 //! Song package I/O for the multitrack player.
 //!
-//! [`load_song`] reads a song folder (`song.json` plus WAV stems), validates it
-//! with the `domain` crate, and decodes every stem to `f32` for the engine.
+//! [`load_song`] reads a song folder (`song.json` plus WAV or FLAC stems),
+//! validates it with the `domain` crate, and decodes every stem to `f32` for
+//! the engine. A stem's format comes from its file's first bytes, and a FLAC
+//! stem decodes to the same samples as the same audio in a WAV stem of its
+//! bit depth.
 //! [`open_streaming`] checks the same folder but streams the stems from disk
 //! for the live player, with memory that does not grow with song length.
 //! [`write_wav_stereo_f32`] writes a rendered mix. A [`Library`] keeps the
@@ -39,7 +42,10 @@ use engine::StemAudio;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use thiserror::Error;
 
+use decode::{FlacStem, starts_as_flac};
+
 mod config;
+mod decode;
 mod mix_store;
 mod setlist_order;
 mod setlist_songs;
@@ -52,6 +58,7 @@ pub use config::{
     BUS_SETTINGS_FILE, ConfigStore, LoadedBusSettings, LoadedRouting, Platform, ROUTING_FILE,
     config_folder,
 };
+pub use decode::DecodeError;
 pub use mix_store::{MIX_FILE, SongMix, read_mix, write_mix};
 pub use setlist_songs::{SetlistSongs, SongUnavailable};
 pub use setlists::{
@@ -133,7 +140,7 @@ pub enum LoadError {
         /// Stem file, as in the manifest.
         file: String,
         /// The decoder error.
-        source: hound::Error,
+        source: DecodeError,
     },
     /// The thread that streams the stems could not be started.
     #[error("cannot start the disk thread: {source}")]
@@ -158,7 +165,7 @@ pub enum SongProblem {
         /// Stem file, as in the manifest.
         file: String,
     },
-    /// The stem file is missing or is not a readable WAV file.
+    /// The stem file is missing or is not a readable WAV or FLAC file.
     #[error("stem \"{id}\" file \"{file}\" cannot be read: {reason}")]
     StemUnreadable {
         /// Stem id.
@@ -178,6 +185,16 @@ pub enum SongProblem {
         /// Stem file, as in the manifest.
         file: String,
         /// The format found, such as "8-bit integer, 1 channel".
+        format: String,
+    },
+    /// The stem is a FLAC file with more channels than the player plays.
+    #[error("stem \"{id}\" file \"{file}\" is {format}; supported FLAC stems are mono or stereo")]
+    UnsupportedFlacFormat {
+        /// Stem id.
+        id: String,
+        /// Stem file, as in the manifest.
+        file: String,
+        /// The format found, such as "24-bit FLAC, 6 channels".
         format: String,
     },
 }
@@ -268,8 +285,8 @@ fn open_package_json(
             Ok(Some(opened)) => {
                 infos.push(StemInfo {
                     id: stem.id.clone(),
-                    sample_rate: opened.reader.spec().sample_rate,
-                    length_samples: u64::from(opened.reader.duration()),
+                    sample_rate: opened.sample_rate(),
+                    length_samples: opened.frames(),
                 });
                 readers.push(Some(opened));
             }
@@ -301,13 +318,36 @@ fn open_package_json(
 type StemReader = WavReader<BufReader<File>>;
 
 /// A stem file that passed every check, open for decoding.
-struct OpenedStem {
-    reader: StemReader,
-    /// Most samples the file can hold, from its size on disk.
-    max_samples: u64,
+enum OpenedStem {
+    /// A WAV file.
+    Wav {
+        reader: StemReader,
+        /// Most samples the file can hold, from its size on disk.
+        max_samples: u64,
+    },
+    /// A FLAC file.
+    Flac(Box<FlacStem>),
 }
 
-/// Opens the stem's WAV file after these checks, in order:
+impl OpenedStem {
+    /// Frames per second, from the header.
+    fn sample_rate(&self) -> u32 {
+        match self {
+            Self::Wav { reader, .. } => reader.spec().sample_rate,
+            Self::Flac(flac) => flac.sample_rate(),
+        }
+    }
+
+    /// Length in frames, from the header.
+    fn frames(&self) -> u64 {
+        match self {
+            Self::Wav { reader, .. } => u64::from(reader.duration()),
+            Self::Flac(flac) => flac.frames(),
+        }
+    }
+}
+
+/// Opens the stem's WAV or FLAC file after these checks, in order:
 ///
 /// 1. Its path is relative with no `..` component, as this platform reads
 ///    paths. Nothing on disk is touched before this check; a path that fails
@@ -315,7 +355,8 @@ struct OpenedStem {
 /// 2. It resolves, symlinks included, inside `folder` (already canonical).
 /// 3. It is a regular file, so opening it cannot block (a FIFO would).
 ///
-/// Then the file is opened and its format checked.
+/// Then the file is opened and its format checked: a file that starts with
+/// the FLAC marker is read as FLAC, any other as WAV.
 fn open_stem(folder: &Path, stem: &Stem) -> Result<Option<OpenedStem>, SongProblem> {
     if !is_plain_relative(&stem.file) {
         return Ok(None);
@@ -335,8 +376,12 @@ fn open_stem(folder: &Path, stem: &Stem) -> Result<Option<OpenedStem>, SongProbl
         }
         Err(error) => return Err(unreadable(error.to_string())),
     };
-    let (file, opened) =
+    let (mut file, opened) =
         open_regular_file(&resolved).map_err(|error| unreadable(error.to_string()))?;
+    if starts_as_flac(&mut file).map_err(|error| unreadable(error.to_string()))? {
+        return FlacStem::open(stem, file, opened.len())
+            .map(|flac| Some(OpenedStem::Flac(Box::new(flac))));
+    }
     let reader =
         WavReader::new(BufReader::new(file)).map_err(|error| unreadable(error.to_string()))?;
     let spec = reader.spec();
@@ -352,7 +397,7 @@ fn open_stem(folder: &Path, stem: &Stem) -> Result<Option<OpenedStem>, SongProbl
         });
     }
     let bytes_per_sample = u64::from(spec.bits_per_sample.div_ceil(8));
-    Ok(Some(OpenedStem {
+    Ok(Some(OpenedStem::Wav {
         reader,
         max_samples: opened.len() / bytes_per_sample,
     }))
@@ -547,24 +592,29 @@ fn problem_stem(problem: &SongProblem) -> Option<&str> {
     match problem {
         SongProblem::StemOutsideFolder { id, .. }
         | SongProblem::StemUnreadable { id, .. }
-        | SongProblem::UnsupportedStemFormat { id, .. } => Some(id),
+        | SongProblem::UnsupportedStemFormat { id, .. }
+        | SongProblem::UnsupportedFlacFormat { id, .. } => Some(id),
         SongProblem::Validation(_) => None,
     }
 }
 
-/// Decodes a supported WAV stem to interleaved `f32`: integer samples are
-/// divided by `2^(bits - 1)`, float samples are kept as they are.
+/// Decodes a supported stem to interleaved `f32`. For WAV, integer samples
+/// are divided by `2^(bits - 1)`, float samples are kept as they are; a FLAC
+/// stem converts as a WAV stem of its bit depth ([`FlacStem::decode_all`]).
 fn decode(stem: &Stem, opened: OpenedStem) -> Result<StemAudio, LoadError> {
-    let OpenedStem {
-        mut reader,
-        max_samples,
-    } = opened;
+    let (mut reader, max_samples) = match opened {
+        OpenedStem::Wav {
+            reader,
+            max_samples,
+        } => (reader, max_samples),
+        OpenedStem::Flac(flac) => return flac.decode_all(stem),
+    };
     let spec = reader.spec();
     let frames = u64::from(reader.duration());
-    let decode_error = |source| LoadError::Decode {
+    let decode_error = |source: hound::Error| LoadError::Decode {
         id: stem.id.clone(),
         file: stem.file.clone(),
-        source,
+        source: source.into(),
     };
     // A header can claim more samples than its file holds: reserve no more
     // than the file can contain, and fail cleanly if even that does not fit.

@@ -8,7 +8,7 @@ render-cli <SONG_DIR> --output <FILE> [--arrangement <ID>] [--no-click]
 
 | Flag | Meaning |
 |------|---------|
-| `<SONG_DIR>` | Song folder: `song.json` plus the WAV stems it lists (16-, 24-, or 32-bit integer or 32-bit float, mono or stereo). |
+| `<SONG_DIR>` | Song folder: `song.json` plus the stems it lists, mono or stereo: WAV (16-, 24-, or 32-bit integer or 32-bit float) or FLAC (4- to 32-bit). A stem's format comes from its first bytes, not its extension. |
 | `--output <FILE>` | WAV file to write, at the song sample rate. |
 | `--arrangement <ID>` | Arrangement to render. Default: `default`. |
 | `--no-click` | Do not generate the click. A recorded `click` stem still plays. |

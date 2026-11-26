@@ -13,7 +13,7 @@ Requirements quote `docs/mvp-spec.md` (F1) and the user verbatim. Items marked *
 - Architecture: "Lossy files become FLAC for exact seeking" (`docs/architecture.md`, Decision 6).
 - **Assumption:** WAV and FLAC files the player can read are copied unchanged. MP3 and M4A are decoded and written as 24-bit FLAC. Encoder delay and padding are trimmed when the file records them (gapless), so every stem starts on the same sample.
 - **Assumption:** a folder import takes every audio file in the folder and its subfolders. It skips hidden files and folders, and `__MACOSX` in a ZIP, and ignores files that are not audio. A source with no audio file is refused.
-- **Assumption:** an audio file the player cannot use is refused with its file name and the reason, and nothing is written. This covers more than two channels, and a sample format the player does not read (for example 8-bit or 64-bit float WAV).
+- **Assumption (rewritten in L5):** a WAV or FLAC file the player cannot read as-is (for example an 8-bit or 64-bit float WAV, or a FLAC that starts with an ID3 tag) is decoded and written as FLAC like a lossy file. A file with more than two channels, or one nothing can decode, is refused with its file name and the reason, and nothing is written. Every stem the import writes is opened with the player's own reader before the package is finished.
 - **Assumption:** ZIP entries are never written under their own names. Each stem is written as `stems/<id>.wav` or `stems/<id>.flac`, with an id the import chooses. An entry named like `../x` therefore cannot write outside the song folder.
 - Acceptance (F1): "Importing 24 stems of 5 minutes produces a playable package on the reference hardware." The reference hardware is still an open decision, so the time is measured on the development Mac and logged.
 
@@ -66,7 +66,7 @@ Requirements quote `docs/mvp-spec.md` (F1) and the user verbatim. Items marked *
 | ID | Specs | Route | Status | Commits |
 |----|-------|-------|--------|---------|
 | T1 | S2 | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L4) | see L4 |
-| T2 | S6 | delegated (parallel unit with T1, disjoint surface `crates/library` decoding, `Cargo.toml`, `Cargo.lock`) | in progress (L3) | |
+| T2 | S6 | delegated (parallel unit with T1, disjoint surface `crates/library` decoding, `Cargo.toml`, `Cargo.lock`) | done (L5); independent verifier pending | see L5 |
 | T3 | S1, S3, S4, S5 (library side) | delegated (context backstop); needs T1 and T2 | pending | |
 | T4 | S7 | delegated (context backstop); needs T3 | pending | |
 | T5 | S8 | inline, with each task's own docs | pending | |
@@ -99,3 +99,20 @@ Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` an
     - GREEN: `cargo test -p domain` passes 152 tests; `cargo fmt -p domain -- --check` is clean. The parent re-ran both.
     - Differential: 36,894 names gave the same `bus_for_name` and `bus_for_stem` on the base and on this change. A mutant copy, used as a control, gave 225 differences.
   - Open point, decided by the parent for T3: a stem overridden to `other` stores `"other"`, which is no table word, so `bus_for_stem` falls back to the file name. `EG 1.wav` set to Other would therefore stay on Guitars. T3 makes `bus_for_stem` read `Part::from_id` first; only a stored `"other"` changes, because every other part id already reads back as its own part.
+- **L5** (2026-11-26): T2 delivered.
+  - **Dependencies:** `symphonia` 0.6.1 (`default-features = false`, `["flac"]`) and `flacenc` 0.5.1 (a dev-dependency for now). All new crates are MPL-2.0, Apache-2.0, MIT or MIT OR Apache-2.0.
+  - **Reading:** `crates/library/src/decode.rs` adds `DecodeError` and `starts_as_flac`, which detects FLAC from its first bytes. `decode/flac.rs` adds `FlacStem`, which reuses the WAV `int_scale(bits)`, so a FLAC stem decodes bit-identical to hound's WAV.
+  - **Errors:** `OpenedStem` is now a WAV/FLAC enum, `LoadError::Decode.source` is a `DecodeError`, and `SongProblem::UnsupportedFlacFormat` is new. Nothing outside the library matches these exhaustively.
+  - **Streaming:** `disk.rs` streams both formats. A damaged FLAC frame is an error and never shifts the stem.
+  - **Checks:**
+    - RED: 8 tests failed before the change.
+    - GREEN: `cargo test -p library` passes 133 tests (2 ignored); `cargo fmt -p library -- --check` is clean. The parent re-ran both.
+    - The writer also ran `cargo test -p app`, `cargo test -p engine --test live_allocations` and `cargo check --workspace --all-targets`, all clean.
+    - Differential against bc999ea through render-cli: identical output bytes, stderr and exit codes, for the demo song and for missing, garbage and truncated WAV stems.
+  - **Seek timing:** 2–3 ms (debug build) for a seek in a 5-minute, 24-bit stereo FLAC with no SEEKTABLE, so the import needs no SEEKTABLE.
+  - **Findings for T3:**
+    1. flacenc 0.5.1 writes files symphonia rejects unless `stream.stream_info_mut().set_block_sizes(block, block)` is called before writing. The test helper `write_flac` does this.
+    2. A FLAC that starts with an ID3 tag is read as WAV and fails.
+    3. A STREAMINFO with no length is refused.
+  - **S1 assumption rewritten:** a WAV or FLAC file the player cannot read as-is (for example an 8-bit or 64-bit float WAV, or a FLAC with an ID3 tag) is decoded and written as FLAC like a lossy file, instead of being refused. Only more than two channels is refused. Every stem the import writes is opened with the player's own reader before the package is finished.
+  - Risk: item 3 (`LoadError::Decode`'s source type and a new public `SongProblem` variant) and item 5 (new dependencies), so T2 gets an independent verifier.
