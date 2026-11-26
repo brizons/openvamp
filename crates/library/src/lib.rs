@@ -15,6 +15,10 @@
 //! [`domain::Setlist::validate`] can report the ones the library lacks while
 //! the rest of the setlist stays usable. [`Library::list_songs`] lists every
 //! song folder in the library, from the manifest and stem headers only.
+//! [`read_mix`] and [`write_mix`] keep a song's mix in the [`MIX_FILE`]
+//! beside its `song.json`, with the rules the [settings files](SettingsError)
+//! share. A [`ConfigStore`] keeps the global bus settings and the routing of
+//! every device in the app's configuration folder ([`config_folder`]).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -23,7 +27,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process;
 
@@ -35,18 +39,27 @@ use engine::StemAudio;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use thiserror::Error;
 
+mod config;
+mod mix_store;
 mod setlist_order;
 mod setlist_songs;
 mod setlists;
+mod settings;
 mod songs;
 mod stream;
 
+pub use config::{
+    BUS_SETTINGS_FILE, ConfigStore, LoadedBusSettings, LoadedRouting, Platform, ROUTING_FILE,
+    config_folder,
+};
+pub use mix_store::{MIX_FILE, SongMix, read_mix, write_mix};
 pub use setlist_songs::{SetlistSongs, SongUnavailable};
 pub use setlists::{
     Library, MAX_SETLIST_FILE_BYTES, SETLIST_EXTENSION, SETLIST_ORDER_FILE,
     SETLIST_ORDER_FORMAT_VERSION, SETLISTS_FOLDER, SetlistEntry, SetlistError, SetlistListing,
     TrashFn, UnreadableSetlist, move_to_trash,
 };
+pub use settings::{MAX_SETTINGS_FILE_BYTES, SettingsError};
 pub use songs::{ArrangementEntry, PositionEntry, SongEntry, SongListing, UnreadableSong};
 pub use stream::{DiskMonitor, Gate, StreamCapacity, StreamConfig, StreamingSong, open_streaming};
 
@@ -394,6 +407,69 @@ fn open_regular_file(path: &Path) -> Result<(File, fs::Metadata), OpenFileError>
         return Err(OpenFileError::Changed);
     }
     Ok((file, opened))
+}
+
+/// Why [`read_confined`] did not read a file.
+#[derive(Debug)]
+enum ConfinedReadError {
+    /// The file resolves, through symlinks or otherwise, outside the folder.
+    Outside,
+    /// The file is a folder, FIFO, device or anything but a regular file; it
+    /// was not opened.
+    NotAFile,
+    /// The file holds more bytes than the limit.
+    TooLarge,
+    /// The file was read but is not UTF-8 text.
+    NotUtf8,
+    /// The file could not be resolved, opened or read as UTF-8.
+    Io(io::Error),
+}
+
+/// Reads the file `file` inside `folder` (canonical) as text: it must
+/// resolve inside `folder`, symlinks included, be a regular file (a FIFO is
+/// refused without being opened) and hold at most `max_bytes`. Setlists, the
+/// setlist order, `mix.json` and the configuration files are all read this
+/// way.
+fn read_confined(folder: &Path, file: &str, max_bytes: u64) -> Result<String, ConfinedReadError> {
+    let resolved = match resolve_inside(folder, file) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => return Err(ConfinedReadError::Outside),
+        Err(error) => return Err(ConfinedReadError::Io(error)),
+    };
+    let (opened, metadata) = open_regular_file(&resolved).map_err(|error| match error {
+        OpenFileError::NotRegular => ConfinedReadError::NotAFile,
+        OpenFileError::Io(error) => ConfinedReadError::Io(error),
+        changed @ OpenFileError::Changed => {
+            ConfinedReadError::Io(io::Error::other(changed.to_string()))
+        }
+    })?;
+    if metadata.len() > max_bytes {
+        return Err(ConfinedReadError::TooLarge);
+    }
+    let bytes = read_at_most(opened, max_bytes)
+        .map_err(ConfinedReadError::Io)?
+        .ok_or(ConfinedReadError::TooLarge)?;
+    String::from_utf8(bytes).map_err(|_| ConfinedReadError::NotUtf8)
+}
+
+/// Reads all of `file`, or `None` when it holds more than `max_bytes` (it may
+/// grow after its size was checked).
+fn read_at_most(file: File, max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= max_bytes).then_some(bytes))
+}
+
+/// Writes `contents` to a temporary file beside `path`, flushes it to disk,
+/// and renames it over `path`; on failure the temporary file is removed and
+/// an existing file at `path` is left as it was. A symlink at `path` is
+/// replaced, never followed.
+fn write_file_atomically(path: &Path, contents: &str) -> io::Result<()> {
+    let (temporary, mut file) = Temporary::create_beside(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    temporary.rename_to(path)
 }
 
 /// Whether `file` is a non-empty relative path whose components are all plain

@@ -157,13 +157,15 @@ Render transposed and time-stretched stems **offline**, into a cache keyed by ke
 
 Songs use the [open song package](mvp-spec.md#song-package-format-v1). Lossy imports are transcoded to FLAC so the disk thread can seek to any sample exactly; that costs storage and is listed as an open decision in the spec.
 
-Mixing and routing add three JSON files, each with its own `formatVersion` (1) and documented in the `domain` crate:
+Mixing and routing add three JSON files, each with its own `formatVersion` (1); `domain` documents the formats and `library` reads and writes them:
 
 | File | Where | Holds | Format docs |
 |------|-------|-------|-------------|
 | `mix.json` | Beside `song.json` in the song folder; `song.json` is never rewritten | Each arrangement's stem volumes, mutes, solos and bus choices | `domain::mix` |
-| Bus settings | App configuration folder | The global bus volumes and mutes and the master volume | `domain::mixer` |
-| Routing | App configuration folder | Each device's bus-to-output routing and split mode | `domain::routing` |
+| `bus-settings.json` | App configuration folder | The global bus volumes and mutes and the master volume | `domain::mixer` |
+| `routing.json` | App configuration folder | Each device's bus-to-output routing and split mode | `domain::routing` |
+
+The app configuration folder is `~/Library/Application Support/OpenVamp` on macOS, `%APPDATA%\OpenVamp` on Windows, and `$XDG_CONFIG_HOME/openvamp` (or `~/.config/openvamp`) on Linux; the phone and tablet shells pass their own (`library::ConfigStore`). A missing file means the defaults, so a song without `mix.json` plays as before. A file that cannot be used (unreadable, malformed, a symlink out of its folder, a FIFO, over 1 MiB, or a newer `formatVersion`) is reported, the defaults play, and the file is left alone until the user changes a setting; a newer `formatVersion` is never written over. Writes are atomic, like setlists.
 
 ## Repository layout
 

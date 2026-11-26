@@ -2,15 +2,15 @@
 //! [`SETLISTS_FOLDER`], read and written with the same care as song packages.
 
 use std::cmp::Ordering;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use domain::{Setlist, SetlistEditError, SetlistFileError};
 use thiserror::Error;
 
 use crate::setlist_order::{apply_order, read_order, update_order, write_order};
-use crate::{OpenFileError, Temporary, open_regular_file, resolve_inside, same_file};
+use crate::{ConfinedReadError, read_confined, resolve_inside, same_file, write_file_atomically};
 
 /// Name of the folder, inside the library folder, that holds the setlists.
 pub const SETLISTS_FOLDER: &str = "Setlists";
@@ -834,35 +834,22 @@ fn read_setlist(folder: &Path, file: &str) -> Result<Setlist, SetlistError> {
 /// [`MAX_SETLIST_FILE_BYTES`].
 pub(crate) fn read_folder_file(folder: &Path, file: &str) -> Result<String, SetlistError> {
     let path = folder.join(file);
-    let resolved = match resolve_inside(folder, file) {
-        Ok(Some(resolved)) => resolved,
-        Ok(None) => return Err(SetlistError::OutsideLibrary { path }),
-        Err(source) => return Err(SetlistError::Read { path, source }),
-    };
-    let (opened, metadata) = open_regular_file(&resolved).map_err(|error| match error {
-        OpenFileError::NotRegular => SetlistError::NotAFile { path: path.clone() },
-        OpenFileError::Io(source) => SetlistError::Read {
-            path: path.clone(),
-            source,
+    read_confined(folder, file, MAX_SETLIST_FILE_BYTES).map_err(|error| match error {
+        ConfinedReadError::Outside => SetlistError::OutsideLibrary { path },
+        ConfinedReadError::NotAFile => SetlistError::NotAFile { path },
+        ConfinedReadError::TooLarge => SetlistError::TooLarge {
+            path,
+            max_bytes: MAX_SETLIST_FILE_BYTES,
         },
-        changed @ OpenFileError::Changed => SetlistError::Read {
-            path: path.clone(),
-            source: io::Error::other(changed.to_string()),
+        ConfinedReadError::NotUtf8 => SetlistError::Read {
+            path,
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            ),
         },
-    })?;
-    let too_large = || SetlistError::TooLarge {
-        path: path.clone(),
-        max_bytes: MAX_SETLIST_FILE_BYTES,
-    };
-    if metadata.len() > MAX_SETLIST_FILE_BYTES {
-        return Err(too_large());
-    }
-    read_at_most(opened, MAX_SETLIST_FILE_BYTES)
-        .map_err(|source| SetlistError::Read {
-            path: path.clone(),
-            source,
-        })?
-        .ok_or_else(too_large)
+        ConfinedReadError::Io(source) => SetlistError::Read { path, source },
+    })
 }
 
 /// `saved`, or [`SetlistError::OrderNotUpdated`] when `placed` says its
@@ -892,14 +879,6 @@ fn keep_place(folder: &Path, file: &str, target: &str) -> Result<(), SetlistErro
             order[place] = target.to_owned();
         }
     })
-}
-
-/// Reads all of `file` as UTF-8, or `None` when it holds more than
-/// `max_bytes` (it may grow after its size was checked).
-fn read_at_most(file: File, max_bytes: u64) -> io::Result<Option<String>> {
-    let mut text = String::new();
-    file.take(max_bytes + 1).read_to_string(&mut text)?;
-    Ok((text.len() as u64 <= max_bytes).then_some(text))
 }
 
 /// Whether anything, a dangling symlink included, has the path `path`.
@@ -951,14 +930,7 @@ fn file_taken(name: &str, file: String) -> SetlistError {
 /// and renames it over `path`; on failure the temporary file is removed and
 /// an existing file at `path` is left as it was.
 pub(crate) fn write_atomically(path: &Path, contents: &str) -> Result<(), SetlistError> {
-    let write = || -> io::Result<()> {
-        let (temporary, mut file) = Temporary::create_beside(path)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        temporary.rename_to(path)
-    };
-    write().map_err(|source| SetlistError::Write {
+    write_file_atomically(path, contents).map_err(|source| SetlistError::Write {
         path: path.to_owned(),
         source,
     })

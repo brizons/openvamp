@@ -1,6 +1,6 @@
 [package]
 name = "library"
-description = "Song package and setlist I/O: reads song folders and WAV stems, streams stems from disk for live playback, writes rendered WAV files, keeps setlist files in the library folder."
+description = "Song package and setlist I/O: reads song folders and WAV stems, streams stems from disk for live playback, writes rendered WAV files, keeps setlist files and song mixes in the library folder and the bus settings and routing in the app configuration folder."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
