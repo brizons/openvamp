@@ -187,14 +187,17 @@ pub enum SongProblem {
         /// The format found, such as "8-bit integer, 1 channel".
         format: String,
     },
-    /// The stem is a FLAC file with more channels than the player plays.
-    #[error("stem \"{id}\" file \"{file}\" is {format}; supported FLAC stems are mono or stereo")]
+    /// The stem is a FLAC file this version does not decode: deeper than 24
+    /// bits, or with more than two channels.
+    #[error(
+        "stem \"{id}\" file \"{file}\" is {format}; supported FLAC stems are 4- to 24-bit, mono or stereo"
+    )]
     UnsupportedFlacFormat {
         /// Stem id.
         id: String,
         /// Stem file, as in the manifest.
         file: String,
-        /// The format found, such as "24-bit FLAC, 6 channels".
+        /// The format found, such as "32-bit FLAC, 2 channels".
         format: String,
     },
 }

@@ -1,7 +1,8 @@
 //! S6: FLAC stems play like WAV stems. The same audio stored as WAV and as
 //! FLAC loads to the same samples, streams the same frames from any frame,
 //! and gives the listing and the package checks the same facts; the format
-//! is chosen from the file's first bytes.
+//! is chosen from the file's first bytes. The audio is noise, which FLAC
+//! cannot compress, a tone and silence, which it compresses to little.
 
 mod common;
 
@@ -45,15 +46,46 @@ fn bits(samples: &[f32]) -> Vec<u32> {
     samples.iter().map(|sample| sample.to_bits()).collect()
 }
 
-/// Writes one WAV and one FLAC stem of the same audio for every format,
-/// `wav-<bits>-<channels>` then `flac-<bits>-<channels>`, in one package.
+/// A tone at half scale in `bits` bits, a different pitch per channel.
+fn tone(bits: u16, channels: u16) -> Vec<i32> {
+    let amplitude = f64::from(1 << (bits - 2));
+    (0..FRAMES)
+        .flat_map(|frame| {
+            (0..channels).map(move |channel| {
+                let hz = 220.0 * f64::from(channel + 2);
+                let t = frame as f64 / f64::from(RATE);
+                ((t * hz * std::f64::consts::TAU).sin() * amplitude) as i32
+            })
+        })
+        .collect()
+}
+
+/// A signal's samples for a seed, the bits and the channels.
+type Signal = fn(u64, u16, u16) -> Vec<i32>;
+
+/// The signals compared, by name.
+const SIGNALS: [(&str, Signal); 3] = [
+    ("noise", |seed, bits, channels| {
+        noise(seed, bits, FRAMES * usize::from(channels))
+    }),
+    ("tone", |_, bits, channels| tone(bits, channels)),
+    ("silence", |_, _, channels| {
+        vec![0; FRAMES * usize::from(channels)]
+    }),
+];
+
+/// Writes one WAV and one FLAC stem of the same audio for every signal and
+/// format, `wav-<signal>-<bits>-<channels>` then `flac-…`, in one package.
 fn write_pairs(dir: &Path) -> Vec<(String, String)> {
     let mut stems = Vec::new();
     let mut pairs = Vec::new();
-    for (seed, &(bits, channels)) in FORMATS.iter().enumerate() {
-        let samples = noise(seed as u64 + 1, bits, FRAMES * usize::from(channels));
-        let wav = format!("wav-{bits}-{channels}");
-        let flac = format!("flac-{bits}-{channels}");
+    let formats = SIGNALS
+        .iter()
+        .flat_map(|signal| FORMATS.iter().map(move |format| (signal, format)));
+    for (seed, (&(signal, samples), &(bits, channels))) in formats.enumerate() {
+        let samples = samples(seed as u64 + 1, bits, channels);
+        let wav = format!("wav-{signal}-{bits}-{channels}");
+        let flac = format!("flac-{signal}-{bits}-{channels}");
         write_int(
             &dir.join(format!("stems/{wav}.wav")),
             bits,
@@ -98,7 +130,9 @@ fn wav_and_flac_stems_of_the_same_audio_load_to_identical_samples() {
             flac.id
         );
         assert_eq!(bits(&flac.samples), bits(&wav.samples), "{}", flac.id);
-        assert!(wav.samples.contains(&-1.0), "{} reaches full scale", wav.id);
+        if wav.id.contains("noise") {
+            assert!(wav.samples.contains(&-1.0), "{} reaches full scale", wav.id);
+        }
     }
 }
 
@@ -300,7 +334,48 @@ fn a_flac_stem_with_more_than_two_channels_is_refused_naming_its_format() {
     assert_eq!(
         messages,
         [
-            "stem \"surround\" file \"surround.flac\" is 16-bit FLAC, 3 channels; supported FLAC stems are mono or stereo"
+            "stem \"surround\" file \"surround.flac\" is 16-bit FLAC, 3 channels; supported FLAC stems are 4- to 24-bit, mono or stereo"
         ]
     );
+}
+
+/// `tests/fixtures/tone-32bit-stereo.flac` and `tone-32bit-mono-b256.flac`:
+/// 5 000 frames at 48 kHz of a 440 Hz sine at 2·10⁹ (the right channel a
+/// radian later), encoded from 32-bit WAV by flac 1.5.0 as `flac` and
+/// `flac -b 256`. symphonia 0.6.1 needs 33 bits for their side channel and
+/// residuals: it decodes them wrong, or panics in a debug build.
+#[test]
+fn a_flac_stem_deeper_than_24_bits_is_refused_naming_its_format() {
+    for (fixture, channels) in [
+        ("tone-32bit-stereo.flac", "2 channels"),
+        ("tone-32bit-mono-b256.flac", "1 channel"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(fixture),
+            path.join("deep.flac"),
+        )
+        .unwrap();
+        write_manifest(
+            path,
+            &manifest(48_000, &[("deep", "deep.flac", StemRole::Track)]),
+        );
+        let expected = format!(
+            "stem \"deep\" file \"deep.flac\" is 32-bit FLAC, {channels}; supported FLAC stems are 4- to 24-bit, mono or stereo"
+        );
+
+        for result in [
+            load_song(path).map(drop),
+            open_streaming(path, &StreamConfig::default()).map(drop),
+        ] {
+            let Err(LoadError::Invalid(problems)) = result else {
+                panic!("{fixture} is refused: {result:?}");
+            };
+            let messages: Vec<String> = problems.iter().map(ToString::to_string).collect();
+            assert_eq!(messages, [expected.as_str()], "{fixture}");
+        }
+    }
 }

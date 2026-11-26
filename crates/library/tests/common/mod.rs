@@ -105,7 +105,25 @@ pub fn flac_bytes(
     block_frames: usize,
     samples: &[i32],
 ) -> Vec<u8> {
-    use flacenc::component::BitRepr;
+    flac_bytes_with_seek_points(bits, channels, sample_rate, block_frames, samples, |_| {
+        Vec::new()
+    })
+}
+
+/// [`flac_bytes`] with a SEEKTABLE after STREAMINFO, when `points` gives
+/// any. `points` gets the first frame and the byte offset from the first
+/// audio frame of every block, the facts a true SEEKTABLE point holds, and
+/// returns the (frame, byte offset) points to write; each says its block
+/// holds `block_frames` frames.
+pub fn flac_bytes_with_seek_points(
+    bits: usize,
+    channels: usize,
+    sample_rate: u32,
+    block_frames: usize,
+    samples: &[i32],
+    points: impl FnOnce(&[(u64, u64)]) -> Vec<(u64, u64)>,
+) -> Vec<u8> {
+    use flacenc::component::{BitRepr, MetadataBlockData};
     use flacenc::error::Verify;
 
     let config = flacenc::config::Encoder::default()
@@ -119,6 +137,22 @@ pub fn flac_bytes(
         .stream_info_mut()
         .set_block_sizes(block_frames, block_frames)
         .expect("a valid block size");
+    let mut blocks = Vec::new();
+    let mut offset = 0;
+    for n in 0..stream.frame_count() {
+        blocks.push(((n * block_frames) as u64, offset));
+        offset += stream.frame(n).unwrap().count_bits() as u64 / 8;
+    }
+    let points = points(&blocks);
+    if !points.is_empty() {
+        let mut table = Vec::new();
+        for (frame, offset) in points {
+            table.extend_from_slice(&frame.to_be_bytes());
+            table.extend_from_slice(&offset.to_be_bytes());
+            table.extend_from_slice(&(block_frames as u16).to_be_bytes());
+        }
+        stream.add_metadata_block(MetadataBlockData::new_unknown(3, &table).unwrap());
+    }
     let mut sink = flacenc::bitsink::ByteSink::new();
     stream.write(&mut sink).expect("the stream writes");
     sink.as_slice().to_vec()

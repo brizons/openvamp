@@ -17,7 +17,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use common::{flac_bytes, manifest, write_int, write_manifest};
+use common::{flac_bytes, flac_bytes_with_seek_points, manifest, write_int, write_manifest};
 use domain::{StemRole, ValidationError};
 use library::{LoadError, SongProblem, StreamConfig, load_song, open_streaming};
 
@@ -110,9 +110,11 @@ fn load_and_stream(path: &Path) -> Outcome {
             largest,
         });
     });
-    receiver
-        .recv_timeout(Duration::from_secs(10))
-        .expect("loading and streaming return without hanging")
+    match receiver.recv_timeout(Duration::from_secs(10)) {
+        Ok(outcome) => outcome,
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!("loading and streaming hang"),
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("loading or streaming panicked"),
+    }
 }
 
 /// A mono 16-bit FLAC song of `frames` frames at `rate`, in blocks of
@@ -274,4 +276,38 @@ fn a_flac_stream_info_with_zero_or_absurd_values_is_refused() {
         );
     }
     assert!(outcome.largest < 1 << 20, "{} bytes", outcome.largest);
+}
+
+#[test]
+fn a_cut_flac_file_with_a_seek_table_is_an_error_never_a_panic() {
+    // A SEEKTABLE point every two blocks, as the reference encoder writes:
+    // cutting the file leaves points past its end.
+    let samples: Vec<i32> = (0..2 * (10 * 4_096 + 1_000))
+        .map(|i| ((f64::from(i) * 0.01).sin() * 2_000_000.0) as i32)
+        .collect();
+    let flac = flac_bytes_with_seek_points(24, 2, 48_000, 4_096, &samples, |blocks| {
+        blocks.iter().step_by(2).copied().collect()
+    });
+    for step in 1..16 {
+        let cut = flac.len() * step / 16;
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(
+            dir.path(),
+            &manifest(48_000, &[("bad", "bad.flac", StemRole::Track)]),
+        );
+        fs::write(dir.path().join("bad.flac"), &flac[..cut]).unwrap();
+
+        let outcome = load_and_stream(dir.path());
+
+        for result in [&outcome.loaded, &outcome.streamed] {
+            assert!(
+                matches!(
+                    result,
+                    Err(LoadError::Decode { .. } | LoadError::Invalid(_))
+                ),
+                "cut at {cut}: {result:?}"
+            );
+        }
+        assert!(outcome.largest < 1 << 20, "{} bytes", outcome.largest);
+    }
 }

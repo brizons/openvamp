@@ -4,6 +4,13 @@
 //! Samples convert exactly as a WAV stem of the same bit depth converts: the
 //! decoder gives every sample left-justified in 32 bits, which is shifted
 //! back to the file's bit depth and scaled by [`int_scale`].
+//!
+//! The reader sees only STREAMINFO and the audio frames ([`frames`]), and a
+//! seek opens a fresh one: symphonia 0.6.1 keeps the last frame header its
+//! parser saw across a seek that ends where its reader already was, then
+//! merges the frames after it into one packet, so the stem would lose them.
+
+mod frames;
 
 use std::fs::File;
 use std::io;
@@ -22,9 +29,16 @@ use symphonia::default::formats::FlacReader;
 
 use super::DecodeError;
 use crate::{LoadError, SongProblem, int_scale};
+use frames::{ENDS_BEFORE_AUDIO, Layout};
 
 /// The audio stops before the length STREAMINFO declares.
 const ENDS_EARLY: &str = "Ill-formed FLAC file: the file ends before its declared length";
+
+/// The deepest FLAC the player reads. symphonia 0.6.1 reads a sample in at
+/// most 32 bits, but a 32-bit stereo stem's side channel needs 33 and its
+/// residuals can need more: it decodes them wrong, or panics in a debug
+/// build.
+const MAX_BITS: u32 = 24;
 
 /// Samples the full decode reserves up front per byte of file at most, so a
 /// STREAMINFO claiming far more frames than the file holds reserves little.
@@ -34,6 +48,9 @@ const RESERVED_SAMPLES_PER_BYTE: u64 = 4;
 
 /// A FLAC stem file, open for decoding, with the facts of its STREAMINFO.
 pub(crate) struct FlacStem {
+    /// The file, from which every reader reads.
+    file: File,
+    layout: Layout,
     reader: FlacReader<'static>,
     decoder: FlacDecoder,
     track_id: u32,
@@ -56,18 +73,18 @@ impl FlacStem {
     /// Opens `file`, which starts with the FLAC marker and holds `file_len`
     /// bytes, and reads its metadata up to the first audio frame. A file the
     /// player cannot use is `stem`'s problem: unreadable, without a length,
-    /// or with more than two channels.
+    /// deeper than 24 bits, or with more than two channels.
     pub(crate) fn open(stem: &Stem, file: File, file_len: u64) -> Result<Self, SongProblem> {
         let unreadable = |reason: String| SongProblem::StemUnreadable {
             id: stem.id.clone(),
             file: stem.file.clone(),
             reason,
         };
-        let source = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
-        let reader = FlacReader::try_new(source, FormatOptions::default()).map_err(|error| {
+        let layout = Layout::read(&file, file_len).map_err(unreadable)?;
+        let reader = open_reader(&file, layout).map_err(|error| {
             unreadable(match error {
                 FlacError::IoError(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                    "Ill-formed FLAC file: the file ends before its first audio frame".to_owned()
+                    ENDS_BEFORE_AUDIO.to_owned()
                 }
                 other => DecodeError::from(other).to_string(),
             })
@@ -91,11 +108,15 @@ impl FlacStem {
                 "Ill-formed FLAC file: its STREAMINFO is incomplete".to_owned(),
             ));
         };
-        if !matches!(channels, 1 | 2) {
+        if bits > MAX_BITS || !matches!(channels, 1 | 2) {
+            let channels = match channels {
+                1 => "1 channel".to_owned(),
+                n => format!("{n} channels"),
+            };
             return Err(SongProblem::UnsupportedFlacFormat {
                 id: stem.id.clone(),
                 file: stem.file.clone(),
-                format: format!("{bits}-bit FLAC, {channels} channels"),
+                format: format!("{bits}-bit FLAC, {channels}"),
             });
         }
         let Some(frames) = track.num_frames else {
@@ -108,6 +129,8 @@ impl FlacStem {
             .map_err(|error| unreadable(DecodeError::from(error).to_string()))?;
         Ok(Self {
             track_id: track.id,
+            file,
+            layout,
             reader,
             decoder,
             sample_rate,
@@ -220,23 +243,27 @@ impl FlacStem {
         }
     }
 
-    /// Moves the reader to the packet holding source frame `position`.
+    /// Moves a fresh reader to the packet holding source frame `position`:
+    /// one that has never parsed a frame, so no stale frame header can merge
+    /// the frames after `position` into one packet.
     fn seek(&mut self, position: u64) -> Result<(), DecodeError> {
         self.next = None;
         self.packet.clear();
+        self.reader = open_reader(&self.file, self.layout).map_err(decode_error)?;
+        self.decoder.reset();
+        if position == 0 {
+            // A fresh reader stands at the first frame.
+            self.next = Some(0);
+            return Ok(());
+        }
         let ts = Timestamp::new(position as i64);
         let to = SeekTo::Timestamp {
             ts,
             track_id: self.track_id,
         };
-        match self.reader.seek(SeekMode::Accurate, to) {
-            Ok(_) => {}
-            Err(FlacError::IoError(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                return Err(DecodeError::Malformed(ENDS_EARLY.to_owned()));
-            }
-            Err(other) => return Err(other.into()),
-        }
-        self.decoder.reset();
+        self.reader
+            .seek(SeekMode::Accurate, to)
+            .map_err(decode_error)?;
         Ok(())
     }
 
@@ -263,14 +290,11 @@ impl FlacStem {
 
     /// Decodes the next packet into `self.packet`; its first source frame.
     fn decode_packet(&mut self) -> Result<u64, DecodeError> {
-        let packet = match self.reader.next_packet() {
-            Ok(Some(packet)) => packet,
-            Ok(None) => return Err(DecodeError::Malformed(ENDS_EARLY.to_owned())),
-            Err(FlacError::IoError(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                return Err(DecodeError::Malformed(ENDS_EARLY.to_owned()));
-            }
-            Err(other) => return Err(other.into()),
-        };
+        let packet = self
+            .reader
+            .next_packet()
+            .map_err(decode_error)?
+            .ok_or_else(|| DecodeError::Malformed(ENDS_EARLY.to_owned()))?;
         // FLAC timestamps are 36-bit frame numbers, never negative.
         let start = packet.pts.get() as u64;
         let GenericAudioBufferRef::S32(buffer) = self.decoder.decode(&packet)? else {
@@ -302,6 +326,26 @@ impl FlacStem {
         self.packet_start = start;
         self.next = Some(start + self.packet_frames());
         Ok(start)
+    }
+}
+
+/// A reader of `file`'s audio frames behind its STREAMINFO, standing at the
+/// first frame. It reads from a handle of its own on the same open file, so
+/// the file read is always the one checked when the stem was opened.
+fn open_reader(file: &File, layout: Layout) -> Result<FlacReader<'static>, FlacError> {
+    let source = layout.source(file.try_clone()?);
+    let stream = MediaSourceStream::new(Box::new(source), MediaSourceStreamOptions::default());
+    FlacReader::try_new(stream, FormatOptions::default())
+}
+
+/// A reader error as a decode error: the end of the file before the frames
+/// wanted means the file ends early.
+fn decode_error(error: FlacError) -> DecodeError {
+    match error {
+        FlacError::IoError(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            DecodeError::Malformed(ENDS_EARLY.to_owned())
+        }
+        other => other.into(),
     }
 }
 
