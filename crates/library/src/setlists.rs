@@ -974,7 +974,7 @@ fn needs_escape(character: char, first: bool) -> bool {
 
 /// Whether Windows reserves `stem` for a device: the part before its first
 /// dot, without trailing spaces, is a reserved name in any case.
-fn is_windows_reserved(stem: &str) -> bool {
+pub(crate) fn is_windows_reserved(stem: &str) -> bool {
     let base = stem
         .split('.')
         .next()

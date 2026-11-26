@@ -22,6 +22,11 @@
 //! beside its `song.json`, with the rules the [settings files](SettingsError)
 //! share. A [`ConfigStore`] keeps the global bus settings and the routing of
 //! every device in the app's configuration folder ([`config_folder`]).
+//!
+//! [`probe_import`] reads a folder or ZIP of WAV, FLAC, MP3 and M4A stems as
+//! an [`ImportDraft`] to edit, and [`Library::save_import`] saves it as a new
+//! song folder in the library, copying the stems the player reads and
+//! transcoding the others to FLAC (see the [`import`] module).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -46,6 +51,7 @@ use decode::{FlacStem, starts_as_flac};
 
 mod config;
 mod decode;
+pub mod import;
 mod mix_store;
 mod setlist_order;
 mod setlist_songs;
@@ -59,6 +65,10 @@ pub use config::{
     config_folder,
 };
 pub use decode::DecodeError;
+pub use import::{
+    ImportDraft, ImportError, ImportProgress, MAX_IMPORT_FILES, ProbedStem, RefusedFile,
+    SONG_FOLDER_EXTENSION, SourceFormat, StemAction, probe_import, song_folder_name,
+};
 pub use mix_store::{MIX_FILE, SongMix, read_mix, write_mix};
 pub use setlist_songs::{SetlistSongs, SongUnavailable};
 pub use setlists::{
@@ -346,6 +356,14 @@ impl OpenedStem {
         match self {
             Self::Wav { reader, .. } => u64::from(reader.duration()),
             Self::Flac(flac) => flac.frames(),
+        }
+    }
+
+    /// Channels, from the header: 1 or 2.
+    fn channels(&self) -> u16 {
+        match self {
+            Self::Wav { reader, .. } => reader.spec().channels,
+            Self::Flac(flac) => flac.channels(),
         }
     }
 }
