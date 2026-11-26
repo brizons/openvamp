@@ -5,8 +5,8 @@
 
 use domain::Transition;
 use gpui::{
-    AnyElement, App, Context, Div, DragMoveEvent, ElementId, Entity, FontWeight, IntoElement,
-    SharedString, Stateful, div, font, prelude::*, px,
+    AnyElement, App, Context, Div, DragMoveEvent, ElementId, Entity, ExternalPaths, FontWeight,
+    IntoElement, ScrollHandle, SharedString, Stateful, div, font, prelude::*, px,
 };
 use openvamp_desktop::action::Intent;
 use openvamp_desktop::catalog::{TRANSITIONS, transition_name};
@@ -97,8 +97,13 @@ pub fn no_library(problem: Option<&str>, cx: &mut Context<Perform>) -> impl Into
         )
 }
 
-/// The Library screen: the setlists, the editor and the songs.
-pub fn library(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElement {
+/// The Library screen: the setlists, the editor and the songs, whose list
+/// scrolls with `songs_scroll`.
+pub fn library(
+    view: &LibraryView,
+    songs_scroll: &ScrollHandle,
+    cx: &mut Context<Perform>,
+) -> impl IntoElement {
     div()
         .flex_1()
         .min_h_0()
@@ -119,7 +124,7 @@ pub fn library(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElemen
                 .gap(px(12.))
                 .child(setlists(view, cx))
                 .child(editor(view.editor.as_ref(), cx))
-                .child(songs(view, cx)),
+                .child(songs(view, songs_scroll, cx)),
         )
 }
 
@@ -1196,9 +1201,9 @@ fn click_details(
         .child(transitions(index, transition, cx))
 }
 
-/// The library's songs, with the search and a button that adds each one
-/// to the setlist in the editor.
-fn songs(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElement {
+/// The library's songs, with the search, "Import stems" and a button that
+/// adds each one to the setlist in the editor.
+fn songs(view: &LibraryView, scroll: &ScrollHandle, cx: &mut Context<Perform>) -> impl IntoElement {
     panel()
         .w(px(360.))
         .flex_none()
@@ -1237,6 +1242,7 @@ fn songs(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElement {
                         )),
                 ),
         )
+        .child(import_stems(view.importing.as_deref(), cx))
         .children(view.unreadable_songs.iter().map(|line| {
             div()
                 .text_size(px(12.))
@@ -1246,12 +1252,49 @@ fn songs(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElement {
         .child(
             div()
                 .id("songs")
+                .track_scroll(scroll)
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
                 .flex()
                 .flex_col()
                 .children(view.songs.iter().map(|song| song_row(song, cx))),
+        )
+}
+
+/// "Import stems": picks a folder or ZIP of stems, or takes one dropped
+/// on it; while one is read, it says so (`importing`).
+fn import_stems(importing: Option<&str>, cx: &mut Context<Perform>) -> impl IntoElement {
+    button("import-stems", cx, Intent::ImportStems)
+        .flex_none()
+        .flex_col()
+        .justify_center()
+        .gap(px(6.))
+        .p(px(16.))
+        .rounded(px(12.))
+        .border(px(1.5))
+        .border_dashed()
+        .border_color(theme::drop_border())
+        .bg(theme::panel())
+        .text_center()
+        .drag_over::<ExternalPaths>(|style, _, _, _| {
+            style.border_color(theme::accent()).bg(theme::raised())
+        })
+        .on_drop(cx.listener(|screen, paths: &ExternalPaths, _, cx| {
+            screen.import_dropped(paths.paths(), cx);
+        }))
+        .child(icon("import", theme::text(), 26.))
+        .child(
+            div()
+                .text_size(px(15.))
+                .font_weight(FontWeight::BOLD)
+                .child(importing.unwrap_or("Import stems").to_owned()),
+        )
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(theme::text_muted())
+                .child("Drop a folder or ZIP · WAV, FLAC, MP3, M4A"),
         )
 }
 
@@ -1264,6 +1307,10 @@ fn song_row(song: &SongRow, cx: &mut Context<Perform>) -> AnyElement {
         .min_h(px(56.))
         .border_b_1()
         .border_color(theme::divider())
+        // The song just imported, until the next control.
+        .when(song.imported, |row| {
+            row.px(px(8.)).rounded(px(8.)).bg(theme::raised())
+        })
         .child(
             div()
                 .flex_1()

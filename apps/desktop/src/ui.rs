@@ -342,7 +342,7 @@ pub fn no_song(errors: &[String], cx: &mut Context<Perform>) -> impl IntoElement
         .child(
             div()
                 .text_color(theme::text_muted())
-                .child("Open a song folder: song.json and the WAV stems it lists."),
+                .child("Open a song folder: song.json and the WAV or FLAC stems it lists."),
         )
         .children(errors.iter().map(|line| {
             div()

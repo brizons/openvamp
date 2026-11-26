@@ -13,8 +13,8 @@ use app::{AudioOutput, SessionOptions};
 use domain::SetlistItem;
 use gpui::{
     App, AppContext, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
-    ModifiersChangedEvent, PathPromptOptions, PromptButton, PromptLevel, Render, Subscription,
-    Task, Window, prelude::*,
+    ModifiersChangedEvent, PathPromptOptions, PromptButton, PromptLevel, Render, ScrollHandle,
+    Subscription, Task, Window, prelude::*,
 };
 use io_cpal::CpalOutput;
 use library::ConfigStore;
@@ -37,7 +37,7 @@ use openvamp_desktop::view::{PerformView, SongFacts};
 
 use crate::library_ui::{DraggedItem, DraggedSetlist};
 use crate::ui::DraggedTile;
-use crate::{library_ui, mixer_ui, output_ui, ui};
+use crate::{library_ui, mixer_ui, output_ui, song_editor_ui, ui};
 
 /// How often the session is polled: about 30 Hz (Decision 3). The timer
 /// keeps running while the window is hidden, since a waiting play starts
@@ -67,6 +67,9 @@ pub struct Perform {
     opened: Opened,
     /// Why the last library folder picked did not open.
     library_problem: Option<String>,
+    /// Where the Library screen's song list is scrolled, so a song just
+    /// imported scrolls into view.
+    songs_scroll: ScrollHandle,
     /// The saved routings and bus settings every session opens with.
     settings: AudioSettings,
     /// The Mixer screen's own state.
@@ -122,6 +125,7 @@ impl Perform {
             library: None,
             opened: Opened::Followed,
             library_problem: None,
+            songs_scroll: ScrollHandle::new(),
             settings: AudioSettings::load(ConfigStore::from_environment()),
             mixer: MixerPage::new(),
             output: OutputPage::new(),
@@ -392,6 +396,7 @@ impl Perform {
             mixer: &mut self.mixer,
             output: &mut self.output,
             settings: &mut self.settings,
+            library: self.library.as_mut(),
         };
         if timed.turn(Instant::now()) {
             cx.notify();
@@ -457,6 +462,7 @@ impl Perform {
             Intent::OpenSong => self.prompt_for(Pick::Song, window, cx),
             Intent::OpenSetlist => self.prompt_for(Pick::Setlist, window, cx),
             Intent::OpenLibrary => self.prompt_for(Pick::Library, window, cx),
+            Intent::ImportStems => self.prompt_for(Pick::Import, window, cx),
             Intent::ShowPage(page) => self.show_page(page),
             Intent::Library(action) => {
                 // The setlist on Perform cannot be removed.
@@ -466,6 +472,7 @@ impl Perform {
                     library.act(action);
                 }
                 self.follow_library_moves();
+                self.run_save(cx);
             }
             Intent::PerformSetlist => self.perform_setlist(cx),
             Intent::DismissProblems => self.problems.clear(),
@@ -475,26 +482,7 @@ impl Perform {
 
     /// Asks for a song folder or a setlist file, then opens it.
     fn prompt_for(&mut self, pick: Pick, _window: &mut Window, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(match pick {
-            Pick::Song => PathPromptOptions {
-                files: false,
-                directories: true,
-                multiple: false,
-                prompt: Some("Open song".into()),
-            },
-            Pick::Setlist => PathPromptOptions {
-                files: true,
-                directories: false,
-                multiple: false,
-                prompt: Some("Open setlist".into()),
-            },
-            Pick::Library => PathPromptOptions {
-                files: false,
-                directories: true,
-                multiple: false,
-                prompt: Some("Open library".into()),
-            },
-        });
+        let paths = cx.prompt_for_paths(pick.options());
         cx.spawn(async move |this, cx| {
             let chosen = match paths.await {
                 Ok(Ok(Some(paths))) => paths.into_iter().next(),
@@ -518,6 +506,7 @@ impl Perform {
                             Err(problem) => screen.problems = vec![problem],
                         },
                         Pick::Library => screen.open_library(&path, None, Opened::Picked),
+                        Pick::Import => screen.import_stems(&path, cx),
                     }
                     cx.notify();
                 });
@@ -742,6 +731,66 @@ impl Perform {
         }
     }
 
+    /// Imports the folder or ZIP at `source` into the library on the
+    /// Library screen: it is read on the background executor, since a
+    /// slow, sleeping or unplugged drive can take seconds, and the Song
+    /// editor opens with what it read, or the Library says why it cannot
+    /// be imported.
+    fn import_stems(&mut self, source: &Path, cx: &mut Context<Self>) {
+        let Some(library) = &mut self.library else {
+            return;
+        };
+        let job = library.import_from(source);
+        let probe = cx.background_executor().spawn(async move { job.run() });
+        cx.spawn(async move |this, cx| {
+            let done = probe.await;
+            let _ = this.update(cx, |screen, cx| {
+                if let Some(library) = &mut screen.library {
+                    library.probed(done);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Folders or files dropped on "Import stems": the first one is
+    /// imported, as if it was picked.
+    pub fn import_dropped(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        if self.asking {
+            return;
+        }
+        if let Some(source) = paths.first() {
+            self.import_stems(source, cx);
+        }
+        cx.notify();
+    }
+
+    /// Runs the save "Save song" started, if any, on the background
+    /// executor: it copies and transcodes every stem, which takes seconds,
+    /// while the timer draws its progress ([`Timed::turn`]). Once it ends,
+    /// the Library lists the new song and scrolls to it, or the Song
+    /// editor says why it was not saved.
+    fn run_save(&mut self, cx: &mut Context<Self>) {
+        let Some(job) = self.library.as_mut().and_then(LibraryPage::take_save) else {
+            return;
+        };
+        let save = cx.background_executor().spawn(async move { job.run() });
+        cx.spawn(async move |this, cx| {
+            let done = save.await;
+            let _ = this.update(cx, |screen, cx| {
+                if let Some(library) = &mut screen.library {
+                    library.saved(done);
+                    if let Some(row) = library.imported_row() {
+                        screen.songs_scroll.scroll_to_item(row);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Opens the library folder `root` on the Library screen, with `file`
     /// in the editor when given.
     fn open_library(&mut self, root: &Path, file: Option<&str>, opened: Opened) {
@@ -818,11 +867,7 @@ impl Perform {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.page == Page::Library
-            && self
-                .library
-                .as_ref()
-                .is_some_and(|library| library.typing().is_some())
+        if self.page == Page::Library && self.library.as_ref().is_some_and(LibraryPage::takes_keys)
         {
             self.type_key(event, window, cx);
             return;
@@ -906,6 +951,26 @@ enum Pick {
     Setlist,
     /// A library folder.
     Library,
+    /// A folder or ZIP file of stems to import.
+    Import,
+}
+
+impl Pick {
+    /// The picker that asks for it.
+    fn options(self) -> PathPromptOptions {
+        let (files, directories, prompt) = match self {
+            Pick::Song => (false, true, "Open song"),
+            Pick::Setlist => (true, false, "Open setlist"),
+            Pick::Library => (false, true, "Open library"),
+            Pick::Import => (true, true, "Import stems"),
+        };
+        PathPromptOptions {
+            files,
+            directories,
+            multiple: false,
+            prompt: Some(prompt.into()),
+        }
+    }
 }
 
 impl Render for Perform {
@@ -917,10 +982,16 @@ impl Render for Perform {
         };
         let body = match (self.page, &self.loaded) {
             (Page::Library, _) => match &self.library {
-                Some(library) => {
-                    let view = library.view(self.playing_file());
-                    library_ui::library(&view, cx).into_any_element()
-                }
+                Some(library) => match library.song_editor() {
+                    Some(editor) => {
+                        song_editor_ui::song_editor(&editor, window.viewport_size(), cx)
+                            .into_any_element()
+                    }
+                    None => {
+                        let view = library.view(self.playing_file());
+                        library_ui::library(&view, &self.songs_scroll, cx).into_any_element()
+                    }
+                },
                 None => {
                     library_ui::no_library(self.library_problem.as_deref(), cx).into_any_element()
                 }
@@ -1009,4 +1080,37 @@ fn same_settings(options: &SessionOptions, used: &SessionOptions) -> bool {
         && options.buffer_frames == used.buffer_frames
         && options.routing == used.routing
         && options.bus_settings == used.bus_settings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pick;
+
+    #[test]
+    fn each_picker_asks_for_one_folder_or_file_of_its_kind() {
+        let asks = |pick: Pick| {
+            let options = pick.options();
+            (
+                options.files,
+                options.directories,
+                options.multiple,
+                options.prompt.map(|prompt| prompt.to_string()),
+            )
+        };
+        let prompt = |text: &str| Some(text.to_owned());
+        assert_eq!(asks(Pick::Song), (false, true, false, prompt("Open song")));
+        assert_eq!(
+            asks(Pick::Setlist),
+            (true, false, false, prompt("Open setlist"))
+        );
+        assert_eq!(
+            asks(Pick::Library),
+            (false, true, false, prompt("Open library"))
+        );
+        // A folder of stems, or a ZIP file of them.
+        assert_eq!(
+            asks(Pick::Import),
+            (true, true, false, prompt("Import stems"))
+        );
+    }
 }

@@ -2,6 +2,14 @@
 //! setlists of a library folder, the editor of the one selected, and the
 //! library's songs to add to it. [`LibraryPage::act`] carries out what the
 //! screen's controls ask for; [`LibraryPage::view`] says what it shows.
+//!
+//! "Import stems" (S7, F1) adds a song to the library: the source is read
+//! off the UI thread ([`LibraryPage::import_from`], [`LibraryPage::probed`]),
+//! the Song editor shows in place of the screen while its draft is open
+//! ([`LibraryPage::song_editor`], [`crate::song_import`]), and "Save song"
+//! writes it off the UI thread ([`LibraryPage::take_save`],
+//! [`LibraryPage::saved`]); the song list then reads the library again and
+//! marks the new song.
 
 use std::path::{Path, PathBuf};
 
@@ -9,13 +17,16 @@ use domain::{
     ClickItem, DEFAULT_ARRANGEMENT_ID, MAX_BPM, MIN_BPM, SetlistItem, SetlistValidationError,
     SongItem, TimeSignature, Transition,
 };
-use library::{ArrangementEntry, Library, SetlistError, SongEntry, TrashFn};
+use library::{ArrangementEntry, Library, SetlistError, SongEntry, SongListing, TrashFn};
 
 use crate::catalog::{Audience, Catalog};
 use crate::editor::{Edit, SetlistEditor};
 use crate::line_edit::{LineEdit, LineKey, LineOutcome};
 use crate::reorder::{Half, drop_index, drop_slot};
 use crate::shelf::Shelf;
+use crate::song_import::{
+    ImportAction, Outcome, ProbeJob, Probed, SaveJob, Saved, SongEditorView, SongImport,
+};
 
 /// The label of an armed remove control. It does not repeat the name: the
 /// setlist's name is in the editor's header (an unreadable file's in the
@@ -118,6 +129,8 @@ pub enum LibraryAction {
     Search,
     /// Hides the last problem and the last warning.
     DismissNotice,
+    /// A control of the Song editor, while a draft is open in it.
+    Import(ImportAction),
 }
 
 impl LibraryAction {
@@ -172,6 +185,14 @@ pub struct LibraryPage {
     /// The drag under way and the gap it would land in, while dropping
     /// there would move it.
     insertion: Option<(Dragged, usize)>,
+    /// The draft open in the Song editor.
+    import: Option<SongImport>,
+    /// The source being read for an import, by its job's ticket.
+    probing: Option<(u64, PathBuf)>,
+    /// The save asked for and not taken yet ([`Self::take_save`]).
+    pending_save: Option<SaveJob>,
+    /// The song folder last imported, marked in the song list.
+    imported: Option<String>,
 }
 
 impl LibraryPage {
@@ -219,17 +240,7 @@ impl LibraryPage {
             source,
         })?;
         let library = Library::new(root).with_trash(trash);
-        let (catalog, unreadable_songs) = match library.list_songs() {
-            Ok(listing) => (
-                Catalog::from_listing(&listing),
-                listing
-                    .unreadable
-                    .iter()
-                    .map(|song| song.error.to_string())
-                    .collect(),
-            ),
-            Err(error) => (Catalog::default(), vec![error.to_string()]),
-        };
+        let (catalog, unreadable_songs) = songs_of(library.list_songs());
         let shelf = Shelf::open(library)?;
         let mut page = Self {
             root: root.to_owned(),
@@ -247,6 +258,10 @@ impl LibraryPage {
             armed: None,
             playing: None,
             insertion: None,
+            import: None,
+            probing: None,
+            pending_save: None,
+            imported: None,
         };
         let file = file
             .map(str::to_owned)
@@ -346,6 +361,140 @@ impl LibraryPage {
         self.notice.as_deref()
     }
 
+    /// Starts an import of the folder or ZIP at `source` ("Import stems",
+    /// or a folder or ZIP dropped on it): the job reads it off the UI
+    /// thread, the screen shows it is busy meanwhile, and [`Self::probed`]
+    /// opens the Song editor with what it read. Only the newest import
+    /// started opens.
+    pub fn import_from(&mut self, source: &Path) -> ProbeJob {
+        let job = ProbeJob::new(source);
+        self.probing = Some((job.ticket(), source.to_owned()));
+        job
+    }
+
+    /// What [`Self::import_from`]'s job read: the Song editor opens on the
+    /// draft, or the notice says why the source cannot be imported. A job
+    /// a newer import replaced changes nothing.
+    pub fn probed(&mut self, done: Probed) {
+        if self.probing.as_ref().map(|(ticket, _)| *ticket) != Some(done.ticket) {
+            return;
+        }
+        self.probing = None;
+        if self
+            .import
+            .as_ref()
+            .is_some_and(|import| import.saving().is_some())
+        {
+            // The editor waits for its save; a draft never replaces it.
+            self.notice = Some("Cannot import stems while a song is being saved.".to_owned());
+            return;
+        }
+        match done.result {
+            Ok(draft) => {
+                self.import = Some(SongImport::new(draft));
+                self.typing = None;
+                self.armed = None;
+            }
+            Err(error) => self.notice = Some(format!("Cannot import stems: {error}")),
+        }
+    }
+
+    /// The save "Save song" started, to run off the UI thread, once.
+    pub fn take_save(&mut self) -> Option<SaveJob> {
+        self.pending_save.take()
+    }
+
+    /// What [`Self::take_save`]'s job did. A saved song is listed and
+    /// marked, and the Library shows again; a failed save keeps the Song
+    /// editor open with the reason; a cancelled one leaves nothing behind
+    /// and shows the Library. A song saved after Discard (the save had
+    /// already ended) is listed and says so.
+    pub fn saved(&mut self, done: Saved) {
+        let ours = self
+            .import
+            .as_ref()
+            .and_then(SongImport::saving)
+            .is_some_and(|saving| saving.ticket == done.ticket);
+        if !ours {
+            // A save the editor no longer waits for (this library was
+            // opened again meanwhile): a song it wrote here is listed all
+            // the same.
+            if let (Ok(_), Some(listing)) = (&done.result, done.listing)
+                && done.root == self.root
+            {
+                self.list(listing);
+            }
+            return;
+        }
+        let Some(import) = &mut self.import else {
+            return;
+        };
+        let discarded = import.saving().is_some_and(|saving| saving.discarded);
+        match done.result {
+            Ok(entry) => {
+                let title = import.title().trim().to_owned();
+                self.import = None;
+                if let Some(listing) = done.listing {
+                    self.list(listing);
+                }
+                self.mark_imported(entry.song);
+                if discarded {
+                    self.warning = Some(format!(
+                        "The import had already finished: \"{title}\" was saved."
+                    ));
+                }
+            }
+            Err(_) if discarded => self.import = None,
+            Err(error) => import.save_failed(&error),
+        }
+    }
+
+    /// The Song editor, while a draft is open in it.
+    pub fn song_editor(&self) -> Option<SongEditorView> {
+        self.import.as_ref().map(SongImport::view)
+    }
+
+    /// Whether the progress of the save under way changed since the last
+    /// call: the screen draws again ([`crate::tick::Timed::turn`]).
+    pub fn import_moved(&mut self) -> bool {
+        self.import.as_mut().is_some_and(SongImport::progress_moved)
+    }
+
+    /// Whether the keys type into a field: the song search, a setlist's
+    /// name, or a field of the Song editor.
+    pub fn takes_keys(&self) -> bool {
+        match &self.import {
+            Some(import) => import.typing().is_some(),
+            None => self.typing.is_some(),
+        }
+    }
+
+    /// The row of the song list holding the song just imported, while it
+    /// is marked.
+    pub fn imported_row(&self) -> Option<usize> {
+        let imported = self.imported.as_deref()?;
+        self.found_songs()
+            .iter()
+            .position(|song| song.song == imported)
+    }
+
+    /// The songs of the library as `listing` lists them, read again.
+    fn list(&mut self, listing: Result<SongListing, SetlistError>) {
+        (self.catalog, self.unreadable_songs) = songs_of(listing);
+    }
+
+    /// Marks the song at `path` as just imported, clearing the search
+    /// when it would hide it.
+    fn mark_imported(&mut self, path: String) {
+        self.imported = Some(path);
+        if self.imported_row().is_none() {
+            self.search = LineEdit::default();
+            if self.typing == Some(Field::Search) {
+                self.typing = None;
+            }
+        }
+    }
+
     /// Carries out `action`; what goes wrong is kept as the notice.
     pub fn act(&mut self, action: LibraryAction) {
         if let Err(problem) = self.try_act(action) {
@@ -359,6 +508,8 @@ impl LibraryPage {
         if !action.is_removal() {
             self.armed = None;
         }
+        // The song just imported is marked until the next control.
+        self.imported = None;
         match action {
             A::SelectSetlist(row) => {
                 if let Some(file) = self.shelf.setlists.get(row).map(|s| s.entry.file.clone()) {
@@ -490,6 +641,16 @@ impl LibraryPage {
                 self.notice = None;
                 self.warning = None;
             }
+            A::Import(action) => {
+                let Some(import) = &mut self.import else {
+                    return Ok(());
+                };
+                match import.act(action, self.shelf.library()) {
+                    Outcome::Stay => {}
+                    Outcome::Discarded => self.import = None,
+                    Outcome::Save(job) => self.pending_save = Some(*job),
+                }
+            }
         }
         Ok(())
     }
@@ -497,6 +658,10 @@ impl LibraryPage {
     /// A key typed into the field that has the focus.
     pub fn type_key(&mut self, key: LineKey<'_>) {
         self.armed = None;
+        if let Some(import) = &mut self.import {
+            import.type_key(key);
+            return;
+        }
         match self.typing {
             Some(Field::Search) => match self.search.key(key) {
                 LineOutcome::Editing => {}
@@ -521,6 +686,10 @@ impl LibraryPage {
     /// Text pasted into the field that has the focus.
     pub fn paste(&mut self, text: &str) {
         self.armed = None;
+        if let Some(import) = &mut self.import {
+            import.paste(text);
+            return;
+        }
         match self.typing {
             Some(Field::Search) => self.search.paste(text),
             Some(Field::Rename) => self.rename.paste(text),
@@ -532,6 +701,9 @@ impl LibraryPage {
     /// typed, a rename is not made.
     pub fn stop_typing(&mut self) {
         self.typing = None;
+        if let Some(import) = &mut self.import {
+            import.stop_typing();
+        }
     }
 
     fn select(&mut self, file: &str) {
@@ -793,10 +965,14 @@ impl LibraryPage {
         } else {
             format!("{} of {}", found.len(), plural(total, "song"))
         };
+        let imported = self.imported.as_deref();
         let songs = found
             .into_iter()
             .enumerate()
-            .map(|(index, song)| song_row(index, song))
+            .map(|(index, song)| SongRow {
+                imported: imported == Some(song.song.as_str()),
+                ..song_row(index, song)
+            })
             .collect();
         LibraryView {
             folder: self.root.display().to_string(),
@@ -837,6 +1013,13 @@ impl LibraryPage {
             searching: self.typing == Some(Field::Search),
             notice: self.notice.clone(),
             warning: self.warning.clone(),
+            importing: self.probing.as_ref().map(|(_, source)| {
+                let name = source.file_name().map_or_else(
+                    || source.display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                format!("Reading {name}…")
+            }),
         }
     }
 
@@ -1042,6 +1225,7 @@ fn song_row(index: usize, song: &SongEntry) -> SongRow {
         bpm: song.bpm.to_string(),
         length: clock(frames / u64::from(song.sample_rate.max(1))),
         stems: plural(song.stems, "stem"),
+        imported: false,
     }
 }
 
@@ -1069,6 +1253,22 @@ fn summary(lengths: &[Option<u64>]) -> String {
     match total.saturating_add(30) / 60 {
         0 => format!("{items} · < 1 min"),
         minutes => format!("{items} · ≈ {minutes} min"),
+    }
+}
+
+/// The catalog of a song listing and the lines of the song folders it
+/// could not read; a listing that failed is one line.
+fn songs_of(listing: Result<SongListing, SetlistError>) -> (Catalog, Vec<String>) {
+    match listing {
+        Ok(listing) => (
+            Catalog::from_listing(&listing),
+            listing
+                .unreadable
+                .iter()
+                .map(|song| song.error.to_string())
+                .collect(),
+        ),
+        Err(error) => (Catalog::default(), vec![error.to_string()]),
     }
 }
 
@@ -1280,6 +1480,8 @@ pub struct SongRow {
     pub length: String,
     /// Stem count, such as "14 stems".
     pub stems: String,
+    /// Whether it is the song just imported.
+    pub imported: bool,
 }
 
 /// Everything the Library screen shows.
@@ -1317,4 +1519,7 @@ pub struct LibraryView {
     /// The last warning: something done that is not quite whole, such as a
     /// setlist saved without its place in the stored order.
     pub warning: Option<String>,
+    /// What the import is reading, such as "Reading First Light…", while
+    /// it reads.
+    pub importing: Option<String>,
 }

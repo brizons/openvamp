@@ -68,7 +68,7 @@ Requirements quote `docs/mvp-spec.md` (F1) and the user verbatim. Items marked *
 | T1 | S2 | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L4; verified L7; review approved L8) | 883b398 |
 | T2 | S6 | delegated (parallel unit with T1, disjoint surface `crates/library` decoding, `Cargo.toml`, `Cargo.lock`) | done (L5); independent verifier pending | see L5 |
 | T3 | S1, S3, S4, S5 (library side) | delegated (context backstop); needs T1 and T2 | done (L9); independent verifier pending | see L9 |
-| T4 | S7 | delegated (context backstop); needs T3 | pending | |
+| T4 | S7 | delegated (context backstop); needs T3 | done (L13); independent verifier and screenshot check pending | see L13 |
 | T5 | S8 | inline, with each task's own docs | pending | |
 
 Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` and the desktop consume (item 3), so each gets an independent verifier. T1 changes the shared bus rules (item 3).
@@ -158,3 +158,51 @@ Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` an
   - **Parent fix:** `import/save.rs` had copied the Windows reserved-name list from `setlists.rs`. It now calls `setlists::is_windows_reserved` (now `pub(crate)`). The parent re-ran fmt, `cargo test -p library -p domain` (323 pass) and clippy, all clean.
   - **Disk:** the parent removed T3's scratch, `target/release` and `target/debug/incremental` (free 6.4 GiB).
   - Risk: item 5 (dependencies) and item 2 (ZIP entry names as untrusted paths), so T3 gets an independent verifier.
+- **L10** (2026-11-26): T3 is now two commits, so native review can take each part alone: 7a4c0a2 (domain: song drafts and `bus_for_stem`, about 1,400 lines) and c1f710f (library import, dependencies and this document, about 3,000 lines). T4 launched on c1f710f. The T3 verifier waits for the T2 verifier, so that their scratch builds do not run out of disk.
+- **L11** (2026-11-26): the T2 verifier found three blockers in 0c390d5.
+  - **What passes:**
+    - Full decodes of 648 FLAC stems (16/24-bit, 44.1/48/96 kHz, mono/stereo, odd lengths, flacenc and flac 1.5.0 in 9 encodings) match their WAV twins.
+    - WAV behaviour is unchanged: render-cli gives 63/63 identical runs over 21 songs, and messages and listings are identical.
+    - Real-time allocation tests and the 13 new crates' licenses pass. flacenc is dev-only, and symphonia has FLAC only.
+    - Release seek plus first frame takes 0.1–0.5 ms.
+  - **Blockers:**
+    - **B1:** a short or mostly silent FLAC streamed from its start loses frames 4096–6143. symphonia 0.6.1 skips its parser reset after the open-time last-frame read; a fresh `FlacReader` per seek fixes it.
+    - **B2:** 32-bit stereo FLAC decodes wrong in release and panics in debug (a symphonia limit).
+    - **B3:** a truncated `flac` CLI file with a SEEKTABLE panics in `open_streaming` in debug.
+  - **Advisories:**
+    - a forged SEEKTABLE panics on the disk thread in debug;
+    - 32-bit mono `-b 256` overflows in debug;
+    - bad metadata blocks are reported as "ends before its first audio frame";
+    - the ID3 prefix and zero-length cases from L5 remain;
+    - the writer's tests used only noise;
+    - variable-blocksize streams are untested.
+  - **Correction batch:** the T2 writer was resumed in the main tree, at the same time as T4 (disjoint: library vs apps/desktop). It fixes B1–B3, and the import refuses FLAC over 24 bits. The parent will commit the playback fix and the import refusal separately, so the playback fix can be moved next to 0c390d5 before T2's native review. The review waits for the corrected code, and the verifier then rechecks only B1–B3.
+- **L12** (2026-11-26): the correction batch landed in two commits.
+  - **904002a (a):**
+    - **B1:** each seek opens a fresh `FlacReader`, and frame 0 needs no seek.
+    - **B2:** FLAC over 24 bits is refused as `UnsupportedFlacFormat` ("supported FLAC stems are 4- to 24-bit, mono or stereo"), and the render-cli README now says 4- to 24-bit.
+    - **B3:** the new `decode/flac/frames.rs` hands symphonia only STREAMINFO plus the audio frames, after checking that the metadata blocks fit the file. This also fixes advisory 1, skips damaged tag and picture blocks, and gives precise metadata messages.
+    - **Tests:** the new tests/flac_stream.rs, tone and silence signals, a SEEKTABLE written by hand, and fixtures `tone-32bit-stereo.flac` (28.5 KB) and `tone-32bit-mono-b256.flac` (18.8 KB).
+  - **dc218ab (b):** the import refuses FLAC over 24 bits by codec, before decoding.
+  - **Checks:**
+    - RED: the gap, 32-bit and cut-SEEKTABLE tests failed or panicked first.
+    - GREEN: the writer's full verification list passes in the main tree, and the verifier's own probes pass against the fix (283 hostile cases, 0 bad).
+    - The parent re-ran `--test flac_stream` (3 passed) and `--test hostile_header` (6 passed).
+- **L13** (2026-11-26): T4 delivered.
+  - **New files:** `song_import.rs` (the Song editor view model, the background probe and save jobs on `cx.background_executor()` as PR #21 does, process-unique tickets, cancel on Discard, the header line) and `song_editor_ui.rs` (header, notes, a "Tempo and meter" panel, and the Stems panel with the part menu and "Show N more").
+  - **Changed files:** `library_page.rs`, `library_ui.rs` (the "Import stems" drop zone), `screen.rs` (picker for a folder or file, drop, save), `tick.rs`, `action.rs`, `theme.rs`, icons `import.svg` and `left.svg`, and the "WAV or FLAC stems" wording in `ui.rs` and `main.rs`. The desktop README has an import section.
+  - **Drop:** GPUI 0.2.2 supports dropping through `ExternalPaths`.
+  - **Design differences:**
+    - the part menu opens inline, as the Mixer menus do;
+    - a left "Tempo and meter" panel, 330 px wide;
+    - "From <source>", the notes box, "Saving… N%" and a marked new song row are additions;
+    - "WAV + FLAC" for mixed formats.
+  - **Writer's assumptions, kept:**
+    - the "Library" back link discards the draft;
+    - a new change goes 8 bars after the last;
+    - Discard after a finished save keeps the song with a warning;
+    - opening another library cancels a running save.
+  - **Checks:**
+    - RED: 27 import tests failed against stubs, plus the picker test.
+    - GREEN: `cargo test -p openvamp` passes 281 tests, with clippy, fmt and the workspace check clean. The parent re-ran `--test song_import` (29 passed).
+  - Risk: item 4 (background jobs, the cancel flag and result ordering), so T4 gets an independent verifier.
