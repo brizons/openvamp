@@ -2,7 +2,8 @@
 //! them (F1.2, F7.2).
 //!
 //! Stems go to buses automatically by part: [`bus_for_stem`] reads the stem's
-//! role, then its `part`, then its file name. The user can send a stem to
+//! role, then its `part` (a [`Part`] id goes to that part's bus, `other` to
+//! [`DEFAULT_BUS`]; any other text by the table), then its file name. The user can send a stem to
 //! another bus; that choice lives in the arrangement's mix (`mix.json`),
 //! never here.
 //!
@@ -174,12 +175,16 @@ impl fmt::Display for Bus {
 }
 
 /// The bus a stem goes to by the rules table: click and guide stems always go
-/// to [`Bus::ClickGuide`]; any other stem goes where its `part` says, else
-/// where its file name says (without folders or extension), else to
-/// [`DEFAULT_BUS`].
+/// to [`Bus::ClickGuide`]; a stem whose `part` is a [`Part`] id goes to that
+/// part's bus (so `other` goes to [`DEFAULT_BUS`]); any other stem goes where
+/// its `part` says, else where its file name says (without folders or
+/// extension), else to [`DEFAULT_BUS`].
 pub fn bus_for_stem(stem: &Stem) -> Bus {
     if matches!(stem.role, StemRole::Click | StemRole::Guide) {
         return Bus::ClickGuide;
+    }
+    if let Some(part) = Part::from_id(&stem.part) {
+        return part.bus();
     }
     bus_for_name(&stem.part)
         .or_else(|| bus_for_name(file_name(&stem.file)))
@@ -393,9 +398,11 @@ const RULES: &[(&str, Part, Weight)] = &[
 
 /// Two-word instruments, checked before the second word alone.
 ///
-/// A phrase only makes a part more precise; it never moves a name to another
-/// bus. Its part is on the bus of its second word when that word names an
-/// instrument, else on the bus of its first word, which then names one.
+/// A phrase decides its own part, whatever its words say alone, so it can
+/// put a name on another bus than its second word's: "bass guitar" is Bass,
+/// not Guitars; "bass synth", "bajo sinte" and "bajo sintetizador" are Synth
+/// bass on Bass, not Keys & Pads; and "voz guia" is Vocals, not Click &
+/// Guide. Every other phrase is on the bus of its second word.
 const PHRASES: &[(&str, &str, Part)] = &[
     ("bass", "guitar", Part::Bass),
     ("bass", "synth", Part::SynthBass),
@@ -470,7 +477,7 @@ fn push_word(words: &mut Vec<String>, current: &mut String) {
 }
 
 /// A lowercase letter without its accent: `á` is `a`, `ñ` is `n`.
-fn without_accent(c: char) -> char {
+pub(crate) fn without_accent(c: char) -> char {
     match c {
         'á' | 'à' | 'â' | 'ä' | 'ã' => 'a',
         'é' | 'è' | 'ê' | 'ë' => 'e',
