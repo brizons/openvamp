@@ -11,6 +11,7 @@ use flacenc::component::{BitRepr, Stream, StreamInfo};
 use flacenc::config::Encoder;
 use flacenc::error::{Verified, Verify};
 use flacenc::source::{Context, Fill, FrameBuf};
+use symphonia::core::codecs::audio::well_known::CODEC_ID_FLAC;
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
@@ -27,6 +28,11 @@ const FLAC_BITS: usize = 24;
 
 /// Frames per FLAC block: the encoder's default.
 const FLAC_BLOCK: usize = 4_096;
+
+/// The deepest FLAC the import decodes, as the player reads it: `symphonia`
+/// 0.6.1 decodes deeper FLAC wrong (a 32-bit stereo side channel needs 33
+/// bits), so such a file is refused rather than transcoded.
+const MAX_FLAC_BITS: u32 = 24;
 
 /// Largest 24-bit sample, as a float.
 const MAX_24: f64 = 8_388_607.0;
@@ -109,6 +115,14 @@ fn open(path: &Path, format: SourceFormat) -> Result<Decoding, String> {
         .as_ref()
         .and_then(|params| params.audio())
         .ok_or_else(|| "it has no audio".to_owned())?;
+    if let Some(bits) = params
+        .bits_per_sample
+        .filter(|&bits| params.codec == CODEC_ID_FLAC && bits > MAX_FLAC_BITS)
+    {
+        return Err(format!(
+            "it is {bits}-bit FLAC, and FLAC is decoded up to {MAX_FLAC_BITS}-bit"
+        ));
+    }
     let mut options = AudioDecoderOptions::default();
     options.gapless = true;
     let decoder = symphonia::default::get_codecs()

@@ -1025,3 +1025,40 @@ fn an_audio_file_linked_from_outside_the_source_folder_is_refused() {
         ]
     );
 }
+
+/// `tests/fixtures/tone-32bit-stereo.flac` (see `tests/flac.rs`): the
+/// decoder reads 32-bit FLAC wrong, so the import refuses it rather than
+/// transcode it, whatever its name and with or without an ID3 tag in front.
+#[test]
+fn a_flac_deeper_than_24_bits_is_refused_not_transcoded() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Song");
+    wav(&source.join("Drums.wav"), RATE, 1_000);
+    let deep = fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone-32bit-stereo.flac"),
+    )
+    .unwrap();
+    fs::write(source.join("Deep.flac"), &deep).unwrap();
+    fs::write(source.join("Renamed.wav"), &deep).unwrap();
+    let mut tagged = id3_tag();
+    tagged.extend(&deep);
+    fs::write(source.join("Tagged.flac"), tagged).unwrap();
+
+    let draft = probe_import(&source).unwrap();
+
+    assert_eq!(names(&draft), ["Drums.wav"]);
+    let refused: Vec<(&str, &str)> = draft
+        .refused()
+        .iter()
+        .map(|file| (file.name.as_str(), file.reason.as_str()))
+        .collect();
+    let reason = "it cannot be decoded: it is 32-bit FLAC, and FLAC is decoded up to 24-bit";
+    assert_eq!(
+        refused,
+        [
+            ("Deep.flac", reason),
+            ("Renamed.wav", reason),
+            ("Tagged.flac", reason),
+        ]
+    );
+}
