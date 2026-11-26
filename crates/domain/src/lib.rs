@@ -9,8 +9,10 @@
 //! orders songs and click-only tiles; [`Setlist::validate`] checks it against
 //! what a [`SongLookup`] knows about the library's songs.
 //!
-//! Stems play through six [`Bus`]es: [`bus_for_stem`] picks one from the
-//! rules table, and an arrangement's [`ArrangementMix`] (stored in a song's
+//! A stem's instrument is one of the fixed [`Part`]s: [`part_for_file`] picks
+//! one from its file name by the rules table, and each part belongs to one
+//! bus. Stems play through six [`Bus`]es: [`bus_for_stem`] picks one from the
+//! same rules table, and an arrangement's [`ArrangementMix`] (stored in a song's
 //! `mix.json`, a [`MixFile`]) can send a stem elsewhere. [`effective_gains`]
 //! combines that mix with the global [`BusSettings`] into one gain per stem,
 //! and a [`Routing`] sends each bus to a device's outputs.
@@ -24,6 +26,7 @@ pub mod grid;
 pub mod mix;
 pub mod mixer;
 pub mod package;
+pub mod part;
 pub mod routing;
 pub mod setlist;
 pub mod song;
@@ -48,6 +51,7 @@ pub use package::{
     StemPathProblem, StemRole, TempoPoint, TimeSignaturePoint, Validated, ValidationError,
     ValidationWarning, validate,
 };
+pub use part::{Part, part_for_file, part_for_name};
 pub use routing::{
     Destination, MAX_OUTPUTS, ROUTING_FORMAT_VERSION, RouteTarget, Routing, RoutingError,
     RoutingFile, RoutingValidationError,
