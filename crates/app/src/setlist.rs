@@ -5,6 +5,7 @@
 use std::fmt;
 use std::mem;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use domain::{
     BusSettings, CROSSFADE_SECONDS, ClickItem, MixFile, Routing, SetlistItem,
@@ -16,6 +17,7 @@ use thiserror::Error;
 
 use crate::error::{OpenError, RuntimeError};
 use crate::item::{Item, ItemError};
+use crate::loader::Load;
 use crate::output::{AudioOutput, OutputCheck};
 use crate::session::{Command, PreparedSong, Session, SessionOptions, Snapshot, check_buffer};
 use crate::song::SongInfo;
@@ -23,6 +25,16 @@ use crate::song::SongInfo;
 /// The rate the device opens at for a setlist with no playable song: only
 /// click-only tiles, which play at any rate.
 pub const CLICK_ONLY_SAMPLE_RATE: u32 = 48_000;
+
+/// How long an operator's next, previous or select waits for its song
+/// item to load, counted from when the load started: a disk that answers
+/// within it selects the item before the command returns, as it always
+/// did; one that does not leaves the selection waiting for the load
+/// ([`SetlistSession`], "Loading"), so the command never waits longer.
+const SELECT_PATIENCE: Duration = Duration::from_millis(250);
+
+/// How long [`SetlistSession::disk_monitors`] waits for an item loading.
+const MONITOR_PATIENCE: Duration = Duration::from_secs(10);
 
 /// What a setlist holds and what the library can provide for it, known
 /// before anything plays.
@@ -354,10 +366,28 @@ struct Withdrawn {
     sent: u64,
 }
 
-/// An item prepared on the control thread, not handed over yet.
+/// An item prepared, not handed over yet.
 struct Pending {
     index: usize,
     item: Item,
+}
+
+/// A song item loading on a thread of its own ([`Load`]), or loaded and
+/// not picked up yet.
+struct Loading {
+    index: usize,
+    /// When its load started.
+    since: Instant,
+    load: Load<Result<Item, String>>,
+}
+
+/// A selection made once its item has loaded: the operator's, or the one
+/// the current item's transition makes at its end.
+#[derive(Debug, Clone, Copy)]
+struct Awaiting {
+    index: usize,
+    /// Whether the item plays once selected.
+    play: bool,
 }
 
 /// A setlist opened from a library with its first item prepared, on no
@@ -403,6 +433,8 @@ impl PreparedSetlist {
             cued: None,
             withdrawn: None,
             pending: None,
+            loading: None,
+            awaiting: None,
             reopen: None,
             play_after_reopen: false,
             halted: false,
@@ -433,7 +465,8 @@ impl PreparedSetlist {
 /// The session keeps the next playable item prepared while the current one
 /// plays: its folder opened, its player built, its start buffered. Once it
 /// is buffered it is cued on the audio thread's [`engine::live::Deck`], so
-/// the current item's transition never waits for the disk:
+/// the current item's transition never waits for the disk. A song item
+/// loads on a thread of its own (see "Loading" below); the transitions:
 ///
 /// - **Cue next**: at its end the item stops and the next one is selected,
 ///   stopped at its start.
@@ -464,6 +497,33 @@ impl PreparedSetlist {
 /// [`domain::SONG_FADE_OUT_SECONDS`], silent on its last frame; click and
 /// guide play on to its end, as with the Fade control (F6.4).
 ///
+/// # Loading
+///
+/// Opening a song item reads its `song.json` and opens its stems, which a
+/// slow, sleeping or unplugged volume can hold up for seconds. So a song
+/// item loads on a thread of its own, and [`Self::poll`] picks it up once
+/// it has loaded: a poll, Panic and every transport command answer at once
+/// while a read hangs. (A click-only tile reads nothing and is built at
+/// once.) An item still loading when it is due waits for its load:
+///
+/// - **AutoLink** or **Crossfade**: the current item ends and stays
+///   current, stopped, and the item starts as soon as it has loaded and
+///   buffered, as when it was not buffered in time
+///   ([`SetlistProblem::LateLink`]).
+/// - **Cue next**: the current item ends and stays current, stopped; the
+///   item is selected, stopped at its start, once it has loaded.
+/// - **Next, previous or select**: the command waits for the load a
+///   moment (the disk that answers within it selects the item before the
+///   command returns), then returns. The current item stops with its ramp
+///   and stays current; the item is selected, stopped at its start, once
+///   it has loaded. A play sent meanwhile plays it then, and a pause, stop
+///   or panic cancels that play, as for an item the device reopens for.
+///
+/// Meanwhile the snapshot shows the current item, with the item awaited as
+/// [`SetlistState::next`] and [`SetlistState::next_ready`] false. A load
+/// that fails reads as [`SetlistProblem::Prepare`], and the current item
+/// stays selected.
+///
 /// # Operator commands
 ///
 /// [`SetlistCommand::Item`] takes every command a single-song
@@ -490,6 +550,10 @@ pub struct SetlistSession {
     /// The item cued last, sent back; never set while one is cued.
     withdrawn: Option<Withdrawn>,
     pending: Option<Pending>,
+    /// The song item loading: the next one, or the one a selection awaits.
+    loading: Option<Loading>,
+    /// A selection waiting for its item to load.
+    awaiting: Option<Awaiting>,
     /// An item at another rate waiting for the current one to stop before
     /// the device reopens.
     reopen: Option<Pending>,
@@ -584,7 +648,9 @@ impl SetlistSession {
 
     /// Watches the disk threads of the current item, the item a crossfade
     /// fades out while it does, and the items prepared ahead; for tests and
-    /// diagnostics.
+    /// diagnostics. A song item still loading has no disk thread yet: this
+    /// first waits for its load, at most 10 seconds, so its thread is
+    /// watched too.
     pub fn disk_monitors(&self) -> Vec<DiskMonitor> {
         let mut monitors = vec![self.session.disk_monitor()];
         monitors.extend(self.fading.clone());
@@ -600,6 +666,13 @@ impl SetlistSession {
                 .chain(&self.reopen)
                 .map(|pending| pending.item.monitor.clone()),
         );
+        if let Some(loading) = &self.loading {
+            loading.load.wait(Instant::now() + MONITOR_PATIENCE);
+            let loaded = loading
+                .load
+                .peek(|loaded| loaded.as_ref().ok().map(|item| item.monitor.clone()));
+            monitors.extend(loaded.flatten());
+        }
         monitors
     }
 
@@ -648,24 +721,33 @@ impl SetlistSession {
         let target = self
             .reopen
             .as_ref()
-            .map_or(self.current, |pending| pending.index);
+            .map(|pending| pending.index)
+            .or(self.awaiting.map(|awaiting| awaiting.index))
+            .unwrap_or(self.current);
         let item = match command {
             SetlistCommand::Item(command) => {
                 // The last transport command wins, also for the item the
-                // device is about to reopen for.
+                // device is about to reopen for, or a selection awaits.
                 match command {
                     Command::Play => {
                         self.halted = false;
-                        // Play starts the item the device reopens for, not
-                        // the one ramping out.
+                        // Play starts the item the device reopens for, or
+                        // the one loading, not the one ramping out.
                         if self.reopen.is_some() {
                             self.play_after_reopen = true;
+                            return Ok(());
+                        }
+                        if let Some(awaiting) = &mut self.awaiting {
+                            awaiting.play = true;
                             return Ok(());
                         }
                     }
                     Command::Pause | Command::Stop | Command::Panic => {
                         self.halted = true;
                         self.play_after_reopen = false;
+                        if let Some(awaiting) = &mut self.awaiting {
+                            awaiting.play = false;
+                        }
                     }
                     _ => {}
                 }
@@ -693,7 +775,7 @@ impl SetlistSession {
         };
         self.problem = None;
         self.failed = None;
-        self.select(item, false)
+        self.select(item, false, true)
     }
 
     /// Moves the session on and returns its state: follows the deck's
@@ -708,9 +790,13 @@ impl SetlistSession {
             report.applied,
             report.status().transport.is_running(),
         );
+        self.finish_awaited();
         self.keep_next_ready();
         let song = self.session.end_poll(&report, now);
-        let next = self.next_playable(self.current);
+        let next = match self.awaiting {
+            Some(awaiting) => Some(awaiting.index),
+            None => self.next_playable(self.current),
+        };
         let next_ready = self.next_ready(next);
         SetlistSnapshot {
             song,
@@ -816,7 +902,7 @@ impl SetlistSession {
                 !self.halted && rate_fallback(transition, rate, next, self.rate_of(next)).is_none()
             }
         };
-        match self.select(next, late) {
+        match self.select(next, late, false) {
             Ok(()) if late => self.problem = Some(SetlistProblem::LateLink { item: next }),
             Ok(()) => {}
             Err(error) => self.problem = Some(problem(next, error)),
@@ -824,8 +910,17 @@ impl SetlistSession {
     }
 
     /// Makes `target` the current item, stopped at its start, and plays it
-    /// when `play` says so. The item playing stops with its ramp.
-    fn select(&mut self, target: usize, play: bool) -> Result<(), SetlistCommandError> {
+    /// when `play` says so. The item playing stops with its ramp. A song
+    /// item still loading is waited for until [`SELECT_PATIENCE`] after its
+    /// load started when `patient` (an operator's command), not at all from
+    /// a poll; past that the selection awaits the load
+    /// ([`Self::finish_awaited`]).
+    fn select(
+        &mut self,
+        target: usize,
+        play: bool,
+        patient: bool,
+    ) -> Result<(), SetlistCommandError> {
         if let Some(waiting) = self.reopen.take() {
             if waiting.index == target {
                 self.reopen = Some(waiting);
@@ -833,6 +928,15 @@ impl SetlistSession {
                 return Ok(());
             }
             self.play_after_reopen = false;
+        }
+        if let Some(awaiting) = self.awaiting.take()
+            && awaiting.index == target
+        {
+            self.awaiting = Some(Awaiting {
+                index: target,
+                play: awaiting.play || play,
+            });
+            return Ok(());
         }
         if target == self.current {
             self.session.send(Command::Stop)?;
@@ -851,9 +955,19 @@ impl SetlistSession {
                 self.session.uncue()?;
                 self.cued = None;
             }
-            let mut pending = match self.pending.take() {
-                Some(pending) if pending.index == target => pending,
-                _ => self.prepare_item(target)?,
+            let loaded = match self.pending.take() {
+                Some(pending) if pending.index == target => Some(pending),
+                _ => self.prepare_waiting(target, patient)?,
+            };
+            let Some(mut pending) = loaded else {
+                // Still loading: what plays stops with its ramp, and the
+                // item is selected once it has loaded.
+                self.session.send(Command::Stop)?;
+                self.awaiting = Some(Awaiting {
+                    index: target,
+                    play,
+                });
+                return Ok(());
             };
             let (timing, fade) = self.session.carried();
             pending.item.carry(timing, fade);
@@ -908,6 +1022,8 @@ impl SetlistSession {
                 .as_mut()
                 .map(|withdrawn| &mut withdrawn.staged.index),
             self.pending.as_mut().map(|pending| &mut pending.index),
+            self.loading.as_mut().map(|loading| &mut loading.index),
+            self.awaiting.as_mut().map(|awaiting| &mut awaiting.index),
             self.reopen.as_mut().map(|pending| &mut pending.index),
             self.failed.as_mut(),
             self.blend_from.as_mut(),
@@ -943,7 +1059,7 @@ impl SetlistSession {
     /// buffered, with the current item's transition as the handoff. A cue
     /// or preparation for another item is dropped first.
     fn keep_next_ready(&mut self) {
-        if self.reopen.is_some() {
+        if self.reopen.is_some() || self.awaiting.is_some() {
             return;
         }
         let want = self.next_playable(self.current);
@@ -969,6 +1085,13 @@ impl SetlistSession {
         {
             self.pending = None;
         }
+        if self
+            .loading
+            .as_ref()
+            .is_some_and(|loading| Some(loading.index) != want)
+        {
+            self.loading = None;
+        }
         let Some(want) = want else {
             return;
         };
@@ -977,7 +1100,9 @@ impl SetlistSession {
         }
         if self.pending.is_none() {
             match self.prepare_item(want) {
-                Ok(pending) => self.pending = Some(pending),
+                Ok(Some(pending)) => self.pending = Some(pending),
+                // Picked up by a later poll.
+                Ok(None) => return,
                 Err(error) => {
                     self.failed = Some(want);
                     self.problem = Some(problem(want, error));
@@ -1026,19 +1151,84 @@ impl SetlistSession {
         }
     }
 
-    /// Builds item `index` at the device's rate.
-    fn prepare_item(&self, index: usize) -> Result<Pending, SetlistCommandError> {
-        let plan = self.plans.get(index).and_then(Option::as_ref);
-        if plan.is_none() {
-            return Err(SetlistCommandError::Unplayable { item: index });
-        }
-        let item = build(plan, self.session.sample_rate(), &self.options).map_err(|error| {
-            SetlistCommandError::Prepare {
-                item: index,
-                error: error.to_string(),
+    /// Item `index`, built at the device's rate. A click-only tile is built
+    /// at once. A song item loads on a thread of its own: the first call
+    /// starts its load (one for another item is dropped) and returns
+    /// `Ok(None)`, as does every call until it has loaded.
+    fn prepare_item(&mut self, index: usize) -> Result<Option<Pending>, SetlistCommandError> {
+        let prepare_error = |error: String| SetlistCommandError::Prepare { item: index, error };
+        let plan = match self.plans.get(index).and_then(Option::as_ref) {
+            None => return Err(SetlistCommandError::Unplayable { item: index }),
+            Some(Plan::Click(click)) => {
+                let plan = Plan::Click(*click);
+                return build(Some(&plan), self.session.sample_rate(), &self.options)
+                    .map(|item| Some(Pending { index, item }))
+                    .map_err(|error| prepare_error(error.to_string()));
             }
-        })?;
-        Ok(Pending { index, item })
+            Some(plan) => plan.clone(),
+        };
+        let Some(loading) = self
+            .loading
+            .as_ref()
+            .filter(|loading| loading.index == index)
+        else {
+            let (rate, options) = (self.session.sample_rate(), self.options.clone());
+            self.loading = Some(Loading {
+                index,
+                since: Instant::now(),
+                load: Load::spawn(
+                    move || build(Some(&plan), rate, &options).map_err(|error| error.to_string()),
+                    Err,
+                ),
+            });
+            return Ok(None);
+        };
+        let Some(loaded) = loading.load.take() else {
+            return Ok(None);
+        };
+        self.loading = None;
+        loaded
+            .map(|item| Some(Pending { index, item }))
+            .map_err(prepare_error)
+    }
+
+    /// [`Self::prepare_item`], waiting for a song item to load until
+    /// [`SELECT_PATIENCE`] after its load started when `patient`.
+    fn prepare_waiting(
+        &mut self,
+        index: usize,
+        patient: bool,
+    ) -> Result<Option<Pending>, SetlistCommandError> {
+        let pending = self.prepare_item(index)?;
+        if pending.is_some() || !patient {
+            return Ok(pending);
+        }
+        if let Some(loading) = &self.loading {
+            loading.load.wait(loading.since + SELECT_PATIENCE);
+        }
+        self.prepare_item(index)
+    }
+
+    /// Makes the selection that awaits its item once the item has loaded
+    /// ([`Self::select`]); one whose load failed says why, and the current
+    /// item stays selected.
+    fn finish_awaited(&mut self) {
+        let Some(awaiting) = self.awaiting else {
+            return;
+        };
+        let loaded = self.loading.as_ref().is_none_or(|loading| {
+            loading.index != awaiting.index || loading.load.peek(|_| ()).is_some()
+        });
+        if !loaded {
+            return;
+        }
+        self.awaiting = None;
+        if let Err(error) = self.select(awaiting.index, awaiting.play, false) {
+            if matches!(error, SetlistCommandError::Prepare { .. }) {
+                self.failed = Some(awaiting.index);
+            }
+            self.problem = Some(problem(awaiting.index, error));
+        }
     }
 
     fn next_ready(&mut self, next: Option<usize>) -> bool {

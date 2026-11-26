@@ -208,6 +208,9 @@ impl fmt::Display for ItemError {
 /// and the stream's seam crossfade, so the stream always keeps what the
 /// player's seams read (advisory A3).
 fn stream(dir: &Path, options: &SessionOptions) -> Result<StreamingSong, OpenError> {
+    if let Some(gate) = &options.open_gate {
+        gate(dir);
+    }
     let stream_config = StreamConfig {
         seam_crossfade: options.seam_crossfade,
         gate: options.disk_gate.clone(),
