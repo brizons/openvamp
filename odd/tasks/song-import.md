@@ -280,4 +280,19 @@ Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` an
     - the release timing was not re-measured because of low disk.
 
   The T3 verifier is rechecking B1–B4 on b05d730.
+- **L20** (2026-11-26): the T4 verifier (on 6aa0db8, now dca6066) found one blocker.
+  - **B1:** quitting during "Saving…" (Cmd-Q or closing the last window) leaves the partial song in a hidden `.import-<pid>-<n>.tmp` folder forever, 149 MB in its probe. GPUI gives quit handlers 100 ms and `on_app_quit` only closes the song.
+  - **What passes:**
+    - the S7 flow (probe errors, stems with AUTO and bus, headers, part override, fields, tempo and meter changes, rate mismatch, length warning, refused files, save and mark);
+    - concurrency: stale probe and save results are ignored, 400 of 400 across pages, from one process-wide ticket counter;
+    - Discard mid-save leaves nothing behind;
+    - progress never goes backwards within a save; the 96% then 90% the parent saw were two different saves;
+    - keys typed in the editor do not reach the shortcuts;
+    - wording;
+    - `cargo test -p openvamp` 281 passed; the tests only gained lines.
+  - **Advisories:**
+    - A1: the macOS picker is modeless, so a late pick replaces an open draft silently;
+    - A2: the "Cannot import stems while a song is being saved." notice is hidden behind the editor;
+    - the button stays at 100% during the final read-through.
+  - **Correction:** the T4 writer was resumed to fix B1. It will ask before quitting while a save runs and defer the quit until the save has stopped and cleaned up. A library backstop will remove certainly stale `.import-*.tmp` folders when an import starts, which also covers the T3 advisory A4 (`kill -9`).
 
