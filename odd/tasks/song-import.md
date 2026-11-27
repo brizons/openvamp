@@ -67,7 +67,7 @@ Requirements quote `docs/mvp-spec.md` (F1) and the user verbatim. Items marked *
 |----|-------|-------|--------|---------|
 | T1 | S2 | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L4; verified L7; review approved L8) | 883b398 |
 | T2 | S6 | delegated (parallel unit with T1, disjoint surface `crates/library` decoding, `Cargo.toml`, `Cargo.lock`) | done (L5; blockers fixed L12; verified L15; review approved L16) | 0c390d5, b906f5e |
-| T3 | S1, S3, S4, S5 (library side) | delegated (context backstop); needs T1 and T2 | done (L9; blockers fixed L19; verified L21); reviews running | 6ea066c, 05b8af2, 4318887, b05d730 |
+| T3 | S1, S3, S4, S5 (library side) | delegated (context backstop); needs T1 and T2 | done (L9; blockers fixed L19; verified L21; reviews approved L22) | 6ea066c, 05b8af2, 4318887, b05d730 |
 | T4 | S7 | delegated (context backstop); needs T3 | done (L13); independent verifier and screenshot check pending | see L13 |
 | T5 | S8 | inline, with each task's own docs | pending | |
 
@@ -305,4 +305,16 @@ Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` an
   - **Reviews:** the user granted both T3 slices ("Revisar este cambio" for each):
     - domain, `si-t3d`, b906f5e..6ea066c, 1,433 lines, lenses risk, reliability and readability;
     - library, `si-t3l`, 6ea066c..b05d730, 3,701 lines, lenses risk, resilience and reliability.
+- **L22** (2026-11-26): both T3 reviews approved and were acknowledged. The reviewed boundary is now b05d730.
+  - **Domain review** (lineage review-1e6cb1007531f263):
+    - WARNING: `bus_for_stem` matches part ids case-sensitively, and the docs do not say so.
+    - WARNING: a legacy package whose part is exactly `other` now goes to `DEFAULT_BUS`. This is intended (L4), but no migration note exists.
+    - WARNING: the combined value-and-stem error path of `to_package` is untested.
+    - SUGGESTION: the song-length limit is duplicated in `SongDraft::maps`.
+  - **Library review** (lineage review-3a694fbba2888f49):
+    - WARNING: mp4.rs box size overflow (a debug panic or a release wrap on a crafted M4A). A scan error refuses an otherwise decodable M4A.
+    - WARNING: a ZIP entry copied as is is not `sync_all`ed before its rename.
+    - WARNING: a long ZIP entry extraction ignores cancel and sends no progress.
+    - SUGGESTIONS: the probe extracts every ZIP entry; one `report` result is discarded; no test saves a transcoded stem from a ZIP.
+  - **Routing:** the box overflow, the ZIP sync and the discarded `report` were sent to the T4 writer, to land in the T4 slice. The rest are follow-ups, as is the user's preference ([[fewer-review-rounds]]).
 
