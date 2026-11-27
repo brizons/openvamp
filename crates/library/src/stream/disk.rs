@@ -10,47 +10,76 @@ use hound::SampleFormat;
 use rtrb::{Consumer, Producer};
 
 use super::{Block, Counters, Gate};
-use crate::{LoadError, OpenedStem, StemReader, int_scale};
+use crate::decode::FlacStem;
+use crate::{DecodeError, LoadError, OpenedStem, StemReader, int_scale};
 
 /// How long the disk thread sleeps when it has nothing to do. The audio
 /// thread never wakes it (that would be a system call), so this bounds how
 /// late a new request is noticed.
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
 
-/// Reads blocks of one WAV stem as stereo `f32`.
+/// Reads blocks of one WAV or FLAC stem as stereo `f32`.
 pub(super) struct Decoder {
-    reader: StemReader,
-    channels: usize,
+    file: StemFile,
     frames: u64,
-    /// `None` for float samples.
-    int_scale: Option<f32>,
+}
+
+/// The open file of a [`Decoder`].
+enum StemFile {
+    Wav {
+        reader: StemReader,
+        channels: usize,
+        /// `None` for float samples.
+        int_scale: Option<f32>,
+    },
+    Flac(Box<FlacStem>),
 }
 
 impl Decoder {
     /// Rejects a file whose header declares more samples than it holds, as
-    /// [`crate::load_song`] does when it decodes it.
+    /// [`crate::load_song`] does when it decodes it. A FLAC file must decode
+    /// its last declared frame.
     pub(super) fn new(stem: &Stem, opened: OpenedStem) -> Result<Self, LoadError> {
-        let OpenedStem {
-            reader,
-            max_samples,
-        } = opened;
-        if u64::from(reader.len()) > max_samples {
-            return Err(LoadError::Decode {
-                id: stem.id.clone(),
-                file: stem.file.clone(),
-                source: hound::Error::FormatError(
-                    "the file holds fewer samples than its header declares",
-                ),
-            });
+        let decode_error = |source| LoadError::Decode {
+            id: stem.id.clone(),
+            file: stem.file.clone(),
+            source,
+        };
+        match opened {
+            OpenedStem::Wav {
+                reader,
+                max_samples,
+            } => {
+                if u64::from(reader.len()) > max_samples {
+                    return Err(decode_error(
+                        hound::Error::FormatError(
+                            "the file holds fewer samples than its header declares",
+                        )
+                        .into(),
+                    ));
+                }
+                let spec = reader.spec();
+                Ok(Self {
+                    frames: u64::from(reader.duration()),
+                    file: StemFile::Wav {
+                        channels: usize::from(spec.channels),
+                        int_scale: (spec.sample_format == SampleFormat::Int)
+                            .then(|| int_scale(spec.bits_per_sample)),
+                        reader,
+                    },
+                })
+            }
+            OpenedStem::Flac(mut flac) => {
+                let frames = flac.frames();
+                // STREAMINFO never declares 0 frames: a stem without a
+                // length is refused when it is opened.
+                flac.read(frames - 1, &mut [0.0; 2]).map_err(decode_error)?;
+                Ok(Self {
+                    frames,
+                    file: StemFile::Flac(flac),
+                })
+            }
         }
-        let spec = reader.spec();
-        Ok(Self {
-            channels: usize::from(spec.channels),
-            frames: u64::from(reader.duration()),
-            int_scale: (spec.sample_format == SampleFormat::Int)
-                .then(|| int_scale(spec.bits_per_sample)),
-            reader,
-        })
     }
 
     pub(super) fn frames(&self) -> u64 {
@@ -60,25 +89,44 @@ impl Decoder {
     /// Fills `out` with the stereo frames from source frame `start`: a mono
     /// stem on both sides, silence past the end. Samples convert exactly as
     /// [`crate::load_song`] converts them.
-    fn decode(&mut self, start: u64, out: &mut [f32]) -> hound::Result<()> {
+    fn decode(&mut self, start: u64, out: &mut [f32]) -> Result<(), DecodeError> {
         out.fill(0.0);
         if start >= self.frames {
             return Ok(());
         }
         let frames = ((out.len() / 2) as u64).min(self.frames - start) as usize;
-        let start = u32::try_from(start).map_err(|_| hound::Error::TooWide)?;
-        self.reader.seek(start)?;
-        let channels = self.channels;
-        match self.int_scale {
-            Some(scale) => {
-                let samples = self
-                    .reader
-                    .samples::<i32>()
-                    .map(|sample| sample.map(|sample| sample as f32 * scale));
-                fill(out, channels, frames, samples)
-            }
-            None => fill(out, channels, frames, self.reader.samples::<f32>()),
+        match &mut self.file {
+            StemFile::Wav {
+                reader,
+                channels,
+                int_scale,
+            } => decode_wav(reader, *channels, *int_scale, start, &mut out[..2 * frames])
+                .map_err(DecodeError::from),
+            StemFile::Flac(flac) => flac.read(start, &mut out[..2 * frames]),
         }
+    }
+}
+
+/// Fills `out` with the stereo frames of a WAV stem from source frame
+/// `start`, all inside the stem.
+fn decode_wav(
+    reader: &mut StemReader,
+    channels: usize,
+    int_scale: Option<f32>,
+    start: u64,
+    out: &mut [f32],
+) -> hound::Result<()> {
+    let frames = out.len() / 2;
+    let start = u32::try_from(start).map_err(|_| hound::Error::TooWide)?;
+    reader.seek(start)?;
+    match int_scale {
+        Some(scale) => {
+            let samples = reader
+                .samples::<i32>()
+                .map(|sample| sample.map(|sample| sample as f32 * scale));
+            fill(out, channels, frames, samples)
+        }
+        None => fill(out, channels, frames, reader.samples::<f32>()),
     }
 }
 

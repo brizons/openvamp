@@ -437,3 +437,58 @@ fn a_fifo_inside_the_song_folder_is_rejected_without_blocking() {
         "{problems:?}"
     );
 }
+
+/// The messages a broken WAV stem gives stay word for word as they were
+/// before FLAC stems: unreadable, unsupported, and a header claiming more
+/// samples than the file holds, loaded and streamed.
+#[test]
+fn wav_stem_messages_stay_word_for_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    write_manifest(
+        path,
+        &manifest(
+            RATE,
+            &[
+                ("text", "text.wav", StemRole::Track),
+                ("eight", "eight.wav", StemRole::Track),
+            ],
+        ),
+    );
+    fs::write(path.join("text.wav"), "not a wav file").unwrap();
+    write_int(&path.join("eight.wav"), 8, 1, RATE, &[0; 4]);
+
+    let messages: Vec<String> = problems(load_song(path).unwrap_err())
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "stem \"text\" file \"text.wav\" cannot be read: Ill-formed WAVE file: no RIFF tag found",
+            "stem \"eight\" file \"eight.wav\" is 8-bit integer, 1 channel; supported stems are 16-, 24- or 32-bit integer or 32-bit float WAV, mono or stereo",
+        ]
+    );
+
+    write_manifest(
+        path,
+        &manifest(RATE, &[("short", "short.wav", StemRole::Track)]),
+    );
+    let file = path.join("short.wav");
+    write_int(&file, 16, 1, RATE, &[0; 1_000]);
+    let mut bytes = fs::read(&file).unwrap();
+    // 16-bit mono uses the 44-byte PCM header: the data size is at 40..44.
+    bytes[40..44].copy_from_slice(&4_000u32.to_le_bytes());
+    fs::write(&file, bytes).unwrap();
+
+    assert_eq!(
+        load_song(path).unwrap_err().to_string(),
+        "stem \"short\" file \"short.wav\" cannot be decoded: Failed to read enough bytes."
+    );
+    let streamed = library::open_streaming(path, &library::StreamConfig::default())
+        .expect_err("the header claims more samples than the file holds");
+    assert_eq!(
+        streamed.to_string(),
+        "stem \"short\" file \"short.wav\" cannot be decoded: Ill-formed WAVE file: the file holds fewer samples than its header declares"
+    );
+}

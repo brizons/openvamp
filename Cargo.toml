@@ -29,11 +29,15 @@ library = { path = "crates/library" }
 clap = { version = "4.6.7", features = ["derive"] }
 cpal = "0.18.2"
 crossterm = "0.29.0"
+# Test fixtures only for now; the song import will encode FLAC with it.
+flacenc = { version = "0.5.1", default-features = false }
 gpui = "=0.2.2"
 hound = "3.5.1"
 rtrb = "0.4.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# FLAC only for now; the song import adds MP3 and AAC.
+symphonia = { version = "0.6.1", default-features = false, features = ["flac"] }
 tempfile = "3.27.0"
 thiserror = "2.0"
 trash = "5.4.0"
