@@ -47,6 +47,7 @@ Requirements quote `docs/mvp-spec.md` (F2) and the user verbatim. Items marked *
   - the Stems panel, where each stem's part can be changed.
 - **Assumption:** "Save song" validates the package and rewrites `song.json` atomically. Discard drops the edits. Positions stay sample offsets, so a tempo edit keeps every marker on the same audio.
 - **Assumption:** a song saved while it is open on Perform keeps playing as it was loaded, and the edits apply the next time it opens.
+- User (L11): "Ajustar solos". On save, setlist items that play part of an edited arrangement (F5.3 start and end positions) are remapped, so they keep playing the same audio. If a range can no longer be kept (a position it used was removed, or it is no longer contiguous), the save asks first and names the setlist. "Save anyway" clears that item's range, and "Keep editing" cancels. A setlist open in the Library is read again after the save, and quitting waits for a song save in flight.
 - **Assumption:** the import editor stays as it is (one Intro section). Its sections are edited after the save, from the song's edit link.
 
 ### S5 — Perform song map
