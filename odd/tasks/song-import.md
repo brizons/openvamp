@@ -67,7 +67,7 @@ Requirements quote `docs/mvp-spec.md` (F1) and the user verbatim. Items marked *
 |----|-------|-------|--------|---------|
 | T1 | S2 | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L4; verified L7; review approved L8) | 883b398 |
 | T2 | S6 | delegated (parallel unit with T1, disjoint surface `crates/library` decoding, `Cargo.toml`, `Cargo.lock`) | done (L5; blockers fixed L12; verified L15; review approved L16) | 0c390d5, b906f5e |
-| T3 | S1, S3, S4, S5 (library side) | delegated (context backstop); needs T1 and T2 | done (L9); independent verifier pending | see L9 |
+| T3 | S1, S3, S4, S5 (library side) | delegated (context backstop); needs T1 and T2 | done (L9; blockers fixed L19; verified L21); reviews running | 6ea066c, 05b8af2, 4318887, b05d730 |
 | T4 | S7 | delegated (context backstop); needs T3 | done (L13); independent verifier and screenshot check pending | see L13 |
 | T5 | S8 | inline, with each task's own docs | pending | |
 
@@ -295,4 +295,14 @@ Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` an
     - A2: the "Cannot import stems while a song is being saved." notice is hidden behind the editor;
     - the button stays at 100% during the final read-through.
   - **Correction:** the T4 writer was resumed to fix B1. It will ask before quitting while a save runs and defer the quit until the save has stopped and cleaned up. A library backstop will remove certainly stale `.import-*.tmp` folders when an import starts, which also covers the T3 advisory A4 (`kill -9`).
+- **L21** (2026-11-26): the T3 verifier's limited recheck on b05d730 confirmed B1–B4 fixed.
+  - **B1:** the crash MP3 gives 2.0 MB and white noise 2.88 MB, both near raw size, with max frame 24,586 B and `flac -t` ok. Quiet sources are unchanged and exact copies are still byte-identical.
+  - **B2:** afconvert AAC at 44.1 and 48 kHz, mono and stereo, gives +0 frames with the impulse at offset 0.
+  - **B3:** Xing-less 192 kbps 44.1 kHz MP3s save at the decoder's length and render.
+  - **B4:** sources cut before the probe are refused with the reason; sources cut between probe and save are refused naming the stem, and the library stays empty.
+  - **Suite:** `cargo test -p library -p domain` 335 passed.
+  - **New advisory:** for a Xing-less MP3 the draft keeps the probe's estimate, one packet (1,152 frames) longer than the saved length, so the length warning, the past-the-end bar check and progress totals can be off by one packet.
+  - **Reviews:** the user granted both T3 slices ("Revisar este cambio" for each):
+    - domain, `si-t3d`, b906f5e..6ea066c, 1,433 lines, lenses risk, reliability and readability;
+    - library, `si-t3l`, 6ea066c..b05d730, 3,701 lines, lenses risk, resilience and reliability.
 
