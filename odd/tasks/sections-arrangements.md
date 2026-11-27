@@ -218,4 +218,27 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
   **Still open:** a failed read is not retried while its song shows; a Perform read and an editor build can run at once (safe, since both write atomically).
 
   Risk: item 4 (background jobs tied to the transport), so T4 gets an independent verifier.
+- **L11** (2026-11-27): the T3 verifier found one blocker; everything else passed.
+  - **What passes:**
+    - 2,400 random editor steps matched `domain::SongEditor`, with the refusal notes word for word;
+    - the waveform heights are right by hand, and placeholders, redraw without rebuild and cancel on close all work;
+    - save, leaving and the unsaved question, `mix.json` cleanup, unknown fields and the read-only error work;
+    - header maps round-trip;
+    - the import editor is byte-identical at baseline and candidate (400 drafts, 12 × 150 controls);
+    - stale results are ignored;
+    - `cargo test -p openvamp` passes 325 and `-p domain` 203.
+  - **B1:** setlist items address arrangement positions by index, so a split, a removed chip or a reorder silently changes what a setlist with start and end positions (F5.3) plays, or makes it invalid. An open setlist editor is not refreshed.
+  - **Advisories:**
+    - quit does not wait for a library song save in flight;
+    - a stale note after a bad number;
+    - the import notice is hidden behind the editor;
+    - "Mix.json" is capitalized in a warning;
+    - setlists that cannot be read are left out of the in-use check.
+  - **User decision (verbatim):** "Ajustar solos". The option chosen: "Al guardar, el setlist se corrige para que siga tocando el mismo audio: un marcador nuevo o un reordenamiento mueven sus límites. Si un bloque que usa el setlist desaparece, se pregunta antes de guardar y se nombra el setlist."
+  - **S4 assumption added:**
+    - On save, setlist ranges that use an edited arrangement are remapped to the same audio.
+    - When a range can no longer be kept, the save asks first, naming the setlist. "Save anyway" clears that item's range, and "Keep editing" cancels.
+    - A setlist open in the Library is refreshed.
+    - Quit waits for a song save in flight.
+  - **Correction:** the T3 writer was resumed for the fix, which lands after T4.
 
