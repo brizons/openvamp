@@ -60,7 +60,7 @@ Requirements quote `docs/mvp-spec.md` (F2) and the user verbatim. Items marked *
 | ID | Specs | Route | Status | Commits |
 |----|-------|-------|--------|---------|
 | T1 | S1, S2 (domain) | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L3; verified L4; review approved L6) | 57965f1 |
-| T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | done (L5; verified L7); review running | d35205d |
+| T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | done (L5; verified L7; review approved L8) | d35205d |
 | T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | pending | |
 | T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | pending | |
 | T5 | S6 | inline, with each task's own docs | pending | |
@@ -159,4 +159,11 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
     - the FNV hash is not tamper-proof;
     - a junk cache up to 64 MiB is read before it is rejected.
   - **Review:** the user granted T2's review ("Revisar este cambio"), slice 57965f1..d35205d, lenses risk, resilience and reliability.
+- **L8** (2026-11-27): T2's native review (lineage review-bd5aeee7f21cbb92, 57965f1..d35205d) approved and was acknowledged, so the reviewed boundary is now d35205d. Non-blocking findings, kept as follow-ups:
+  - WARNING ×2: on coarse-timestamp drives (FAT, exFAT, HFS+), a stem re-exported at the same size within one timestamp tick keeps a stale cache; a cheap content check, such as a hash of the first and last blocks, would close it;
+  - SUGGESTION: a failed cache write is silent;
+  - SUGGESTION: `save_song` has no compare-and-swap against another writer;
+  - SUGGESTION: with unknown fields present, keys are rewritten in alphabetical order;
+  - SUGGESTION: map-point matching by `at` is untested for inserted points;
+  - SUGGESTION: `load_overview` reads `song.json` unbounded and follows symlinks; it should use `read_confined`.
 
