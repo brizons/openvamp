@@ -66,7 +66,7 @@ Requirements quote `docs/mvp-spec.md` (F1) and the user verbatim. Items marked *
 | ID | Specs | Route | Status | Commits |
 |----|-------|-------|--------|---------|
 | T1 | S2 | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L4; verified L7; review approved L8) | 883b398 |
-| T2 | S6 | delegated (parallel unit with T1, disjoint surface `crates/library` decoding, `Cargo.toml`, `Cargo.lock`) | done (L5); independent verifier pending | see L5 |
+| T2 | S6 | delegated (parallel unit with T1, disjoint surface `crates/library` decoding, `Cargo.toml`, `Cargo.lock`) | done (L5; blockers fixed L12; verified L15; review approved L16) | 0c390d5, b906f5e |
 | T3 | S1, S3, S4, S5 (library side) | delegated (context backstop); needs T1 and T2 | done (L9); independent verifier pending | see L9 |
 | T4 | S7 | delegated (context backstop); needs T3 | done (L13); independent verifier and screenshot check pending | see L13 |
 | T5 | S8 | inline, with each task's own docs | pending | |
@@ -232,3 +232,6 @@ Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` an
   - **Suites in the copy:** `cargo test -p library` passes 138 tests (2 ignored), and `live_allocations` passes 6.
   - **T2 review:** slice 883b398..b906f5e, worktree `si-t2`, lenses risk, resilience and reliability. It is high risk, 17 files and 1,988 lines. The user granted it ("Revisar este cambio").
   - **T3:** its independent verifier launched on 4318887 against b906f5e.
+- **L16** (2026-11-26): the T2 review (lineage review-427e0445a3f6049e, slice 883b398..b906f5e) approved and was acknowledged, so the reviewed boundary is now b906f5e. It left two non-blocking reliability suggestions, kept as follow-ups:
+  - the depth check has no lower bound, though the message says 4- to 24-bit;
+  - bit-identical WAV/FLAC equality is only tested at 16 and 24 bits, and an 8-, 12- or 20-bit case would pin the left-justify shift.
