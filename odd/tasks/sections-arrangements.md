@@ -61,7 +61,7 @@ Requirements quote `docs/mvp-spec.md` (F2) and the user verbatim. Items marked *
 |----|-------|-------|--------|---------|
 | T1 | S1, S2 (domain) | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L3; verified L4; review approved L6) | 57965f1 |
 | T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | done (L5; verified L7; review approved L8) | d35205d |
-| T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | pending | |
+| T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | done (L9); split, verifier and screenshot check pending | |
 | T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | pending | |
 | T5 | S6 | inline, with each task's own docs | pending | |
 
@@ -166,4 +166,32 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
   - SUGGESTION: with unknown fields present, keys are rewritten in alphabetical order;
   - SUGGESTION: map-point matching by `at` is untested for inserted points;
   - SUGGESTION: `load_overview` reads `song.json` unbounded and follows symlinks; it should use `read_confined`.
+- **L9** (2026-11-27): T3 delivered.
+  - **Domain:** a public `BarMaps` (`from_maps`, `to_maps`, `BarMapsError::OffBarLine`), which `SongDraft` now uses.
+  - **Desktop:**
+    - `song_header.rs` (the header shared with the import editor);
+    - `song_edit.rs` with `jobs.rs` (open, waveform, save; cleans `mix.json` of deleted arrangements; reads which setlists play each arrangement) and `view.rs`;
+    - `song_sections.rs` (ruler, blocks, waveform heights mapped into 16–94 %) and `song_sections_ui.rs` (markers panel, inspector, Arrangement panel);
+    - the edit link on Library rows (a waveform icon with the tooltip "Edit <title>");
+    - a `Leaving` question (Discard changes / Keep editing) before Discard, another library, quit or close;
+    - 5 icons and the README.
+  - **Checks:**
+    - `cargo test -p openvamp` passes 321 (35 new in tests/song_edit.rs), and `cargo test -p domain` passes 203; clippy, fmt and the workspace check are clean. The parent re-ran `--test song_edit` (35).
+    - RED came first for the domain only. For the desktop, 12 deliberate mutations were each caught.
+  - **Known design differences:**
+    - the selection's right edge is solid, not dashed;
+    - the selected block has a single ring;
+    - an amber cursor;
+    - Type is a list of buttons;
+    - rename and delete are icons after New;
+    - a tempo panel sits under the inspector;
+    - a beat position reads "Bar 9.3";
+    - no scrollbar.
+  - **Open points:**
+    - a quit that cannot ask (Dock, logout) drops unsaved edits;
+    - a part change makes the cached waveform stale until the editor reopens;
+    - setlists are matched to the song by its exact path;
+    - opening runs `list_songs`.
+  - **Size:** the change is about 6,400 lines, too big for one review slice, so the writer is splitting it into 2–3 compiling commits in a scratch clone. The parent will apply them.
+  - Risk: item 3 (the import header and `SongDraft` maps, which are shared) and item 4 (background jobs and cancel), so T3 gets an independent verifier.
 
