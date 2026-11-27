@@ -289,4 +289,16 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
     - GREEN: `cargo test -p openvamp` passes 349 and `-p domain` 211; fmt and clippy are clean. The parent re-ran `--test song_edit_setlists` (11).
   - **Size:** 1,749 changed lines.
   - Risk: item 1 (rewrites setlists and `song.json`), item 3 (`SongEditor` API added) and item 4 (quit waits), so the T3 verifier rechecks B1.
+- **L14** (2026-11-27): the T3 verifier's limited recheck on c43d0d0 confirmed B1 fixed, (a)–(f) all passing.
+  - **(a) Split:** before the range, Gig moves 2–3 → 3–4 on the same frames with no question; inside the range, it becomes 3–6.
+  - **(b) Removed chip:** the save asks once, naming Gig. "Keep editing" leaves every file byte-identical; "Save anyway" leaves Gig valid, playing the whole arrangement, with a warning.
+  - **(c) Reorders:** outside the range they shift silently; inside it they ask.
+  - **(d) Open setlist editor:** it is refreshed with no problems.
+  - **(e) One session:** tempo, part and split edits in one session still remap.
+  - **(f) Unreadable setlist:** the delete is refused, naming the file.
+  - **Suite:** `cargo test -p openvamp -p domain` passes 349 and 211.
+  - **Advisories (follow-ups):**
+    - an open-ended range ("to the end") becomes an explicit end when remapped, so a section appended later is not included;
+    - a split saves with no warning when a setlist file cannot be read;
+    - deleting a marker inside a range asks, though the merged section plays the same frames.
 
