@@ -68,7 +68,7 @@ Requirements quote `docs/mvp-spec.md` (F1) and the user verbatim. Items marked *
 | T1 | S2 | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L4; verified L7; review approved L8) | 883b398 |
 | T2 | S6 | delegated (parallel unit with T1, disjoint surface `crates/library` decoding, `Cargo.toml`, `Cargo.lock`) | done (L5; blockers fixed L12; verified L15; review approved L16) | 0c390d5, b906f5e |
 | T3 | S1, S3, S4, S5 (library side) | delegated (context backstop); needs T1 and T2 | done (L9; blockers fixed L19; verified L21; reviews approved L22) | 6ea066c, 05b8af2, 4318887, b05d730 |
-| T4 | S7 | delegated (context backstop); needs T3 | done (L13; app run L17; blocker fixed L23); recheck pending | dca6066, f8c6194 |
+| T4 | S7 | delegated (context backstop); needs T3 | done (L13; app run L17; blocker fixed L23; verified and reviews approved L24) | dca6066, f8c6194 |
 | T5 | S8 | inline, with each task's own docs | done (L23) | see L23 |
 
 Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` and the desktop consume (item 3), so each gets an independent verifier. T1 changes the shared bus rules (item 3).
@@ -337,4 +337,43 @@ Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` an
       - the `symphonia` row lists FLAC, MP3, AAC and M4A.
     - `README.md`: the status adds the song import and the Mixer and Audio output screens, and "Not built yet" no longer lists the mixer and routing, which were merged in PRs #15–#21.
     - The desktop README's import section came with T4.
+- **L24** (2026-11-26): T4 closed.
+  - **Recheck:** the T4 verifier confirmed B1 fixed on f8c6194. All four quit paths left only the old song, with 0 bytes of stems. Its independent sweep check removed only stale folders of the exact pattern from another pid and kept every other case. `--test import` passed 31. Low disk kept it from building the desktop suite.
+  - **Reviews:** the T4 slice of 4,090 lines went over the review's context budget, so it was reviewed in two slices, each granted by the user:
+    - b05d730..dca6066 (lineage review-578e9015a5a9bd88)
+    - dca6066..f8c6194 (lineage review-4188f24682624610)
+
+    Both approved and were acknowledged, so the reviewed boundary is now f8c6194.
+  - **Seam check:** the parent ran `cargo test --workspace`: 934 passed, 0 failed, 8 ignored.
+  - **Follow-ups** (non-blocking review warnings and verifier advisories, not fixed here, per [[fewer-review-rounds]]):
+    - **Song editor:**
+      - Discard during a save has no escape if the save never returns, for example on a hung drive;
+      - `Saving::drop` blocks the UI for up to 5 s when another library opens mid-save;
+      - the deferred-quit glue in screen.rs is untested;
+      - the probe-during-save branch is untested;
+      - the saving question promises more than a cancel at about 100% guarantees;
+      - the `ChangeEdit` doc is stale, and `ClosePartMenu` is unused by the UI;
+      - on Windows the import picker may not pick files and folders at once;
+      - a late macOS picker result replaces an open draft;
+      - the save notice can be hidden behind the editor.
+    - **Library:**
+      - the sweep trusts mtimes, which can be wrong on a network share with clock skew;
+      - `mp4::edit_list` swallows every I/O error, not just a cut-short box;
+      - cancel is not checked during a long ZIP entry extraction;
+      - the probe extracts every ZIP entry;
+      - a Xing-less MP3's draft length is one packet long;
+      - with duplicate ZIP names, the last entry wins;
+      - folders more than 32 levels deep are skipped;
+      - HE-AAC decodes at its core rate;
+      - an M4A named `.mp3` is not trimmed;
+      - zlib-rs is now flate2's backend for the other crates too.
+    - **Domain and FLAC:**
+      - part-id case sensitivity is not documented;
+      - no migration note for a legacy part `other`;
+      - the combined `to_package` error path is untested;
+      - the song-length limit is duplicated;
+      - `Part::ALL` coverage is unchecked;
+      - the FLAC depth check has no lower bound;
+      - WAV/FLAC equality is tested only at 16 and 24 bits.
+  - **Delivery:** the branch is ready for the stacked PRs. Pushing and opening the PRs are the user's call.
 
