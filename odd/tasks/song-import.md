@@ -206,3 +206,21 @@ Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` an
     - RED: 27 import tests failed against stubs, plus the picker test.
     - GREEN: `cargo test -p openvamp` passes 281 tests, with clippy, fmt and the workspace check clean. The parent re-ran `--test song_import` (29 passed).
   - Risk: item 4 (background jobs, the cancel flag and result ordering), so T4 gets an independent verifier.
+- **L14** (2026-11-26): the parent reordered the branch, which had not been pushed, so the playback fix sits next to T2 and each review slice is contiguous. Commits:
+  - 883b398 T1
+  - 0c390d5 T2
+  - b906f5e T2 fix (a)
+  - 6ea066c T3 domain
+  - 05b8af2 T3 library
+  - 4318887 import refusal (b)
+  - 6aa0db8 T4
+
+  The final tree is identical to the old head 290f8b8, which is kept as the branch `song-import-backup`. The commit ids in L10–L13 refer to the old order (0c390d5 is unchanged): 7a4c0a2 → 6ea066c, c1f710f → 05b8af2, 904002a → b906f5e, dc218ab → 4318887, 290f8b8 → 6aa0db8.
+
+  Review slices:
+  - T2: 883b398..b906f5e
+  - T3 domain: b906f5e..6ea066c
+  - T3 library: 6ea066c..4318887
+  - T4: 4318887..6aa0db8
+
+  The T2 verifier is rechecking B1–B3 on b906f5e.
