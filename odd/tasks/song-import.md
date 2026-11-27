@@ -224,3 +224,11 @@ Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` an
   - T4: 4318887..6aa0db8
 
   The T2 verifier is rechecking B1–B3 on b906f5e.
+- **L15** (2026-11-26): the machine rebooted, which cleared every temp scratch folder. Nothing in the repository was lost.
+  - **Recheck:** the T2 verifier redid its limited recheck on b906f5e, using its own new probe and the `flac` 1.5.0 CLI rather than the committed fixtures. All three blockers are fixed, in debug and release:
+    - **B1:** 8 compressible stems, 2,192 reads, 0 bad.
+    - **B2:** 32-bit stereo and mono `-b 256` files give one clean `UnsupportedFlacFormat` in `load_song` and `open_streaming`, and the 24-bit controls stay exact.
+    - **B3:** 58 cut or forged SEEKTABLE cases, 0 bad; cuts give clean errors and uncut files play exactly.
+  - **Suites in the copy:** `cargo test -p library` passes 138 tests (2 ignored), and `live_allocations` passes 6.
+  - **T2 review:** slice 883b398..b906f5e, worktree `si-t2`, lenses risk, resilience and reliability. It is high risk, 17 files and 1,988 lines. The user granted it ("Revisar este cambio").
+  - **T3:** its independent verifier launched on 4318887 against b906f5e.
