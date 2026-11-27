@@ -3,13 +3,14 @@
 //! view-model actions, and hands a [`PerformView`] (and, for a setlist, a
 //! [`openvamp_desktop::strip::SetlistView`]) to the presentational code in
 //! [`crate::ui`], with the song's [`SongFacts`] read from its `song.json`
-//! on a background thread ([`openvamp_desktop::facts`]).
+//! on a background thread ([`openvamp_desktop::facts`]), and the song map's
+//! waveform read or built on one too ([`openvamp_desktop::map_wave`]).
 
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use app::{AudioOutput, SessionOptions};
+use app::{AudioOutput, SessionOptions, TransportState};
 use domain::SetlistItem;
 use gpui::{
     AnyWindowHandle, App, AppContext, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
@@ -27,6 +28,7 @@ use openvamp_desktop::facts::{self, FactsCache};
 use openvamp_desktop::hold::PanicHold;
 use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, Typed, is_panic_key, typed};
 use openvamp_desktop::library_page::{Dragged, LibraryPage, Opened, library_to_open};
+use openvamp_desktop::map_wave::MapWaveform;
 use openvamp_desktop::mixer::{MixerAction, MixerPage, UnsavedMix, restore_mix, unsaved_mix};
 use openvamp_desktop::output_page::{OutputAction, OutputPage};
 use openvamp_desktop::reorder::Half;
@@ -90,6 +92,9 @@ pub struct Perform {
     /// The facts of the song folders read, which the song header and the
     /// bars on Perform show; never read while drawing.
     facts: FactsCache,
+    /// The waveform of the song on show, which the song map draws; never
+    /// read while drawing.
+    waves: MapWaveform,
     /// Counts the picks: only the newest one opens once it has prepared
     /// ([`Self::open`]).
     opening: u64,
@@ -157,6 +162,7 @@ impl Perform {
             mixer: MixerPage::new(),
             output: OutputPage::new(),
             facts: FactsCache::new(),
+            waves: MapWaveform::new(),
             opening: 0,
             _poll: poll,
             _quit: quit,
@@ -176,6 +182,8 @@ impl Perform {
         // A pick still preparing never opens after the show ended.
         self.opening += 1;
         self.save_waiting_buses();
+        // A waveform build under way stops.
+        self.waves.forget();
         if let Some(show) = self.loaded.take() {
             // A buffer size or routing waiting for the device is not kept.
             self.output.song_closed();
@@ -467,6 +475,7 @@ impl Perform {
         self.output.song_closed();
         // Its song.json may have changed: read every folder again.
         self.facts.forget();
+        self.waves.forget();
         self.hold = PanicHold::new();
         let Some(previous) = replaced.to_reopen().cloned() else {
             self.opened(&replaced, fallback, unsaved);
@@ -518,7 +527,8 @@ impl Perform {
     /// One turn of the timer: moves on everything that changes with time
     /// alone and draws again only when it changed what the screens show
     /// ([`Timed::turn`]), then starts reading the facts of a song that
-    /// shows when they are wanted ([`Self::read_facts`]).
+    /// shows when they are wanted ([`Self::read_facts`]), and its waveform
+    /// when it has none yet ([`Self::read_wave`]).
     fn tick(&mut self, cx: &mut Context<Self>) {
         let timed = Timed {
             show: self.loaded.as_mut(),
@@ -532,6 +542,7 @@ impl Perform {
             cx.notify();
         }
         self.read_facts(cx);
+        self.read_wave(cx);
     }
 
     /// Starts reading the facts of the song on show when the cache wants
@@ -557,6 +568,43 @@ impl Perform {
             });
         })
         .detach();
+    }
+
+    /// Starts reading the waveform of the song on show when it has none yet
+    /// ([`MapWaveform::show`]), on the background executor: its cached
+    /// overview whatever plays, else one built from its stems while the
+    /// transport is stopped or paused. Play cancels a build under way,
+    /// another song on show (a setlist moving on) cancels the read of the
+    /// last, and a late result changes nothing; the screen draws again once
+    /// it is read.
+    fn read_wave(&mut self, cx: &mut Context<Self>) {
+        let folder = self.shown_folder();
+        let transport = self
+            .loaded
+            .as_ref()
+            .map_or(TransportState::Stopped, |show| show.snapshot().transport);
+        let Some(job) = self.waves.show(folder.as_deref(), transport) else {
+            return;
+        };
+        let read = cx.background_executor().spawn(async move { job.run() });
+        cx.spawn(async move |this, cx| {
+            let done = read.await;
+            let _ = this.update(cx, |screen, cx| {
+                if screen.waves.finish(done) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The folder of the song on show (a setlist's current item); `None`
+    /// with nothing open, or on a click-only tile.
+    fn shown_folder(&self) -> Option<PathBuf> {
+        self.loaded
+            .as_ref()
+            .and_then(Show::mix_file)
+            .map(|(folder, _)| folder)
     }
 
     /// Carries out what the presentational code or a key asks for; while
@@ -1305,7 +1353,9 @@ impl Render for Perform {
                 }
             },
             (Page::Perform, Some(show)) => {
-                let view = PerformView::with_facts(show.snapshot(), show.song(), &facts);
+                let folder = self.shown_folder();
+                let wave = self.waves.wave(folder.as_deref());
+                let view = PerformView::with_wave(show.snapshot(), show.song(), &facts, wave);
                 let setlist = show.setlist().map(LoadedSetlist::view);
                 let mixer = self.mixer.view(Some(show));
                 ui::perform(

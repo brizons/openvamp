@@ -7,6 +7,8 @@
 //! song header, and the bars each section lasts on the map, the pads and
 //! the Now and Next cards.
 
+use std::ops::Range;
+
 use app::{
     DeviceStatus, FadeState, JumpKind, JumpTiming, LoadError, LossReason, OpenError, PositionInfo,
     Snapshot, SongInfo, TransportState,
@@ -14,6 +16,8 @@ use app::{
 use domain::{DEFAULT_ARRANGEMENT_ID, ManifestError, SongPackage};
 
 use crate::action::is_playing;
+use crate::map_wave::SongWave;
+use crate::song_sections::bar_height;
 
 /// The family of a section, which picks its color on the song map and on
 /// its pad.
@@ -204,6 +208,41 @@ pub struct JumpMarker {
     pub label: String,
 }
 
+/// The share of the song map's track the quietest bar of its waveform
+/// fills, as on the design canvas: 18 %.
+pub const MAP_WAVE_LOW: f32 = 0.18;
+
+/// The share of the track the loudest bar fills: 96 %.
+pub const MAP_WAVE_HIGH: f32 = 0.96;
+
+/// The opacity of the waveform's bars ahead of the playhead, as on the
+/// design canvas; the bars it has reached are opaque.
+pub const AHEAD_OPACITY: f32 = 0.38;
+
+/// One bar of the waveform on the song map's track: a musical bar of a
+/// position, or the part of one it holds when the section starts or ends
+/// inside a bar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapBar {
+    /// Its position, an index into the arrangement.
+    pub position: usize,
+    /// Its section's family, which picks its color.
+    pub kind: SectionKind,
+    /// The source frames it shows: its position's own audio.
+    pub source: Range<u64>,
+    /// Where it starts, as a fraction of the arrangement.
+    pub start: f32,
+    /// Its width, as a fraction of the arrangement.
+    pub width: f32,
+    /// Its height, as a share of the track's: its level in the song's
+    /// overview over the song's peak, from [`MAP_WAVE_LOW`] to
+    /// [`MAP_WAVE_HIGH`].
+    pub height: f32,
+    /// 1 once the playhead is past its start (played), else
+    /// [`AHEAD_OPACITY`].
+    pub opacity: f32,
+}
+
 /// The song map: the arrangement in play order, the playhead, and the
 /// queued jump.
 #[derive(Debug, Clone, PartialEq)]
@@ -214,6 +253,10 @@ pub struct SongMap {
     pub playhead: f32,
     /// The queued jump or loop, if any.
     pub jump: Option<JumpMarker>,
+    /// The waveform on the track, in play order: each position's bars in
+    /// its block. Empty until the song's waveform is read, or when it
+    /// cannot be: the track then shows the blocks' colors.
+    pub wave: Vec<MapBar>,
 }
 
 /// One section pad.
@@ -539,8 +582,20 @@ impl PerformView {
     }
 
     /// What the screen shows for `snapshot` of `song`, whose `song.json`
-    /// says `facts`.
+    /// says `facts`, before its waveform is read ([`Self::with_wave`]).
     pub fn with_facts(snapshot: &Snapshot, song: &SongInfo, facts: &SongFacts) -> Self {
+        Self::with_wave(snapshot, song, facts, None)
+    }
+
+    /// What the screen shows for `snapshot` of `song`, whose `song.json`
+    /// says `facts`, with its waveform `wave` on the song map once it is
+    /// read ([`crate::map_wave`]).
+    pub fn with_wave(
+        snapshot: &Snapshot,
+        song: &SongInfo,
+        facts: &SongFacts,
+        wave: Option<&SongWave>,
+    ) -> Self {
         let timeline = Timeline::new(snapshot, song);
         let next = next_position(snapshot, song);
         let queued_target = snapshot.queued.as_ref().map(|queued| queued.target);
@@ -573,7 +628,10 @@ impl PerformView {
             time: clock(timeline.elapsed, song.sample_rate),
             total: clock(timeline.total, song.sample_rate),
             bar_beat: format!("Bar {} · beat {}", snapshot.bar, snapshot.beat),
-            map: song_map(snapshot, song, &timeline, &names, &abbreviations, &bars),
+            map: SongMap {
+                wave: wave.map_or_else(Vec::new, |wave| map_wave(song, &timeline, wave)),
+                ..song_map(snapshot, song, &timeline, &names, &abbreviations, &bars)
+            },
             now: NowCard {
                 name: names
                     .get(snapshot.position)
@@ -750,7 +808,49 @@ fn song_map(
         blocks,
         playhead: timeline.fraction(timeline.elapsed),
         jump,
+        wave: Vec::new(),
     }
+}
+
+/// The waveform on the song map's track: each position's musical bars
+/// (the bar lines of `wave` inside its source frames, cut where the
+/// section starts or ends inside a bar), each as tall as the level of its
+/// own frames, in play order; opaque once the playhead is past its start.
+fn map_wave(song: &SongInfo, timeline: &Timeline, wave: &SongWave) -> Vec<MapBar> {
+    let lines = wave.bar_lines();
+    let mut before = 0;
+    let mut bars = Vec::new();
+    for (position, info) in song.positions.iter().enumerate() {
+        let kind = SectionKind::of(&info.label);
+        let end = info.start_frame + info.length_frames;
+        let first = lines.partition_point(|&line| line <= info.start_frame);
+        let inside = lines[first..]
+            .iter()
+            .copied()
+            .take_while(|&line| line < end);
+        let mut from = info.start_frame;
+        for to in inside.chain([end]) {
+            if to > from {
+                let at = before + (from - info.start_frame);
+                bars.push(MapBar {
+                    position,
+                    kind,
+                    source: from..to,
+                    start: timeline.fraction(at),
+                    width: timeline.fraction(to - from),
+                    height: bar_height(wave.overview(), from..to, MAP_WAVE_LOW..MAP_WAVE_HIGH),
+                    opacity: if at < timeline.elapsed {
+                        1.0
+                    } else {
+                        AHEAD_OPACITY
+                    },
+                });
+            }
+            from = to;
+        }
+        before += info.length_frames;
+    }
+    bars
 }
 
 /// The position that plays after the current section: the queued target,

@@ -36,8 +36,9 @@ use crate::song_import::{ImportAction, SongField, full_stop, next_ticket, senten
 use crate::song_sections::{BarScale, MIN_VISIBLE_BARS, Window};
 
 pub(crate) use jobs::SongSource;
+pub(crate) use jobs::WaveformRun;
 pub use jobs::{OpenSongJob, OpenedSong, SaveSongJob, SongSaved, Waved, WaveformJob};
-use jobs::{Waveform, WaveformRun, package_problems};
+use jobs::{Waveform, package_problems};
 pub use view::stems_summary;
 
 /// The name "New" gives an arrangement, numbered when taken: "New

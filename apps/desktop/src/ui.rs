@@ -75,8 +75,13 @@ const TITLE_ROW_HEIGHT: f32 = 60.0;
 /// The song map's row of section blocks.
 const MAP_BLOCKS_HEIGHT: f32 = 28.0;
 
-/// The song map's track under the blocks, with the playhead.
+/// The song map's track under the blocks, with the waveform and the
+/// playhead.
 const MAP_TRACK_HEIGHT: f32 = 50.0;
+
+/// Past this many bars on the song map's waveform, the gap between them
+/// narrows from 2 points to 1, as on the design canvas.
+const MAP_WAVE_DENSE_BARS: usize = 150;
 
 /// The song map's bar ruler under the track.
 const MAP_RULER_HEIGHT: f32 = 14.0;
@@ -943,8 +948,10 @@ fn next_card(next: &NextCard, cx: &mut Context<Perform>) -> impl IntoElement {
 }
 
 /// The arrangement in play order, sized by length and numbered by bar, with
-/// the playhead and the queued jump. The song's waveform is to come: the
-/// track under the sections shows their colors.
+/// the playhead and the queued jump. Once the song's waveform is read, the
+/// track under the sections shows it, one bar per musical bar in its
+/// section's color, faded ahead of the playhead; until then, the sections'
+/// colors with the played part lit.
 fn song_map(map: &SongMap) -> impl IntoElement {
     let strip = div()
         .h(px(MAP_BLOCKS_HEIGHT))
@@ -986,24 +993,31 @@ fn song_map(map: &SongMap) -> impl IntoElement {
         .h(px(MAP_TRACK_HEIGHT))
         .flex_none()
         .flex()
-        .children(map.blocks.iter().map(|block| {
-            let color = theme::section(block.kind);
-            div().w(relative(block.width)).h_full().pr(px(2.)).child(
-                div()
-                    .size_full()
-                    .rounded(px(3.))
-                    .bg(theme::faded(color, 0.3)),
-            )
-        }))
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left_0()
-                .w(relative(map.playhead))
-                .bg(theme::faded(theme::text(), 0.12)),
-        )
+        .map(|track| {
+            if map.wave.is_empty() {
+                track
+                    .children(map.blocks.iter().map(|block| {
+                        let color = theme::section(block.kind);
+                        div().w(relative(block.width)).h_full().pr(px(2.)).child(
+                            div()
+                                .size_full()
+                                .rounded(px(3.))
+                                .bg(theme::faded(color, 0.3)),
+                        )
+                    }))
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left_0()
+                            .w(relative(map.playhead))
+                            .bg(theme::faded(theme::text(), 0.12)),
+                    )
+            } else {
+                track.children(wave_bars(map))
+            }
+        })
         .when_some(map.jump.as_ref(), |track, jump| {
             track
                 .child(
@@ -1038,12 +1052,17 @@ fn song_map(map: &SongMap) -> impl IntoElement {
                 )
         })
         .child(
+            // The canvas's 2-point line ringed by a point of the window's
+            // background.
             div()
                 .absolute()
-                .top(px(-6.))
-                .bottom(px(-6.))
+                .top(px(-7.))
+                .bottom(px(-7.))
                 .left(relative(map.playhead))
-                .w(px(2.))
+                .ml(px(-1.))
+                .w(px(4.))
+                .border_1()
+                .border_color(theme::bg())
                 .bg(theme::text()),
         );
     let ruler = div()
@@ -1069,6 +1088,37 @@ fn song_map(map: &SongMap) -> impl IntoElement {
         .child(strip)
         .child(track)
         .child(ruler)
+}
+
+/// The song map's waveform: each bar where its musical bar plays, as tall
+/// as its level, in its section's color at its opacity, with the canvas's
+/// gap after it. Each is placed on its own, so a sliver of a bar narrower
+/// than the gap moves none after it.
+fn wave_bars(map: &SongMap) -> impl Iterator<Item = Div> + '_ {
+    let gap = if map.wave.len() > MAP_WAVE_DENSE_BARS {
+        1.
+    } else {
+        2.
+    };
+    map.wave.iter().map(move |bar| {
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(relative(bar.start))
+            .w(relative(bar.width))
+            .pr(px(gap))
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .w_full()
+                    .h(relative(bar.height))
+                    .rounded(px(1.))
+                    .bg(theme::section(bar.kind))
+                    .opacity(bar.opacity),
+            )
+    })
 }
 
 fn section_controls(view: &PerformView, cx: &mut Context<Perform>) -> impl IntoElement {

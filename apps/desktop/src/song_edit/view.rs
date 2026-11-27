@@ -43,7 +43,14 @@ impl SongEdit {
                 let part = Part::from_id(&stem.part).unwrap_or_else(|| part_for_file(&stem.file));
                 StemRow {
                     index,
-                    file: stem.file.clone(),
+                    // Its file name, as the import's editor names its
+                    // sources: "ag.wav" for "stems/ag.wav".
+                    file: stem
+                        .file
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&stem.file)
+                        .to_owned(),
                     icon: stem_icon(stem.role, &stem.part, &stem.id),
                     part,
                     bus: part.bus(),

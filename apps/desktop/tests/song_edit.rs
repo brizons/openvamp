@@ -1171,6 +1171,26 @@ fn the_stems_panel_lists_each_stems_part_and_its_menu_changes_it() {
 }
 
 #[test]
+fn the_stems_panel_names_each_stem_by_its_file_name_without_its_folder() {
+    // An import stores the stems as stems/<id>.wav.
+    let mut package = package();
+    for stem in &mut package.stems {
+        stem.file = format!("stems/{}", stem.file);
+    }
+    let bench = Bench::with(package);
+    let stems = bench.folder().join("stems");
+    fs::create_dir_all(&stems).unwrap();
+    wav(&stems.join("keys.wav"), level);
+    wav(&stems.join("click.wav"), |_| 0.9);
+    let mut page = bench.page();
+    open(&mut page, "First Light");
+
+    let editor = view(&page).editor;
+    let files: Vec<&str> = editor.stems.iter().map(|row| row.file.as_str()).collect();
+    assert_eq!(files, ["keys.wav", "click.wav"]);
+}
+
+#[test]
 fn zoom_shows_fewer_bars_around_the_cursor_and_scrolling_moves_through_the_song() {
     let bench = Bench::new();
     let mut page = opened(&bench);
