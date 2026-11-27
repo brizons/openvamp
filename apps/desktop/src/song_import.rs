@@ -19,13 +19,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use domain::{Bus, MapChange, Part, SongDraft, StoredFormat, TimeSignature};
+use domain::{Bus, Part, SongDraft, StoredFormat};
 use library::{
     ImportDraft, ImportError, ImportProgress, Library, SetlistError, SongEntry, SongListing,
 };
 
-use crate::line_edit::{LineEdit, LineKey, LineOutcome};
+use crate::line_edit::LineKey;
 use crate::mixer::stem_icon;
+use crate::song_header::{HeaderFields, HeaderValues};
 
 /// The longest the app waits for a cancelled save to stop before it lets
 /// go of it ([`crate::library_page::LibraryPage::stop_save`]): a save stops
@@ -42,7 +43,7 @@ pub const CHANGE_STEP_BARS: u64 = 8;
 /// taken for the current one.
 static TICKETS: AtomicU64 = AtomicU64::new(1);
 
-fn next_ticket() -> u64 {
+pub(crate) fn next_ticket() -> u64 {
     TICKETS.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -291,27 +292,11 @@ impl Drop for Saving {
     }
 }
 
-/// The text of one tempo or meter change, and the change it last read as.
-#[derive(Debug, Clone)]
-struct ChangeEdit {
-    bar: LineEdit,
-    bpm: LineEdit,
-    time: LineEdit,
-}
-
 /// The draft open in the Song editor, with the text of its fields.
 #[derive(Debug)]
 pub struct SongImport {
     draft: ImportDraft,
-    title: LineEdit,
-    key: LineEdit,
-    tempo: LineEdit,
-    time: LineEdit,
-    changes: Vec<ChangeEdit>,
-    typing: Option<SongField>,
-    /// The text of the field typed into, as it was when typing started:
-    /// Escape puts it back.
-    before: String,
+    header: HeaderFields,
     menu: Option<usize>,
     all_stems: bool,
     saving: Option<Saving>,
@@ -320,15 +305,8 @@ pub struct SongImport {
 
 impl SongImport {
     pub(crate) fn new(draft: ImportDraft) -> Self {
-        let song = &draft.song;
         Self {
-            title: LineEdit::new(song.title.clone()),
-            key: LineEdit::new(song.key.clone().unwrap_or_default()),
-            tempo: LineEdit::new(number(song.bpm)),
-            time: LineEdit::new(meter(song.time_signature)),
-            changes: Vec::new(),
-            typing: None,
-            before: String::new(),
+            header: HeaderFields::new(&values_of(&draft.song)),
             menu: None,
             all_stems: false,
             saving: None,
@@ -339,7 +317,7 @@ impl SongImport {
 
     /// The field the keys type into, if any.
     pub(crate) fn typing(&self) -> Option<SongField> {
-        self.typing
+        self.header.typing()
     }
 
     /// The save under way, if any.
@@ -364,24 +342,26 @@ impl SongImport {
             return Outcome::Stay;
         }
         if !matches!(action, ImportAction::Edit(_)) {
-            self.typing = None;
+            self.header.stop_typing();
         }
         if !matches!(action, ImportAction::TogglePartMenu(_)) {
             self.menu = None;
         }
         match action {
-            ImportAction::Edit(field) => self.start_typing(field),
-            ImportAction::AddChange => self.add_change(),
-            ImportAction::RemoveChange(index) if index < self.changes.len() => {
-                // The draft's change goes too, so each change after it
-                // keeps what it last read as.
-                self.changes.remove(index);
-                if index < self.draft.song.changes.len() {
-                    self.draft.song.changes.remove(index);
-                }
+            ImportAction::Edit(field) => self.header.start_typing(field),
+            ImportAction::AddChange => {
+                self.header.add_change(&values_of(&self.draft.song));
                 self.sync();
             }
-            ImportAction::RemoveChange(_) => {}
+            ImportAction::RemoveChange(index) => {
+                // The draft's change goes too, so each change after it
+                // keeps what it last read as.
+                let mut values = values_of(&self.draft.song);
+                if self.header.remove_change(index, &mut values) {
+                    self.draft.song.changes = values.changes;
+                    self.sync();
+                }
+            }
             ImportAction::TogglePartMenu(index) => {
                 self.menu = match self.menu {
                     Some(open) if open == index => None,
@@ -407,36 +387,21 @@ impl SongImport {
     /// A key typed into the field that has the focus: the draft follows
     /// the text as it is typed.
     pub(crate) fn type_key(&mut self, key: LineKey<'_>) {
-        let Some(field) = self.typing else {
-            return;
-        };
-        let before = std::mem::take(&mut self.before);
-        let Some(edit) = self.field_mut(field) else {
-            self.typing = None;
-            return;
-        };
-        match edit.key(key) {
-            LineOutcome::Editing => self.before = before,
-            LineOutcome::Commit(_) => self.typing = None,
-            LineOutcome::Cancel => {
-                *edit = LineEdit::new(before);
-                self.typing = None;
-            }
+        if self.header.type_key(key) {
+            self.sync();
         }
-        self.sync();
     }
 
     /// Text pasted into the field that has the focus.
     pub(crate) fn paste(&mut self, text: &str) {
-        if let Some(edit) = self.typing.and_then(|field| self.field_mut(field)) {
-            edit.paste(text);
+        if self.header.paste(text) {
             self.sync();
         }
     }
 
     /// Leaves the field that has the focus, keeping its text.
     pub(crate) fn stop_typing(&mut self) {
-        self.typing = None;
+        self.header.stop_typing();
     }
 
     /// The save failed with `error`: the editor stays open with the
@@ -470,85 +435,18 @@ impl SongImport {
         moved
     }
 
-    fn start_typing(&mut self, field: SongField) {
-        if self.typing == Some(field) {
-            // A click in the field typed into: Escape still puts back what
-            // it held before.
-            return;
-        }
-        let Some(edit) = self.field_mut(field) else {
-            return;
-        };
-        let text = edit.text().to_owned();
-        self.before = text;
-        self.typing = Some(field);
-    }
-
-    fn field_mut(&mut self, field: SongField) -> Option<&mut LineEdit> {
-        Some(match field {
-            SongField::Title => &mut self.title,
-            SongField::Key => &mut self.key,
-            SongField::Tempo => &mut self.tempo,
-            SongField::Time => &mut self.time,
-            SongField::ChangeBar(index) => &mut self.changes.get_mut(index)?.bar,
-            SongField::ChangeBpm(index) => &mut self.changes.get_mut(index)?.bpm,
-            SongField::ChangeTime(index) => &mut self.changes.get_mut(index)?.time,
-        })
-    }
-
-    fn add_change(&mut self) {
-        let song = &self.draft.song;
-        let last = song.changes.iter().max_by_key(|change| change.bar);
-        let bar = last.map_or(1, |change| change.bar) + CHANGE_STEP_BARS;
-        // The tempo in force where it goes: the last change's that sets
-        // one, else the song's.
-        let mut sorted: Vec<&MapChange> = song.changes.iter().collect();
-        sorted.sort_by_key(|change| change.bar);
-        let bpm = sorted
-            .iter()
-            .rev()
-            .find_map(|change| change.bpm)
-            .unwrap_or(song.bpm);
-        self.changes.push(ChangeEdit {
-            bar: LineEdit::new(bar.to_string()),
-            bpm: LineEdit::new(number(bpm)),
-            time: LineEdit::new(""),
-        });
-        self.sync();
-    }
-
     /// Puts what the fields read into the draft. A text that reads as no
     /// value leaves the draft's value as it was, and shows as a problem
     /// ([`Self::checks`]) that keeps the song from being saved.
     fn sync(&mut self) {
+        let mut values = values_of(&self.draft.song);
+        self.header.sync(&mut values);
         let song = &mut self.draft.song;
-        song.title = self.title.text().to_owned();
-        let key = self.key.text().trim();
-        song.key = (!key.is_empty()).then(|| key.to_owned());
-        if let Some(bpm) = parse_bpm(self.tempo.text()) {
-            song.bpm = bpm;
-        }
-        if let Some(meter) = parse_meter(self.time.text()) {
-            song.time_signature = meter;
-        }
-        let old = std::mem::take(&mut song.changes);
-        song.changes = self
-            .changes
-            .iter()
-            .enumerate()
-            .map(|(index, edit)| {
-                let before = old.get(index).copied();
-                MapChange {
-                    bar: parse_bar(edit.bar.text())
-                        .or(before.map(|change| change.bar))
-                        .unwrap_or(0),
-                    bpm: optional(edit.bpm.text(), parse_bpm)
-                        .unwrap_or_else(|| before.and_then(|change| change.bpm)),
-                    time_signature: optional(edit.time.text(), parse_meter)
-                        .unwrap_or_else(|| before.and_then(|change| change.time_signature)),
-                }
-            })
-            .collect();
+        song.title = values.title;
+        song.key = values.key;
+        song.bpm = values.bpm;
+        song.time_signature = values.time_signature;
+        song.changes = values.changes;
     }
 
     fn start_save(&mut self, library: &Library) -> SaveJob {
@@ -578,7 +476,7 @@ impl SongImport {
     /// The problems that keep the draft from being saved and the warnings
     /// that do not, in the order the editor lists them.
     fn checks(&self) -> Checks {
-        let mut blocking = self.text_problems();
+        let mut blocking = self.header.text_problems();
         let mut warnings = Vec::new();
         match self.draft.song.to_package() {
             Ok(packaged) => {
@@ -601,39 +499,9 @@ impl SongImport {
         Checks { blocking, warnings }
     }
 
-    /// The fields whose text reads as no value.
-    fn text_problems(&self) -> Vec<String> {
-        let mut problems = Vec::new();
-        if parse_bpm(self.tempo.text()).is_none() {
-            problems.push(not_a_tempo(self.tempo.text()));
-        }
-        if parse_meter(self.time.text()).is_none() {
-            problems.push(not_a_meter(self.time.text()));
-        }
-        for edit in &self.changes {
-            if parse_bar(edit.bar.text()).is_none() {
-                problems.push(format!(
-                    "The bar \"{}\" of a change is not a whole number, such as 17.",
-                    edit.bar.text()
-                ));
-            }
-            if optional(edit.bpm.text(), parse_bpm).is_none() {
-                problems.push(not_a_tempo(edit.bpm.text()));
-            }
-            if optional(edit.time.text(), parse_meter).is_none() {
-                problems.push(not_a_meter(edit.time.text()));
-            }
-        }
-        problems
-    }
-
     /// What the Song editor shows.
     pub(crate) fn view(&self) -> SongEditorView {
         let song = &self.draft.song;
-        let field = |edit: &LineEdit, field: SongField| FieldView {
-            text: edit.text().to_owned(),
-            editing: self.typing == Some(field),
-        };
         let stems = song
             .stems()
             .iter()
@@ -687,21 +555,11 @@ impl SongImport {
         });
         SongEditorView {
             source: self.draft.source().display().to_string(),
-            title: field(&self.title, SongField::Title),
-            key: field(&self.key, SongField::Key),
-            tempo: field(&self.tempo, SongField::Tempo),
-            time: field(&self.time, SongField::Time),
-            changes: self
-                .changes
-                .iter()
-                .enumerate()
-                .map(|(index, edit)| ChangeRow {
-                    index,
-                    bar: field(&edit.bar, SongField::ChangeBar(index)),
-                    bpm: field(&edit.bpm, SongField::ChangeBpm(index)),
-                    time: field(&edit.time, SongField::ChangeTime(index)),
-                })
-                .collect(),
+            title: self.header.field(SongField::Title),
+            key: self.header.field(SongField::Key),
+            tempo: self.header.field(SongField::Tempo),
+            time: self.header.field(SongField::Time),
+            changes: self.header.change_rows(),
             stems_summary: stems_summary(song),
             stems,
             all_stems: self.all_stems,
@@ -736,9 +594,21 @@ fn file_stem_name(path: &str) -> &str {
     name.rsplit_once('.').map_or(name, |(stem, _)| stem)
 }
 
+/// The header values of `song`: its title, key, tempo and time signature
+/// at the start, and its changes.
+fn values_of(song: &SongDraft) -> HeaderValues {
+    HeaderValues {
+        title: song.title.clone(),
+        key: song.key.clone(),
+        bpm: song.bpm,
+        time_signature: song.time_signature,
+        changes: song.changes.clone(),
+    }
+}
+
 /// A domain or library message as a sentence: capitalized, with a full
 /// stop.
-fn sentence(message: &str) -> String {
+pub(crate) fn sentence(message: &str) -> String {
     let mut chars = message.chars();
     full_stop(match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
@@ -747,61 +617,11 @@ fn sentence(message: &str) -> String {
 }
 
 /// `text` ending in a full stop.
-fn full_stop(mut text: String) -> String {
+pub(crate) fn full_stop(mut text: String) -> String {
     if !text.ends_with('.') {
         text.push('.');
     }
     text
-}
-
-fn not_a_tempo(text: &str) -> String {
-    format!("The tempo \"{text}\" is not a number of beats per minute, such as 120.")
-}
-
-fn not_a_meter(text: &str) -> String {
-    format!("The time signature \"{text}\" is not written like 4/4.")
-}
-
-/// A tempo typed, with a point or a comma before its decimals; `None` for
-/// anything but a number.
-fn parse_bpm(text: &str) -> Option<f64> {
-    text.trim()
-        .replace(',', ".")
-        .parse::<f64>()
-        .ok()
-        .filter(|bpm| bpm.is_finite())
-}
-
-/// A time signature typed as "6/8".
-fn parse_meter(text: &str) -> Option<TimeSignature> {
-    let (numerator, denominator) = text.trim().split_once('/')?;
-    Some(TimeSignature {
-        numerator: numerator.trim().parse().ok()?,
-        denominator: denominator.trim().parse().ok()?,
-    })
-}
-
-fn parse_bar(text: &str) -> Option<u64> {
-    text.trim().parse().ok()
-}
-
-/// What an optional field reads as: `Some(None)` when empty, `Some(value)`
-/// when it reads as one, `None` when it reads as none.
-fn optional<T>(text: &str, parse: impl Fn(&str) -> Option<T>) -> Option<Option<T>> {
-    if text.trim().is_empty() {
-        Some(None)
-    } else {
-        parse(text).map(Some)
-    }
-}
-
-/// A tempo as typed: "120", "104.5".
-fn number(bpm: f64) -> String {
-    bpm.to_string()
-}
-
-fn meter(meter: TimeSignature) -> String {
-    format!("{}/{}", meter.numerator, meter.denominator)
 }
 
 /// The line of the stems panel's header, as the design writes it: the
@@ -822,7 +642,7 @@ pub fn stems_summary(song: &SongDraft) -> String {
 }
 
 /// A sample rate in kHz without trailing zeros: "48 kHz", "44.1 kHz".
-fn kilohertz(rate: u32) -> String {
+pub(crate) fn kilohertz(rate: u32) -> String {
     let whole = rate / 1000;
     let rest = rate % 1000;
     if rest == 0 {

@@ -11,7 +11,9 @@
 //!
 //! An import builds a [`SongDraft`] from the stems it finds; the user edits
 //! its title, tempo, time signature, key and parts, and
-//! [`SongDraft::to_package`] turns it into a checked [`SongPackage`].
+//! [`SongDraft::to_package`] turns it into a checked [`SongPackage`]. Its
+//! tempo and meter are a [`BarMaps`], which a saved song's maps read back as
+//! when every change starts a bar.
 //!
 //! A [`SongEditor`] edits a saved song's section markers and arrangements
 //! (F2): every edit leaves a package [`validate`] accepts, or leaves it
@@ -51,9 +53,9 @@ pub use compile::{
 pub use edit::{ArrangementSummary, Snap, SongEditError, SongEditor};
 pub use grid::{BarBeat, BeatGrid, SourceClick};
 pub use import::{
-    DEFAULT_ARRANGEMENT_NAME, DEFAULT_IMPORT_BPM, DEFAULT_IMPORT_TIME_SIGNATURE, DraftError,
-    DraftStem, DraftWarning, INTRO_SECTION_ID, MapChange, PackagedDraft, STEMS_FOLDER, SongDraft,
-    StoredFormat,
+    BarMaps, BarMapsError, DEFAULT_ARRANGEMENT_NAME, DEFAULT_IMPORT_BPM,
+    DEFAULT_IMPORT_TIME_SIGNATURE, DraftError, DraftStem, DraftWarning, INTRO_SECTION_ID,
+    MapChange, PackagedDraft, STEMS_FOLDER, SongDraft, StoredFormat,
 };
 pub use mix::{
     ArrangementMix, MAX_VOLUME_DB, MIX_FORMAT_VERSION, MixFile, MixValidationError, MixerFile,

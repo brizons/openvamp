@@ -2,9 +2,9 @@
 //! draft the user edited.
 
 use domain::{
-    BarBeat, BeatGrid, Bus, DEFAULT_ARRANGEMENT_ID, DraftError, DraftStem, DraftWarning, MapChange,
-    Part, SectionType, SongDraft, StemRole, StoredFormat, TempoPoint, TimeSignature,
-    TimeSignaturePoint, ValidationError, bus_for_stem,
+    BarBeat, BarMaps, BarMapsError, BeatGrid, Bus, DEFAULT_ARRANGEMENT_ID, DraftError, DraftStem,
+    DraftWarning, MapChange, Part, SectionType, SongDraft, StemRole, StoredFormat, TempoPoint,
+    TimeSignature, TimeSignaturePoint, ValidationError, bus_for_stem,
 };
 
 const RATE: u32 = 48_000;
@@ -420,5 +420,127 @@ fn two_click_stems_block_saving_and_name_both_files() {
     assert_eq!(
         errors[0].to_string(),
         "only one click stem is allowed, found \"click\", \"click-2\" (\"Click.wav\", \"Take 2/Click.wav\")"
+    );
+}
+
+/// The draft of `changes_at_bars_become_sample_offsets…`: changes at bars
+/// 5, 7 and 9, so its maps hold points that start bars on three grids.
+fn draft_with_changes() -> SongDraft {
+    let mut draft = draft(&["Drums.wav"]);
+    draft.changes = vec![
+        MapChange {
+            bar: 9,
+            bpm: Some(180.0),
+            time_signature: Some(ts(6, 8)),
+        },
+        meter(7, 3, 4),
+        tempo(5, 90.0),
+    ];
+    draft
+}
+
+#[test]
+fn a_saved_songs_maps_read_as_bars_and_turn_back_into_the_same_maps() {
+    let package = draft_with_changes().to_package().unwrap().package;
+
+    let bars = BarMaps::from_maps(
+        RATE,
+        MINUTE,
+        &package.tempo_map,
+        &package.time_signature_map,
+    )
+    .unwrap();
+
+    // Sorted by bar, a point of each map at one sample being one change.
+    assert_eq!(
+        bars,
+        BarMaps {
+            bpm: 120.0,
+            time_signature: ts(4, 4),
+            changes: vec![
+                tempo(5, 90.0),
+                meter(7, 3, 4),
+                MapChange {
+                    bar: 9,
+                    bpm: Some(180.0),
+                    time_signature: Some(ts(6, 8)),
+                },
+            ],
+        }
+    );
+    assert_eq!(
+        bars.to_maps(RATE, MINUTE).unwrap(),
+        (package.tempo_map, package.time_signature_map)
+    );
+}
+
+#[test]
+fn edited_bar_maps_build_the_maps_an_import_with_those_values_saves() {
+    let mut edited = draft_with_changes();
+    edited.bpm = 100.0;
+    edited.changes[1] = meter(11, 5, 4);
+    let expected = edited.to_package().unwrap().package;
+
+    let bars = BarMaps {
+        bpm: 100.0,
+        time_signature: ts(4, 4),
+        changes: edited.changes.clone(),
+    };
+
+    assert_eq!(
+        bars.to_maps(RATE, MINUTE).unwrap(),
+        (expected.tempo_map, expected.time_signature_map)
+    );
+}
+
+#[test]
+fn a_map_point_that_starts_no_bar_cannot_be_read_as_bars() {
+    // 120 BPM in 4/4: bars every 96 000 samples, so 100 000 is inside bar 2.
+    let tempo_map = [
+        TempoPoint { at: 0, bpm: 120.0 },
+        TempoPoint {
+            at: 100_000,
+            bpm: 90.0,
+        },
+    ];
+    let time_signature_map = [TimeSignaturePoint {
+        at: 0,
+        numerator: 4,
+        denominator: 4,
+    }];
+
+    assert_eq!(
+        BarMaps::from_maps(RATE, MINUTE, &tempo_map, &time_signature_map),
+        Err(BarMapsError::OffBarLine { at: 100_000 })
+    );
+    assert_eq!(
+        BarMapsError::OffBarLine { at: 100_000 }.to_string(),
+        "a tempo or meter change at sample 100000 does not start a bar"
+    );
+}
+
+#[test]
+fn bar_maps_refuse_what_a_draft_refuses() {
+    let bars = BarMaps {
+        bpm: 120.0,
+        time_signature: ts(4, 4),
+        changes: vec![tempo(1, 90.0), tempo(99, 90.0)],
+    };
+
+    // A minute at 120 BPM in 4/4 has 30 bars.
+    assert_eq!(
+        bars.to_maps(RATE, MINUTE),
+        Err(vec![DraftError::ChangeAtBarOne])
+    );
+    let past_end = BarMaps {
+        changes: vec![tempo(99, 90.0)],
+        ..bars
+    };
+    assert_eq!(
+        past_end.to_maps(RATE, MINUTE),
+        Err(vec![DraftError::ChangePastEnd {
+            bar: 99,
+            last_bar: 30
+        }])
     );
 }

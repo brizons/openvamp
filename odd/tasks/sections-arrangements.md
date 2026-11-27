@@ -59,9 +59,9 @@ Requirements quote `docs/mvp-spec.md` (F2) and the user verbatim. Items marked *
 
 | ID | Specs | Route | Status | Commits |
 |----|-------|-------|--------|---------|
-| T1 | S1, S2 (domain) | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L3; verified L4) | see L4 |
-| T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | done (L5); independent verifier pending | see L5 |
-| T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | pending | |
+| T1 | S1, S2 (domain) | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L3; verified L4; review approved L6) | 57965f1 |
+| T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | done (L5; verified L7; review approved L8) | d35205d |
+| T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | done (L9); split, verifier and screenshot check pending | |
 | T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | pending | |
 | T5 | S6 | inline, with each task's own docs | pending | |
 
@@ -135,4 +135,63 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
     - The parent re-ran `--test waveform` (13) and `--test save_song` (10).
     - Release build of 24 five-minute stems: 4.1 s (WAV) and 4.7 s (FLAC); a cache read takes 0.6 ms.
   - Risk: item 1 (it rewrites existing `song.json` files) and item 3 (shared load, setlist and settings helpers), so T2 gets an independent verifier.
+- **L6** (2026-11-27): T1's native review (lineage review-83f1cc62ad90ed8c, 2827125..57965f1) approved and was acknowledged, so the reviewed boundary is now 57965f1. Non-blocking findings, kept as follow-ups:
+  - WARNING ×2: the edit.rs docs promise that a split keeps every arrangement's audio, but a looped section split keeps its loop flag on the first part only, and no test pins that;
+  - WARNING: `SectionType::ALL` is not tied to the enum at compile time;
+  - SUGGESTION: the 24-hour song limit is computed inline in `from_maps`;
+  - SUGGESTION: `import::bar_lines` hides a broken invariant with `unwrap_or_default`.
+- T2's independent verifier and the T3 writer (the desktop Song editor) were launched at the same time; the verifier works in a scratch copy.
+- **L7** (2026-11-27): the T2 verifier passed every probe, with no blockers.
+  - **Overview:** it matches an independent reference over 24 random songs and every format and channel pair, with click and guide stems excluded, and no allocation above 64 KiB.
+  - **Cache:**
+    - it is read in about 350 µs from stem stats only, and is stale on any fingerprint change;
+    - hostile caches (every truncation and flipped byte, huge counts, symlinks) are stale, never a panic;
+    - read-only folders still give the overview, and cancel leaves nothing.
+  - **Save:**
+    - it round-trips;
+    - ten invalid packages are refused with the tree unchanged;
+    - unknown fields survive on kept items and are dropped with deleted or re-id'd items;
+    - every error path writes nothing.
+  - **No change elsewhere:** load, list, mix, setlist and settings behaviour, and render-cli output, are byte-identical at baseline and candidate. `cargo test -p library` passed 195.
+  - **Advisories:**
+    - a 0600 `song.json` becomes 0644 after a save;
+    - a symlinked `song.json` inside the folder is replaced by a file;
+    - the FNV hash is not tamper-proof;
+    - a junk cache up to 64 MiB is read before it is rejected.
+  - **Review:** the user granted T2's review ("Revisar este cambio"), slice 57965f1..d35205d, lenses risk, resilience and reliability.
+- **L8** (2026-11-27): T2's native review (lineage review-bd5aeee7f21cbb92, 57965f1..d35205d) approved and was acknowledged, so the reviewed boundary is now d35205d. Non-blocking findings, kept as follow-ups:
+  - WARNING ×2: on coarse-timestamp drives (FAT, exFAT, HFS+), a stem re-exported at the same size within one timestamp tick keeps a stale cache; a cheap content check, such as a hash of the first and last blocks, would close it;
+  - SUGGESTION: a failed cache write is silent;
+  - SUGGESTION: `save_song` has no compare-and-swap against another writer;
+  - SUGGESTION: with unknown fields present, keys are rewritten in alphabetical order;
+  - SUGGESTION: map-point matching by `at` is untested for inserted points;
+  - SUGGESTION: `load_overview` reads `song.json` unbounded and follows symlinks; it should use `read_confined`.
+- **L9** (2026-11-27): T3 delivered.
+  - **Domain:** a public `BarMaps` (`from_maps`, `to_maps`, `BarMapsError::OffBarLine`), which `SongDraft` now uses.
+  - **Desktop:**
+    - `song_header.rs` (the header shared with the import editor);
+    - `song_edit.rs` with `jobs.rs` (open, waveform, save; cleans `mix.json` of deleted arrangements; reads which setlists play each arrangement) and `view.rs`;
+    - `song_sections.rs` (ruler, blocks, waveform heights mapped into 16–94 %) and `song_sections_ui.rs` (markers panel, inspector, Arrangement panel);
+    - the edit link on Library rows (a waveform icon with the tooltip "Edit <title>");
+    - a `Leaving` question (Discard changes / Keep editing) before Discard, another library, quit or close;
+    - 5 icons and the README.
+  - **Checks:**
+    - `cargo test -p openvamp` passes 321 (35 new in tests/song_edit.rs), and `cargo test -p domain` passes 203; clippy, fmt and the workspace check are clean. The parent re-ran `--test song_edit` (35).
+    - RED came first for the domain only. For the desktop, 12 deliberate mutations were each caught.
+  - **Known design differences:**
+    - the selection's right edge is solid, not dashed;
+    - the selected block has a single ring;
+    - an amber cursor;
+    - Type is a list of buttons;
+    - rename and delete are icons after New;
+    - a tempo panel sits under the inspector;
+    - a beat position reads "Bar 9.3";
+    - no scrollbar.
+  - **Open points:**
+    - a quit that cannot ask (Dock, logout) drops unsaved edits;
+    - a part change makes the cached waveform stale until the editor reopens;
+    - setlists are matched to the song by its exact path;
+    - opening runs `list_songs`.
+  - **Size:** the change is about 6,400 lines, too big for one review slice, so the writer is splitting it into 2–3 compiling commits in a scratch clone. The parent will apply them.
+  - Risk: item 3 (the import header and `SongDraft` maps, which are shared) and item 4 (background jobs and cancel), so T3 gets an independent verifier.
 

@@ -24,6 +24,12 @@
 //! - one Intro section at 0 ([`INTRO_SECTION_ID`]) and the Default
 //!   arrangement ([`DEFAULT_ARRANGEMENT_ID`]) holding it: marking the real
 //!   sections is F2.
+//!
+//! The maps are built from a [`BarMaps`]: the tempo and time signature at the
+//! start and the changes at bars. A saved song's maps read back as one
+//! ([`BarMaps::from_maps`]) when every point starts a bar, so the song editor
+//! edits them as an import does and turns them back into maps
+//! ([`BarMaps::to_maps`]).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -132,6 +138,209 @@ pub struct MapChange {
     pub bpm: Option<f64>,
     /// The new time signature, if the change sets one; bars restart there.
     pub time_signature: Option<TimeSignature>,
+}
+
+/// A song's tempo and time-signature maps as the user enters them: the
+/// tempo and time signature at the start and the changes at bars, each on
+/// the grid of the changes before it (see the [module docs](self)).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BarMaps {
+    /// Tempo at the start, in beats per minute counting the time-signature
+    /// denominator note.
+    pub bpm: f64,
+    /// Time signature at the start.
+    pub time_signature: TimeSignature,
+    /// Tempo and time-signature changes, in any order.
+    pub changes: Vec<MapChange>,
+}
+
+/// Why a song's maps cannot be read as a [`BarMaps`].
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum BarMapsError {
+    /// The maps break a package rule ([`crate::validate`]), or the song is
+    /// longer than [`MAX_SONG_HOURS`].
+    #[error("the tempo and time-signature maps break the package rules")]
+    InvalidMaps,
+    /// A point is not on a bar line of the grid of the points before it,
+    /// or not inside the song.
+    #[error("a tempo or meter change at sample {at} does not start a bar")]
+    OffBarLine {
+        /// The point's sample offset.
+        at: u64,
+    },
+}
+
+impl BarMaps {
+    /// The bars of the maps of a song `length` frames long at
+    /// `sample_rate`: its first points give the start, and every later
+    /// sample where a point of either map starts is one change, at the bar
+    /// it starts on the grid of the points before it. A point that starts
+    /// no bar is [`BarMapsError::OffBarLine`]: such maps are not guessed.
+    pub fn from_maps(
+        sample_rate: u32,
+        length: u64,
+        tempo_map: &[TempoPoint],
+        time_signature_map: &[TimeSignaturePoint],
+    ) -> Result<Self, BarMapsError> {
+        BeatGrid::from_maps(sample_rate, length, tempo_map, time_signature_map)
+            .ok_or(BarMapsError::InvalidMaps)?;
+        // The grid checked the maps: each starts at 0 and is sorted.
+        let (Some(first_tempo), Some(first_meter)) =
+            (tempo_map.first(), time_signature_map.first())
+        else {
+            return Err(BarMapsError::InvalidMaps);
+        };
+        let mut ats: Vec<u64> = tempo_map
+            .iter()
+            .map(|point| point.at)
+            .chain(time_signature_map.iter().map(|point| point.at))
+            .filter(|&at| at > 0)
+            .collect();
+        ats.sort_unstable();
+        ats.dedup();
+        let mut tempo_before = vec![*first_tempo];
+        let mut meter_before = vec![*first_meter];
+        let mut changes = Vec::with_capacity(ats.len());
+        for at in ats {
+            let bars = bar_lines(sample_rate, length, &tempo_before, &meter_before);
+            let index = bars
+                .binary_search(&at)
+                .map_err(|_| BarMapsError::OffBarLine { at })?;
+            let tempo = tempo_map.iter().find(|point| point.at == at).copied();
+            let meter = time_signature_map
+                .iter()
+                .find(|point| point.at == at)
+                .copied();
+            tempo_before.extend(tempo);
+            meter_before.extend(meter);
+            changes.push(MapChange {
+                bar: index as u64 + 1,
+                bpm: tempo.map(|point| point.bpm),
+                time_signature: meter.map(|point| TimeSignature {
+                    numerator: point.numerator,
+                    denominator: point.denominator,
+                }),
+            });
+        }
+        Ok(Self {
+            bpm: first_tempo.bpm,
+            time_signature: TimeSignature {
+                numerator: first_meter.numerator,
+                denominator: first_meter.denominator,
+            },
+            changes,
+        })
+    }
+
+    /// The tempo and time-signature maps of a song `length` frames long at
+    /// `sample_rate`, built as an import builds them; every value and
+    /// change that breaks a rule is returned at once, as
+    /// [`SongDraft::to_package`] reports them.
+    pub fn to_maps(
+        &self,
+        sample_rate: u32,
+        length: u64,
+    ) -> Result<(Vec<TempoPoint>, Vec<TimeSignaturePoint>), Vec<DraftError>> {
+        let mut errors = self.check_values();
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        match self.build(sample_rate, length, &mut errors) {
+            Some(maps) if errors.is_empty() => Ok(maps),
+            _ => Err(errors),
+        }
+    }
+
+    /// The tempo and time-signature values that break a rule, and the
+    /// changes that are not at a bar after the first.
+    fn check_values(&self) -> Vec<DraftError> {
+        let mut errors = Vec::new();
+        check_bpm(1, self.bpm, &mut errors);
+        check_time_signature(1, self.time_signature, &mut errors);
+        let mut bars = HashSet::new();
+        let mut repeated = HashSet::new();
+        for change in self.sorted_changes() {
+            match change.bar {
+                0 => errors.push(DraftError::ChangeAtBarZero),
+                1 => errors.push(DraftError::ChangeAtBarOne),
+                bar if !bars.insert(bar) => {
+                    if repeated.insert(bar) {
+                        errors.push(DraftError::DuplicateChange { bar });
+                    }
+                }
+                _ => {}
+            }
+            if change.bpm.is_none() && change.time_signature.is_none() {
+                errors.push(DraftError::EmptyChange { bar: change.bar });
+            }
+            if let Some(bpm) = change.bpm {
+                check_bpm(change.bar, bpm, &mut errors);
+            }
+            if let Some(time_signature) = change.time_signature {
+                check_time_signature(change.bar, time_signature, &mut errors);
+            }
+        }
+        errors
+    }
+
+    /// The changes sorted by bar.
+    fn sorted_changes(&self) -> Vec<MapChange> {
+        let mut changes = self.changes.clone();
+        changes.sort_by_key(|change| change.bar);
+        changes
+    }
+
+    /// The tempo and time-signature maps, every change placed on the grid of
+    /// the ones before it; `None` when a change does not fit in the song
+    /// (each such change is in `errors`). The values must have passed
+    /// [`Self::check_values`]. A song longer than [`MAX_SONG_HOURS`] gets
+    /// its maps without the changes, which [`crate::validate`] refuses.
+    fn build(
+        &self,
+        sample_rate: u32,
+        length: u64,
+        errors: &mut Vec<DraftError>,
+    ) -> Option<(Vec<TempoPoint>, Vec<TimeSignaturePoint>)> {
+        let mut tempo_map = vec![TempoPoint {
+            at: 0,
+            bpm: self.bpm,
+        }];
+        let mut time_signature_map = vec![TimeSignaturePoint {
+            at: 0,
+            numerator: self.time_signature.numerator,
+            denominator: self.time_signature.denominator,
+        }];
+        if length > MAX_SONG_HOURS * 3_600 * u64::from(sample_rate) {
+            // `validate` refuses the length; the grid is not built.
+            return Some((tempo_map, time_signature_map));
+        }
+        let mut fits = true;
+        for change in self.sorted_changes() {
+            let bars = bar_lines(sample_rate, length, &tempo_map, &time_signature_map);
+            let Some(&at) = usize::try_from(change.bar - 1)
+                .ok()
+                .and_then(|index| bars.get(index))
+            else {
+                errors.push(DraftError::ChangePastEnd {
+                    bar: change.bar,
+                    last_bar: bars.len() as u64,
+                });
+                fits = false;
+                continue;
+            };
+            if let Some(bpm) = change.bpm {
+                tempo_map.push(TempoPoint { at, bpm });
+            }
+            if let Some(time_signature) = change.time_signature {
+                time_signature_map.push(TimeSignaturePoint {
+                    at,
+                    numerator: time_signature.numerator,
+                    denominator: time_signature.denominator,
+                });
+            }
+        }
+        fits.then_some((tempo_map, time_signature_map))
+    }
 }
 
 /// The song an import will save, as the user edits it (F1.3).
@@ -427,43 +636,20 @@ impl SongDraft {
         }
     }
 
-    /// The tempo and time-signature values the user entered that break a
-    /// rule, and the changes that are not at a bar after the first.
-    fn check_values(&self) -> Vec<DraftError> {
-        let mut errors = Vec::new();
-        check_bpm(1, self.bpm, &mut errors);
-        check_time_signature(1, self.time_signature, &mut errors);
-        let mut bars = HashSet::new();
-        let mut repeated = HashSet::new();
-        for change in self.sorted_changes() {
-            match change.bar {
-                0 => errors.push(DraftError::ChangeAtBarZero),
-                1 => errors.push(DraftError::ChangeAtBarOne),
-                bar if !bars.insert(bar) => {
-                    if repeated.insert(bar) {
-                        errors.push(DraftError::DuplicateChange { bar });
-                    }
-                }
-                _ => {}
-            }
-            if change.bpm.is_none() && change.time_signature.is_none() {
-                errors.push(DraftError::EmptyChange { bar: change.bar });
-            }
-            if let Some(bpm) = change.bpm {
-                check_bpm(change.bar, bpm, &mut errors);
-            }
-            if let Some(time_signature) = change.time_signature {
-                check_time_signature(change.bar, time_signature, &mut errors);
-            }
+    /// The draft's tempo, time signature and changes.
+    fn bar_maps(&self) -> BarMaps {
+        BarMaps {
+            bpm: self.bpm,
+            time_signature: self.time_signature,
+            changes: self.changes.clone(),
         }
-        errors
     }
 
-    /// The changes sorted by bar.
-    fn sorted_changes(&self) -> Vec<MapChange> {
-        let mut changes = self.changes.clone();
-        changes.sort_by_key(|change| change.bar);
-        changes
+    /// The tempo and time-signature values the user entered that break a
+    /// rule, and the changes that are not at a bar after the first
+    /// ([`BarMaps`]).
+    fn check_values(&self) -> Vec<DraftError> {
+        self.bar_maps().check_values()
     }
 
     /// The tempo and time-signature maps, every change placed on the grid of
@@ -475,46 +661,8 @@ impl SongDraft {
         sample_rate: u32,
         errors: &mut Vec<DraftError>,
     ) -> Option<(Vec<TempoPoint>, Vec<TimeSignaturePoint>)> {
-        let mut tempo_map = vec![TempoPoint {
-            at: 0,
-            bpm: self.bpm,
-        }];
-        let mut time_signature_map = vec![TimeSignaturePoint {
-            at: 0,
-            numerator: self.time_signature.numerator,
-            denominator: self.time_signature.denominator,
-        }];
-        let length = self.length_frames();
-        if length > MAX_SONG_HOURS * 3_600 * u64::from(sample_rate) {
-            // `validate` refuses the length; the grid is not built.
-            return Some((tempo_map, time_signature_map));
-        }
-        let mut fits = true;
-        for change in self.sorted_changes() {
-            let bars = bar_lines(sample_rate, length, &tempo_map, &time_signature_map);
-            let Some(&at) = usize::try_from(change.bar - 1)
-                .ok()
-                .and_then(|index| bars.get(index))
-            else {
-                errors.push(DraftError::ChangePastEnd {
-                    bar: change.bar,
-                    last_bar: bars.len() as u64,
-                });
-                fits = false;
-                continue;
-            };
-            if let Some(bpm) = change.bpm {
-                tempo_map.push(TempoPoint { at, bpm });
-            }
-            if let Some(time_signature) = change.time_signature {
-                time_signature_map.push(TimeSignaturePoint {
-                    at,
-                    numerator: time_signature.numerator,
-                    denominator: time_signature.denominator,
-                });
-            }
-        }
-        fits.then_some((tempo_map, time_signature_map))
+        self.bar_maps()
+            .build(sample_rate, self.length_frames(), errors)
     }
 
     /// The stem rules of [`crate::validate`] alone, for a draft refused
