@@ -27,6 +27,13 @@
 //! an [`ImportDraft`] to edit, and [`Library::save_import`] saves it as a new
 //! song folder in the library, copying the stems the player reads and
 //! transcoding the others to FLAC (see the [`import`] module).
+//! [`Library::save_song`] rewrites the `song.json` of a song already in the
+//! library after an edit, keeping the fields this version does not know.
+//!
+//! [`build_overview`] reads a song's `track` stems into its waveform
+//! [`Overview`] and caches it in the song's [`WAVEFORMS_FOLDER`], a cache
+//! that is safe to delete; [`load_overview`] reads the cache back while the
+//! stems are unchanged.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -57,8 +64,10 @@ mod setlist_order;
 mod setlist_songs;
 mod setlists;
 mod settings;
+mod song_store;
 mod songs;
 mod stream;
+mod waveform;
 
 pub use config::{
     BUS_SETTINGS_FILE, ConfigStore, LoadedBusSettings, LoadedRouting, Platform, ROUTING_FILE,
@@ -77,8 +86,13 @@ pub use setlists::{
     TrashFn, UnreadableSetlist, move_to_trash,
 };
 pub use settings::{MAX_SETTINGS_FILE_BYTES, SettingsError};
+pub use song_store::SaveSongError;
 pub use songs::{ArrangementEntry, PositionEntry, SongEntry, SongListing, UnreadableSong};
 pub use stream::{DiskMonitor, Gate, StreamCapacity, StreamConfig, StreamingSong, open_streaming};
+pub use waveform::{
+    OVERVIEW_FILE, OVERVIEW_VALUES_PER_SECOND, Overview, OverviewError, OverviewProgress,
+    WAVEFORMS_FOLDER, build_overview, load_overview,
+};
 
 /// Name of the manifest inside a song folder.
 pub const MANIFEST_FILE: &str = "song.json";
@@ -268,9 +282,12 @@ pub fn load_song(dir: &Path) -> Result<LoadedSong, LoadError> {
     })
 }
 
+/// A validated package with every stem file open, in package order.
+type OpenedPackage = (Validated, Vec<(Stem, OpenedStem)>);
+
 /// Reads and validates the song folder `dir` as [`load_song`] describes, and
 /// opens every stem file, in package order, without decoding it.
-fn open_package(dir: &Path) -> Result<(Validated, Vec<(Stem, OpenedStem)>), LoadError> {
+fn open_package(dir: &Path) -> Result<OpenedPackage, LoadError> {
     let manifest_path = dir.join(MANIFEST_FILE);
     let json = fs::read_to_string(&manifest_path).map_err(|source| LoadError::ReadManifest {
         path: manifest_path,
@@ -280,21 +297,25 @@ fn open_package(dir: &Path) -> Result<(Validated, Vec<(Stem, OpenedStem)>), Load
 }
 
 /// [`open_package`] for the manifest text `json` already read from `dir`.
-fn open_package_json(
-    dir: &Path,
-    json: &str,
-) -> Result<(Validated, Vec<(Stem, OpenedStem)>), LoadError> {
+fn open_package_json(dir: &Path, json: &str) -> Result<OpenedPackage, LoadError> {
     let package = SongPackage::from_json(json)?;
     let folder = fs::canonicalize(dir).map_err(|source| LoadError::SongFolder {
         path: dir.to_owned(),
         source,
     })?;
+    check_package(&folder, package).map_err(LoadError::Invalid)
+}
 
+/// Checks `package` against the stem files in `folder` (canonical) as
+/// [`load_song`] does, and opens every stem file, in package order, without
+/// decoding it. On failure every problem is returned, in [`load_song`]'s
+/// order.
+fn check_package(folder: &Path, package: SongPackage) -> Result<OpenedPackage, Vec<SongProblem>> {
     let mut file_problems = Vec::new();
     let mut infos = Vec::with_capacity(package.stems.len());
     let mut readers = Vec::with_capacity(package.stems.len());
     for stem in &package.stems {
-        match open_stem(&folder, stem) {
+        match open_stem(folder, stem) {
             Ok(Some(opened)) => {
                 infos.push(StemInfo {
                     id: stem.id.clone(),
@@ -323,8 +344,8 @@ fn open_package_json(
                 .collect();
             Ok((validated, opened))
         }
-        Ok(_) => Err(LoadError::Invalid(file_problems)),
-        Err(errors) => Err(LoadError::Invalid(merge_problems(file_problems, errors))),
+        Ok(_) => Err(file_problems),
+        Err(errors) => Err(merge_problems(file_problems, errors)),
     }
 }
 
@@ -497,6 +518,16 @@ enum ConfinedReadError {
 /// setlist order, `mix.json` and the configuration files are all read this
 /// way.
 fn read_confined(folder: &Path, file: &str, max_bytes: u64) -> Result<String, ConfinedReadError> {
+    let bytes = read_confined_bytes(folder, file, max_bytes)?;
+    String::from_utf8(bytes).map_err(|_| ConfinedReadError::NotUtf8)
+}
+
+/// [`read_confined`] for a file of any bytes, never [`ConfinedReadError::NotUtf8`].
+fn read_confined_bytes(
+    folder: &Path,
+    file: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, ConfinedReadError> {
     let resolved = match resolve_inside(folder, file) {
         Ok(Some(resolved)) => resolved,
         Ok(None) => return Err(ConfinedReadError::Outside),
@@ -512,10 +543,9 @@ fn read_confined(folder: &Path, file: &str, max_bytes: u64) -> Result<String, Co
     if metadata.len() > max_bytes {
         return Err(ConfinedReadError::TooLarge);
     }
-    let bytes = read_at_most(opened, max_bytes)
+    read_at_most(opened, max_bytes)
         .map_err(ConfinedReadError::Io)?
-        .ok_or(ConfinedReadError::TooLarge)?;
-    String::from_utf8(bytes).map_err(|_| ConfinedReadError::NotUtf8)
+        .ok_or(ConfinedReadError::TooLarge)
 }
 
 /// Reads all of `file`, or `None` when it holds more than `max_bytes` (it may
@@ -530,9 +560,9 @@ fn read_at_most(file: File, max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
 /// and renames it over `path`; on failure the temporary file is removed and
 /// an existing file at `path` is left as it was. A symlink at `path` is
 /// replaced, never followed.
-fn write_file_atomically(path: &Path, contents: &str) -> io::Result<()> {
+fn write_file_atomically(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
     let (temporary, mut file) = Temporary::create_beside(path)?;
-    file.write_all(contents.as_bytes())?;
+    file.write_all(contents.as_ref())?;
     file.sync_all()?;
     drop(file);
     temporary.rename_to(path)

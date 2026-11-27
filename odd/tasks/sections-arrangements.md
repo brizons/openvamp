@@ -60,7 +60,7 @@ Requirements quote `docs/mvp-spec.md` (F2) and the user verbatim. Items marked *
 | ID | Specs | Route | Status | Commits |
 |----|-------|-------|--------|---------|
 | T1 | S1, S2 (domain) | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L3; verified L4) | see L4 |
-| T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | pending | |
+| T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | done (L5); independent verifier pending | see L5 |
 | T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | pending | |
 | T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | pending | |
 | T5 | S6 | inline, with each task's own docs | pending | |
@@ -119,4 +119,20 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
     - RED: the new test did not compile against the old error type.
     - GREEN: `cargo test -p domain` passes 199; fmt and clippy are clean.
     - Amended into the T1 commit, which had not been pushed.
+- **L5** (2026-11-27): T2 delivered.
+  - **`library::waveform`:**
+    - `Overview` holds the peak of the track stems mixed at unity, about 100 values per second (480 frames at 48 kHz), with `range_level` and `peak`.
+    - `load_overview(dir)` reads a fresh cache without decoding; `build_overview(dir, progress, cancel)` reads the stems in lockstep through the player's readers and writes the cache atomically.
+    - The cache is `waveforms/overview.bin`, format v1: a magic, the stems' fingerprints (name, role, size, modified time), u16 values and an FNV-1a hash. It holds about 61 KB for 5 minutes and 24 stems.
+  - **`Library::save_song(song, &SongPackage)`:**
+    - It validates the package against the stems, as loading does, and rewrites `song.json` atomically.
+    - Fields the package does not own survive at every level: list items are matched by id, map points by `at`.
+    - It refuses a read-only, malformed or newer-format `song.json`.
+  - **Shared helpers changed:** `check_package` (used by load and save), `read_confined_bytes`, and `write_file_atomically` (now takes `AsRef<[u8]>`).
+  - **Checks:**
+    - RED: 13 waveform and 9 save tests failed against stubs.
+    - GREEN: `cargo test -p library` passes everything (4 ignored measurements); clippy, doc and the workspace check are clean.
+    - The parent re-ran `--test waveform` (13) and `--test save_song` (10).
+    - Release build of 24 five-minute stems: 4.1 s (WAV) and 4.7 s (FLAC); a cache read takes 0.6 ms.
+  - Risk: item 1 (it rewrites existing `song.json` files) and item 3 (shared load, setlist and settings helpers), so T2 gets an independent verifier.
 
