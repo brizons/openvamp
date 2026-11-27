@@ -63,7 +63,7 @@ Requirements quote `docs/mvp-spec.md` (F2) and the user verbatim. Items marked *
 | T1 | S1, S2 (domain) | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L3; verified L4; review approved L6) | 57965f1 |
 | T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | done (L5; verified L7; review approved L8) | d35205d |
 | T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | done (L9; split L10; verified L11 with B1 in correction; reviews approved L12) | 0d0975e, 19e1a0f, dc274d7 |
-| T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | done (L10); verifier and screenshot check pending | see L10 |
+| T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | done (L10; verified L15); review running | 0010532 |
 | T5 | S6 | inline, with each task's own docs | pending | |
 
 Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and T3 drives background jobs (item 4), so each gets an independent verifier.
@@ -301,4 +301,18 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
     - an open-ended range ("to the end") becomes an explicit end when remapped, so a section appended later is not included;
     - a split saves with no warning when a setlist file cannot be read;
     - deleting a marker inside a range asks, though the merged section plays the same frames.
+- **L15** (2026-11-27): the T4 verifier found no blockers.
+  - **Bars:** each position covers its own source range, a repeated section gives identical heights, heights match the hand formula within 2e-3 and stay inside 18–96 %, a mid-bar start cuts its bar, and opacity is right at more than 500 bars and seams.
+  - **Live safety:**
+    - no build starts in any playing state, and no `waveforms/` folder is created;
+    - play cancels a build without leaving a cache;
+    - builds resume after stop or pause;
+    - a cache shows while playing, without decoding: garbage stems of the same size and modified time still show it.
+  - **Stale results:** they are ignored, and a click-only tile clears the waveform.
+  - **No change elsewhere:** the `PerformView` dump is identical at baseline and candidate apart from the new `wave` field.
+  - **Suite:** `cargo test -p openvamp` passes 338.
+  - **Advisories (follow-ups):**
+    - a build that finished just before play has its result dropped, so the cache is not shown during that play and is rebuilt at the next stop (fix: on an ignored `Ok`, go back to reading the cache);
+    - `StemRow.file`'s doc is stale.
+  - **Final reviews:** the user granted both final review slices: T4 (dc274d7..0010532) and the setlist fix (0010532..c43d0d0).
 
