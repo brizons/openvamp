@@ -36,23 +36,36 @@
 //!   decoded and written as 24-bit FLAC, `stems/<id>.flac`
 //!   ([`StemAction::Transcode`]), so every stem seeks exactly. Samples are
 //!   rounded to 24 bits and clamped, without dither: a source of 24 bits or
-//!   fewer converts exactly. Encoder delay and padding are trimmed when the
-//!   file records them, so every stem starts on the same sample: the LAME or
-//!   Xing header of an MP3, and the edit list of an M4A. An MP3 without such
-//!   a header keeps the decoder's delay.
-//! - A file with more than two channels, an empty one, or one nothing
-//!   decodes is refused ([`RefusedFile`]), with its name and the reason; a
+//!   fewer converts exactly. No FLAC frame is larger than its samples stored
+//!   verbatim, so loud noise takes at most about its raw 24-bit size.
+//!   Encoder delay and padding are trimmed when the file records them, so
+//!   every stem starts on the same sample: the LAME or Xing header of an
+//!   MP3; the edit list of an M4A, or the `iTunSMPB` tag Apple's encoder
+//!   writes instead. An MP3 without such a header keeps its encoder's and
+//!   decoder's delay (1 105 frames for LAME), and an M4A that records
+//!   neither keeps its priming.
+//! - The length the probe reads is exact, except for an MP3 without a Xing
+//!   or LAME header and an M4A that records no delay, whose length is
+//!   estimated from their packets ([`ProbedStem::estimated_length`]); such
+//!   a stem is saved at the length its decoder gives, which can be a packet
+//!   shorter.
+//! - A file with more than two channels, an empty one, one nothing decodes,
+//!   or a WAV or FLAC whose audio stops before the length its header
+//!   declares, is refused ([`RefusedFile`]), with its name and the reason; a
 //!   draft with a refused file is not saved.
 //!
 //! # Saving
 //!
 //! [`Library::save_import`] builds the song in a hidden folder inside the
 //! library folder (named `.import-…`, so [`Library::list_songs`] never shows
-//! it): it copies or transcodes every stem, writes `song.json`, and opens
-//! every stem with the player's own reader, checking its sample rate and
-//! length against what the probe read. Only then is the folder renamed into
-//! place, at once, as `<Title>.song` in the library folder. On any failure,
-//! or when cancelled, the hidden folder is removed and nothing else changes.
+//! it): it copies or transcodes every stem, then reads every stem written
+//! to its end with the player's own reader, a block at a time, checking its
+//! sample rate and length against what the probe read; it writes
+//! `song.json` and opens the whole song as [`crate::load_song`] does. Only
+//! then is the folder renamed into place, at once, as `<Title>.song` in the
+//! library folder. On any failure, or when cancelled, the hidden folder is
+//! removed and nothing else changes; an error about a stem names it
+//! ([`ImportError::Stem`]).
 //!
 //! The folder name is the title made safe on Windows, macOS and Linux:
 //! `/`, `\` and `:` become `-`; `* ? " < > |` and control characters are
@@ -143,6 +156,11 @@ pub struct ProbedStem {
     pub channels: u16,
     /// What the import does with it.
     pub action: StemAction,
+    /// Whether the length the probe read is only an estimate: an MP3
+    /// without a Xing or LAME header, or an M4A that records neither an edit
+    /// list nor an `iTunSMPB` tag. Such a stem is saved at the length its
+    /// decoder gives, which can be a packet shorter.
+    pub estimated_length: bool,
     /// Where to read it.
     pub(crate) location: Location,
     /// Frames of decoded audio to drop before the stem starts: the encoder

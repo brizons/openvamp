@@ -8,13 +8,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use domain::PackagedDraft;
+use domain::{PackagedDraft, Stem};
 
 use super::audio::{self, AudioFacts, TranscodeError};
 use super::source::{self, Scratch};
 use super::{ImportDraft, ImportError, ImportProgress, Location, ProbedStem, Source, StemAction};
 use crate::songs::{SongEntry, entry};
-use crate::{Library, MANIFEST_FILE, open_package, open_regular_file, resolve_inside};
+use crate::{
+    Library, LoadError, MANIFEST_FILE, open_package, open_regular_file, open_stem, problem_stem,
+    read_through, resolve_inside,
+};
 
 /// The ending of a song folder's name.
 pub const SONG_FOLDER_EXTENSION: &str = ".song";
@@ -62,10 +65,11 @@ pub fn song_folder_name(title: &str) -> String {
 enum Message {
     /// Frames of stem `stem` written so far.
     Progress { stem: usize, done: u64 },
-    /// Stem `stem` is written, or why not.
+    /// Stem `stem` is written and read back, with its length in frames, or
+    /// why not.
     Done {
         stem: usize,
-        result: Result<(), ImportError>,
+        result: Result<u64, ImportError>,
     },
 }
 
@@ -121,9 +125,9 @@ impl Library {
             source,
         })?;
 
-        write_stems(draft, &packaged, &scratch.path, progress, cancel)?;
+        let lengths = write_stems(draft, &packaged, &scratch.path, progress, cancel)?;
         write_manifest(&scratch.path, &packaged)?;
-        let song = check(&scratch.path, draft)?;
+        let song = check(&scratch.path, draft, &packaged, &lengths)?;
         sync_folder(&stems_folder);
         sync_folder(&scratch.path);
         if cancel.load(Ordering::Relaxed) {
@@ -142,15 +146,17 @@ impl Library {
     }
 }
 
-/// Writes every stem of `draft` into `folder`'s stems folder, on scoped
-/// threads, reporting progress on this thread.
+/// Writes every stem of `draft` into `folder`'s stems folder, and reads each
+/// one back to its end with the player's reader, on scoped threads,
+/// reporting progress on this thread. Returns each stem's length as
+/// written: the probe's, except for a stem whose length was an estimate.
 fn write_stems(
     draft: &ImportDraft,
     packaged: &PackagedDraft,
     folder: &Path,
     progress: &mut dyn FnMut(ImportProgress),
     cancel: &AtomicBool,
-) -> Result<(), ImportError> {
+) -> Result<Vec<u64>, ImportError> {
     let lengths: Vec<u64> = draft
         .song
         .stems()
@@ -179,13 +185,22 @@ fn write_stems(
                     {
                         return;
                     }
-                    let target = folder.join(&packaged.package.stems[stem].file);
+                    let written = &packaged.package.stems[stem];
+                    let target = folder.join(&written.file);
+                    let going =
+                        || !(stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed));
                     let mut report = |done| {
                         let _ = sender.send(Message::Progress { stem, done });
-                        !(stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed))
+                        going()
                     };
                     let result =
-                        write_stem(draft, stem, folder, &target, &mut archive, &mut report);
+                        write_stem(draft, stem, folder, &target, &mut archive, &mut report)
+                            .and_then(|frames| {
+                                let rate = draft.song.stems()[stem].sample_rate;
+                                let probed = &draft.stems[stem];
+                                verify_stem(folder, written, probed, rate, frames, &mut || going())
+                                    .map(|()| frames)
+                            });
                     if result.is_err() {
                         stop.store(true, Ordering::Relaxed);
                     }
@@ -196,12 +211,16 @@ fn write_stems(
         drop(sender);
 
         let mut done = vec![0; lengths.len()];
+        let mut written = lengths.clone();
         let mut first_error = None;
         for message in receiver {
             let (stem, frames) = match message {
                 Message::Progress { stem, done } => (stem, done),
                 Message::Done { stem, result } => match result {
-                    Ok(()) => (stem, lengths[stem]),
+                    Ok(frames) => {
+                        written[stem] = frames;
+                        (stem, lengths[stem])
+                    }
                     Err(error) => {
                         // A cancel shows as a stopped stem: report the
                         // first real error, else the cancel.
@@ -231,13 +250,14 @@ fn write_stems(
         match first_error {
             Some(error) => Err(error),
             None if cancel.load(Ordering::Relaxed) => Err(ImportError::Cancelled),
-            None => Ok(()),
+            None => Ok(written),
         }
     })
 }
 
-/// Copies or transcodes stem `index` of `draft` to `target`. `report` gets
-/// the frames written so far and says whether to go on.
+/// Copies or transcodes stem `index` of `draft` to `target`, and returns
+/// the frames written. `report` gets the frames written so far and says
+/// whether to go on.
 fn write_stem(
     draft: &ImportDraft,
     index: usize,
@@ -245,7 +265,7 @@ fn write_stem(
     target: &Path,
     archive: &mut Option<zip::ZipArchive<File>>,
     report: &mut dyn FnMut(u64) -> bool,
-) -> Result<(), ImportError> {
+) -> Result<u64, ImportError> {
     let stem = &draft.stems[index];
     let facts = &draft.song.stems()[index];
     let stem_error = |reason: String| ImportError::Stem {
@@ -275,12 +295,13 @@ fn write_stem(
         StemAction::Copy => match &extracted {
             Some(file) => fs::rename(file, target).map_err(write_error).map(|()| {
                 report(facts.length_frames);
+                facts.length_frames
             }),
             None => copy(&input, target, facts.length_frames, report)
                 .map_err(write_error)
                 .and_then(|copied| {
                     if copied {
-                        Ok(())
+                        Ok(facts.length_frames)
                     } else {
                         Err(ImportError::Cancelled)
                     }
@@ -292,6 +313,7 @@ fn write_stem(
                 channels: stem.channels,
                 frames: facts.length_frames,
                 skip: stem.skip_frames,
+                estimated: stem.estimated_length,
             };
             audio::transcode(&input, stem.format, audio, target, report).map_err(
                 |error| match error {
@@ -403,29 +425,108 @@ fn write_manifest(folder: &Path, packaged: &PackagedDraft) -> Result<(), ImportE
     })
 }
 
-/// Opens the song folder at `folder` as the player does, and checks every
-/// stem's sample rate and length against what the probe read; the song as
-/// it loads.
-fn check(folder: &Path, draft: &ImportDraft) -> Result<domain::Song, ImportError> {
-    let (validated, opened) = open_package(folder).map_err(|error| ImportError::Stem {
-        name: draft.source().display().to_string(),
-        reason: format!("the song written does not load: {error}"),
-    })?;
-    for ((stem, facts), (_, opened)) in draft.stems.iter().zip(draft.song.stems()).zip(&opened) {
-        if opened.sample_rate() != facts.sample_rate || opened.frames() != facts.length_frames {
+/// Opens the stem `stem` written in `folder` (canonical) with the player's
+/// reader, checks its sample rate and length against what the probe read
+/// (`sample_rate`) and what was written (`frames`), and reads it through to
+/// its end, a block at a time. `keep_going` is asked between blocks.
+fn verify_stem(
+    folder: &Path,
+    stem: &Stem,
+    probed: &ProbedStem,
+    sample_rate: u32,
+    frames: u64,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<(), ImportError> {
+    let failed = |reason: String| ImportError::Stem {
+        name: probed.name.clone(),
+        reason,
+    };
+    let opened = match open_stem(folder, stem) {
+        Ok(Some(opened)) => opened,
+        Ok(None) => unreachable!("an import writes stems at plain relative paths"),
+        Err(problem) => {
+            return Err(failed(format!(
+                "the stem written cannot be opened: {problem}"
+            )));
+        }
+    };
+    if opened.sample_rate() != sample_rate || opened.frames() != frames {
+        return Err(failed(format!(
+            "the stem written is {} frames at {} Hz, but the file read was {frames} frames at {sample_rate} Hz",
+            opened.frames(),
+            opened.sample_rate(),
+        )));
+    }
+    match read_through(stem, opened, keep_going) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ImportError::Cancelled),
+        Err(error) => Err(failed(format!(
+            "the stem written does not read to its end: {error}"
+        ))),
+    }
+}
+
+/// Opens the song folder at `folder` as the player does, checks every
+/// stem's sample rate and length against the probe's rate and the lengths
+/// written, and returns the song as it loads. A failure names the stem it
+/// is about, with every problem found.
+fn check(
+    folder: &Path,
+    draft: &ImportDraft,
+    packaged: &PackagedDraft,
+    lengths: &[u64],
+) -> Result<domain::Song, ImportError> {
+    let (validated, opened) =
+        open_package(folder).map_err(|error| load_failure(error, draft, packaged))?;
+    for (((stem, facts), (_, opened)), &frames) in draft
+        .stems
+        .iter()
+        .zip(draft.song.stems())
+        .zip(&opened)
+        .zip(lengths)
+    {
+        if opened.sample_rate() != facts.sample_rate || opened.frames() != frames {
             return Err(ImportError::Stem {
                 name: stem.name.clone(),
                 reason: format!(
-                    "the stem written is {} frames at {} Hz, but the file read was {} frames at {} Hz",
+                    "the stem written is {} frames at {} Hz, but the file read was {frames} frames at {} Hz",
                     opened.frames(),
                     opened.sample_rate(),
-                    facts.length_frames,
                     facts.sample_rate
                 ),
             });
         }
     }
     Ok(validated.song)
+}
+
+/// A song written that does not load, as the error of the stem it is about
+/// (the source when it is about no stem), with the loader's every problem.
+fn load_failure(error: LoadError, draft: &ImportDraft, packaged: &PackagedDraft) -> ImportError {
+    let (id, detail) = match &error {
+        LoadError::Invalid(problems) => (
+            problems.iter().find_map(problem_stem),
+            problems
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        ),
+        LoadError::Decode { id, .. } | LoadError::StemTooLarge { id, .. } => {
+            (Some(id.as_str()), error.to_string())
+        }
+        other => (None, other.to_string()),
+    };
+    let name = id
+        .and_then(|id| packaged.package.stems.iter().position(|stem| stem.id == id))
+        .map_or_else(
+            || draft.source().display().to_string(),
+            |index| draft.stems[index].name.clone(),
+        );
+    ImportError::Stem {
+        name,
+        reason: format!("the song written does not load: {detail}"),
+    }
 }
 
 /// `name` with [`SONG_FOLDER_EXTENSION`], or with " 2", " 3"… before it,

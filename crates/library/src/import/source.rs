@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use domain::{DraftStem, SongDraft, Stem, StemRole, StoredFormat};
 use zip::ZipArchive;
 
-use super::audio;
+use super::audio::{self, ProbeError};
 use super::{
     ImportDraft, ImportError, Location, MAX_IMPORT_FILES, ProbedStem, RefusedFile, Source,
     SourceFormat, StemAction,
@@ -29,6 +29,7 @@ pub(super) struct Facts {
     pub(super) channels: u16,
     pub(super) frames: u64,
     pub(super) skip: u64,
+    pub(super) estimated: bool,
     pub(super) stored_as: StoredFormat,
     pub(super) action: StemAction,
 }
@@ -82,6 +83,7 @@ pub(super) fn probe(path: &Path) -> Result<ImportDraft, ImportError> {
                     format,
                     channels: facts.channels,
                     action: facts.action,
+                    estimated_length: facts.estimated,
                     location,
                     skip_frames: facts.skip,
                 });
@@ -297,7 +299,7 @@ pub(super) fn probe_file(folder: &Path, file: &str, format: SourceFormat) -> Res
                 role: StemRole::Track,
             };
             match open_stem(folder, &stem) {
-                Ok(Some(opened)) => return copied(&opened),
+                Ok(Some(opened)) => return copied(opened),
                 Ok(None) => return Err("its path is not inside the source".to_owned()),
                 Err(SongProblem::StemOutsideFolder { .. }) => {
                     return Err("it resolves outside the source folder".to_owned());
@@ -312,8 +314,10 @@ pub(super) fn probe_file(folder: &Path, file: &str, format: SourceFormat) -> Res
         Ok(None) => return Err("it resolves outside the source folder".to_owned()),
         Err(error) => return Err(format!("it cannot be read: {error}")),
     };
-    let facts =
-        audio::probe(&path, format).map_err(|reason| format!("it cannot be decoded: {reason}"))?;
+    let facts = audio::probe(&path, format).map_err(|error| match error {
+        ProbeError::Undecodable(reason) => format!("it cannot be decoded: {reason}"),
+        ProbeError::CutShort(declared) => audio::cut_short(declared),
+    })?;
     if facts.channels > 2 {
         return Err(too_many_channels(facts.channels));
     }
@@ -329,21 +333,43 @@ pub(super) fn probe_file(folder: &Path, file: &str, format: SourceFormat) -> Res
         channels: facts.channels,
         frames: facts.frames,
         skip: facts.skip,
+        estimated: facts.estimated,
         stored_as: StoredFormat::Flac,
         action: StemAction::Transcode { reason },
     })
 }
 
 /// The facts of a stem the player reads as it is, copied as it is.
-fn copied(opened: &OpenedStem) -> Result<Facts, String> {
-    if opened.frames() == 0 {
+/// A file cut short is refused, not transcoded: what the player cannot read
+/// at its end is not audio the import can trust either. A WAV file must hold
+/// every sample its header declares; a FLAC file must decode its last
+/// declared frame.
+fn copied(mut opened: OpenedStem) -> Result<Facts, String> {
+    let frames = opened.frames();
+    if frames == 0 {
         return Err("it holds no audio".to_owned());
+    }
+    match &mut opened {
+        OpenedStem::Wav {
+            reader,
+            max_samples,
+        } => {
+            if u64::from(reader.len()) > *max_samples {
+                return Err(audio::cut_short(frames));
+            }
+        }
+        OpenedStem::Flac(flac) => {
+            if let Err(error) = flac.read(frames - 1, &mut [0.0; 2]) {
+                return Err(format!("{}: {error}", audio::cut_short(frames)));
+            }
+        }
     }
     Ok(Facts {
         sample_rate: opened.sample_rate(),
         channels: opened.channels(),
-        frames: opened.frames(),
+        frames,
         skip: 0,
+        estimated: false,
         stored_as: match opened {
             OpenedStem::Wav { .. } => StoredFormat::Wav,
             OpenedStem::Flac(_) => StoredFormat::Flac,

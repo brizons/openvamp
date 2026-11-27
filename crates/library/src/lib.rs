@@ -671,6 +671,80 @@ fn decode(stem: &Stem, opened: OpenedStem) -> Result<StemAudio, LoadError> {
     })
 }
 
+/// Frames [`read_through`] reads at a time.
+const READ_THROUGH_BLOCK: usize = 4_096;
+
+/// Reads every sample of an opened stem with the reader the player uses, a
+/// block at a time and keeping none, as a song is proved to play to its end
+/// before an import saves it. A WAV file must hold every sample its header
+/// declares and a FLAC file must decode every declared frame, as
+/// [`load_song`] requires. `keep_going` is asked between blocks; the result
+/// is `Ok(false)` when it said to stop.
+fn read_through(
+    stem: &Stem,
+    opened: OpenedStem,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<bool, LoadError> {
+    let decode_error = |source: DecodeError| LoadError::Decode {
+        id: stem.id.clone(),
+        file: stem.file.clone(),
+        source,
+    };
+    match opened {
+        OpenedStem::Wav {
+            mut reader,
+            max_samples,
+        } => {
+            if u64::from(reader.len()) > max_samples {
+                return Err(decode_error(
+                    hound::Error::FormatError(
+                        "the file holds fewer samples than its header declares",
+                    )
+                    .into(),
+                ));
+            }
+            let block = READ_THROUGH_BLOCK * usize::from(reader.spec().channels);
+            let mut read = 0;
+            match reader.spec().sample_format {
+                SampleFormat::Int => {
+                    for sample in reader.samples::<i32>() {
+                        sample.map_err(|error| decode_error(error.into()))?;
+                        read += 1;
+                        if read % block == 0 && !keep_going() {
+                            return Ok(false);
+                        }
+                    }
+                }
+                SampleFormat::Float => {
+                    for sample in reader.samples::<f32>() {
+                        sample.map_err(|error| decode_error(error.into()))?;
+                        read += 1;
+                        if read % block == 0 && !keep_going() {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+            Ok(true)
+        }
+        OpenedStem::Flac(mut flac) => {
+            let frames = flac.frames();
+            let mut block = vec![0.0; 2 * READ_THROUGH_BLOCK];
+            let mut at = 0;
+            while at < frames {
+                let count = (frames - at).min(READ_THROUGH_BLOCK as u64);
+                flac.read(at, &mut block[..2 * count as usize])
+                    .map_err(decode_error)?;
+                at += count;
+                if !keep_going() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+}
+
 /// The factor that turns a `bits`-bit integer sample into `f32`: 2^-(bits - 1),
 /// exact in f32, so the conversion adds no rounding. Loading and streaming
 /// share it, so both give bit-identical samples.

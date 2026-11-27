@@ -1,12 +1,20 @@
-//! The encoder delay and the length an M4A file records in the edit list of
-//! its audio track (`moov/trak/edts/elst`), which `symphonia` 0.6 reads but
-//! does not apply.
+//! The encoder delay and the length an M4A file records, which `symphonia`
+//! 0.6 does not apply.
 //!
 //! An AAC encoder adds priming frames before the audio and pads the last
-//! packet; the edit list says which frames play: the first edit that is
-//! not empty starts at `media_time` (the delay) and lasts
-//! `segment_duration`. ffmpeg writes it that way. A file with several such
-//! edits, or none, is left untrimmed.
+//! packet. A file records which frames play in one of two places:
+//!
+//! - the edit list of its audio track (`moov/trak/edts/elst`), as ffmpeg
+//!   writes it: the first edit that is not empty starts at `media_time` (the
+//!   delay) and lasts `segment_duration`;
+//! - an `iTunSMPB` tag (`moov/udta/meta/ilst/----`), as Apple's encoder
+//!   writes it (afconvert, iTunes, Music, Logic), without an edit list: its
+//!   text holds, in hexadecimal, a zero, the delay, the padding, and the
+//!   number of frames that play, such as
+//!   `00000000 00000840 000001FF 000000000001ADC1`.
+//!
+//! The edit list is read first; a file with several edits that are not
+//! empty, and no tag, is left untrimmed.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -26,6 +34,9 @@ const MAX_BOXES: usize = 4_096;
 
 /// Most edits read.
 const MAX_EDITS: u32 = 16;
+
+/// Longest `iTunSMPB` text read, in bytes.
+const MAX_TAG_BYTES: u64 = 512;
 
 /// The edit list of the first audio track of `file`, in frames of its media
 /// timescale (the sample rate in M4A files); `None` without one the import
@@ -57,15 +68,80 @@ pub(super) fn edit_list(file: &mut File) -> io::Result<Option<EditList>> {
             continue;
         }
         let media_timescale = timescale(file, mdhd)?;
-        let Some(edts) = find(file, trak.start, trak.end, *b"edts")? else {
-            return Ok(None);
-        };
-        let Some(elst) = find(file, edts.start, edts.end, *b"elst")? else {
-            return Ok(None);
-        };
-        return read_edits(file, elst, movie_timescale, media_timescale);
+        if let Some(edts) = find(file, trak.start, trak.end, *b"edts")?
+            && let Some(elst) = find(file, edts.start, edts.end, *b"elst")?
+            && let Some(edits) = read_edits(file, elst, movie_timescale, media_timescale)?
+        {
+            return Ok(Some(edits));
+        }
+        return itunes_gapless(file, moov);
     }
     Ok(None)
+}
+
+/// The delay and length the `iTunSMPB` tag in `moov` records.
+fn itunes_gapless(file: &mut File, moov: Mp4Box) -> io::Result<Option<EditList>> {
+    let Some(udta) = find(file, moov.start, moov.end, *b"udta")? else {
+        return Ok(None);
+    };
+    let Some(meta) = find(file, udta.start, udta.end, *b"meta")? else {
+        return Ok(None);
+    };
+    // `meta` starts with a version and flags in iTunes files; some writers
+    // leave them out, and its first box (`hdlr`) starts at once.
+    let start = if meta.start + 8 <= meta.end && read_at(file, meta.start + 4, 4)? == b"hdlr" {
+        meta.start
+    } else {
+        meta.start + 4
+    };
+    let Some(ilst) = find(file, start, meta.end, *b"ilst")? else {
+        return Ok(None);
+    };
+    for item in children(file, ilst.start, ilst.end)?
+        .into_iter()
+        .filter(|item| item.kind == *b"----")
+    {
+        // `name` holds a version and flags, then the name; `data` a type
+        // and a locale, then the value.
+        let Some(name) = find(file, item.start, item.end, *b"name")? else {
+            continue;
+        };
+        if text(file, name, 4)?.as_deref() != Some("iTunSMPB") {
+            continue;
+        }
+        let Some(data) = find(file, item.start, item.end, *b"data")? else {
+            return Ok(None);
+        };
+        return Ok(text(file, data, 8)?.and_then(|value| parse_itunsmpb(&value)));
+    }
+    Ok(None)
+}
+
+/// The text of a box after its first `skip` bytes; `None` when it is too
+/// long or not UTF-8.
+fn text(file: &mut File, item: Mp4Box, skip: u64) -> io::Result<Option<String>> {
+    let start = item.start + skip;
+    if start > item.end || item.end - start > MAX_TAG_BYTES {
+        return Ok(None);
+    }
+    let bytes = read_at(file, start, (item.end - start) as usize)?;
+    Ok(String::from_utf8(bytes).ok())
+}
+
+/// The delay and the frames that play from an `iTunSMPB` value.
+fn parse_itunsmpb(value: &str) -> Option<EditList> {
+    let fields: Vec<u64> = value
+        .split_whitespace()
+        .take(4)
+        .map(|field| u64::from_str_radix(field, 16).ok())
+        .collect::<Option<_>>()?;
+    let [_, delay, _padding, frames] = fields[..] else {
+        return None;
+    };
+    Some(EditList {
+        skip: delay,
+        keep: (frames > 0).then_some(frames),
+    })
 }
 
 /// A box: its type and where its contents start and end.

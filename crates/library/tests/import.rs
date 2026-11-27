@@ -7,6 +7,19 @@
 //! at 8 000 / 32 768 ([`tone`] generates the same 16-bit samples), encoded
 //! with ffmpeg 9.0.2 as `-c:a libmp3lame -b:a 64k` (with its LAME header) and
 //! `-c:a aac -b:a 64k` (with its edit list).
+//!
+//! Two more record their length in other ways:
+//!
+//! - `tests/import/apple.m4a`: 60 010 frames of mono 48 kHz silence with one
+//!   sample at 0.9 at frame [`IMPULSE`], from ffmpeg's
+//!   `aevalsrc='if(eq(n,10007),0.9,0)':s=48000:d=1.2502083` as 16-bit WAV,
+//!   encoded with macOS 27.2's `afconvert -f m4af -d aac -b 128000`: Apple's
+//!   AAC encoder, which records its delay and padding only in an `iTunSMPB`
+//!   tag, without an edit list.
+//! - `tests/import/noxing.mp3`: a 440 Hz sine, mono 44.1 kHz, 1.3 s, from
+//!   ffmpeg's `sine=f=440:r=44100:d=1.3` encoded as `-c:a libmp3lame -b:a
+//!   192k -write_xing 0`: an MP3 without a Xing or LAME header, whose length
+//!   is only an estimate until it is decoded.
 
 mod common;
 
@@ -26,6 +39,9 @@ use library::{
 };
 
 const RATE: u32 = 48_000;
+
+/// Frame of the impulse in `apple.m4a`.
+const IMPULSE: usize = 10_007;
 
 /// Frames of the MP3 and M4A fixtures' source.
 const TONE_FRAMES: u64 = 96_123;
@@ -1061,4 +1077,226 @@ fn a_flac_deeper_than_24_bits_is_refused_not_transcoded() {
             ("Tagged.flac", reason),
         ]
     );
+}
+
+/// Stereo high-passed white noise near full scale, with the decaying
+/// envelope of a crash cymbal every two seconds: what a lossless encoder
+/// cannot compress.
+fn crash_noise(frames: usize) -> Vec<f64> {
+    let mut state = 1u64;
+    let mut previous = [0.0f64; 2];
+    let mut samples = Vec::with_capacity(frames * 2);
+    for frame in 0..frames {
+        let t = frame as f64 / f64::from(RATE);
+        let envelope = (-2.0 * (t % 2.0)).exp();
+        for last in &mut previous {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let white = (state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0;
+            let high = (white - *last) / 2.0;
+            *last = white;
+            samples.push((high * 0.8 * envelope).clamp(-1.0, 1.0));
+        }
+    }
+    samples
+}
+
+#[test]
+fn loud_noise_is_stored_no_larger_than_its_raw_24_bit_samples_and_plays() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Song");
+    fs::create_dir(&source).unwrap();
+    let frames = 6 * RATE as usize;
+    let noise = crash_noise(frames);
+    fs::write(source.join("Crash.wav"), float64_wav(2, RATE, &noise)).unwrap();
+    let library_dir = dir.path().join("Library");
+    fs::create_dir(&library_dir).unwrap();
+
+    let draft = probe_import(&source).unwrap();
+    assert!(matches!(
+        draft.stems()[0].action,
+        StemAction::Transcode { .. }
+    ));
+    let entry = save(&Library::new(&library_dir), &draft).unwrap();
+
+    let flac = library_dir.join(&entry.song).join("stems/crash.flac");
+    let raw = (frames * 2 * 3) as u64;
+    let size = fs::metadata(&flac).unwrap().len();
+    assert!(
+        size <= raw + raw / 100,
+        "{size} bytes of FLAC for {raw} bytes of 24-bit samples"
+    );
+    // STREAMINFO's frame sizes bound the frames written, and no frame is
+    // larger than 4 096 stereo 24-bit samples stored verbatim (24 576 bytes
+    // and a few bytes of headers).
+    let bytes = fs::read(&flac).unwrap();
+    let be = |range: std::ops::Range<usize>| {
+        bytes[range]
+            .iter()
+            .fold(0u64, |value, &byte| value << 8 | u64::from(byte))
+    };
+    let (min_frame, max_frame) = (be(12..15), be(15..18));
+    let blocks = frames.div_ceil(4_096) as u64;
+    let audio = size - 42;
+    assert!(max_frame <= 24_576 + 32, "{max_frame}");
+    assert!(min_frame * blocks <= audio && audio <= max_frame * blocks);
+    let loaded = load_song(&library_dir.join(&entry.song)).unwrap();
+    assert_eq!(loaded.stems[0].frames, frames as u64);
+    for (got, want) in loaded.stems[0].samples.iter().zip(&noise) {
+        assert!((f64::from(*got) - want).abs() <= 0.5 / 8_388_608.0 + 1e-12);
+    }
+}
+
+#[test]
+fn a_stem_that_fails_the_check_before_saving_is_named_with_the_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Song");
+    wav(&source.join("Bass.wav"), RATE, 1_000);
+    wav(&source.join("Drums.wav"), RATE, 1_000);
+    let library_dir = dir.path().join("Library");
+    fs::create_dir(&library_dir).unwrap();
+    let draft = probe_import(&source).unwrap();
+
+    fs::write(source.join("Drums.wav"), b"no longer a WAV file").unwrap();
+    let error = save(&Library::new(&library_dir), &draft).unwrap_err();
+
+    let ImportError::Stem { name, reason } = &error else {
+        panic!("{error}");
+    };
+    assert_eq!(name, "Drums.wav");
+    assert!(
+        reason.contains("cannot be read: Ill-formed WAVE file: no RIFF tag found"),
+        "{reason}"
+    );
+    assert_eq!(tree(&library_dir), Vec::<String>::new());
+}
+
+#[test]
+fn an_apple_m4a_drops_the_delay_and_padding_its_itunsmpb_tag_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Song");
+    fs::create_dir(&source).unwrap();
+    fs::copy(fixture("apple.m4a"), source.join("Pad.m4a")).unwrap();
+    let library_dir = dir.path().join("Library");
+    fs::create_dir(&library_dir).unwrap();
+
+    let draft = probe_import(&source).unwrap();
+    assert_eq!(draft.song.stems()[0].length_frames, 60_010);
+    assert!(!draft.stems()[0].estimated_length);
+    let entry = save(&Library::new(&library_dir), &draft).unwrap();
+
+    let loaded = load_song(&library_dir.join(&entry.song)).unwrap();
+    let samples = &loaded.stems[0].samples;
+    assert_eq!(samples.len(), 60_010, "mono");
+    let peak = (0..samples.len())
+        .max_by(|&a, &b| samples[a].abs().total_cmp(&samples[b].abs()))
+        .unwrap();
+    assert!(
+        peak.abs_diff(IMPULSE) <= 3,
+        "the impulse is at frame {peak}"
+    );
+}
+
+#[test]
+fn an_mp3_without_a_header_is_saved_at_the_length_its_decoder_gives() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Song");
+    fs::create_dir(&source).unwrap();
+    fs::copy(fixture("noxing.mp3"), source.join("Bass.mp3")).unwrap();
+    let library_dir = dir.path().join("Library");
+    fs::create_dir(&library_dir).unwrap();
+
+    let draft = probe_import(&source).unwrap();
+    assert!(draft.stems()[0].estimated_length);
+    let entry = save(&Library::new(&library_dir), &draft).unwrap();
+
+    let decoded = decoded_24_bit(&fixture("noxing.mp3"), "mp3");
+    assert_eq!(decoded.len(), 57_600, "50 packets of 1 152 frames, mono");
+    assert_eq!(entry.length_frames, 57_600);
+    let loaded = load_song(&library_dir.join(&entry.song)).unwrap();
+    assert_eq!(loaded.stems[0].samples, decoded);
+}
+
+/// Cuts the file at `path` to half its size.
+fn cut_in_half(path: &Path) {
+    let len = fs::metadata(path).unwrap().len();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(len / 2)
+        .unwrap();
+}
+
+#[test]
+fn a_wav_or_flac_cut_short_is_refused_with_the_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Song");
+    wav(&source.join("Drums.wav"), RATE, 1_000);
+    wav(&source.join("Bass.wav"), RATE, 20_000);
+    write_flac(&source.join("Keys.flac"), 24, 2, RATE, &ramp(20_000, 24));
+    let int8: Vec<i32> = (0..20_000).map(|i| (i * 37) % 256 - 128).collect();
+    write_int(&source.join("Shaker.wav"), 8, 1, RATE, &int8);
+    for name in ["Bass.wav", "Keys.flac", "Shaker.wav"] {
+        cut_in_half(&source.join(name));
+    }
+
+    let draft = probe_import(&source).unwrap();
+
+    assert_eq!(names(&draft), ["Drums.wav"]);
+    let refused: Vec<(&str, &str)> = draft
+        .refused()
+        .iter()
+        .map(|file| (file.name.as_str(), file.reason.as_str()))
+        .collect();
+    assert_eq!(refused.len(), 3, "{refused:?}");
+    assert_eq!(
+        refused[0],
+        (
+            "Bass.wav",
+            "it ends before the 20000 frames its header declares"
+        )
+    );
+    assert_eq!(refused[1].0, "Keys.flac");
+    assert!(
+        refused[1]
+            .1
+            .starts_with("it ends before the 20000 frames its header declares"),
+        "{}",
+        refused[1].1
+    );
+    assert_eq!(
+        refused[2],
+        (
+            "Shaker.wav",
+            "it ends before the 20000 frames its header declares"
+        )
+    );
+}
+
+#[test]
+fn a_wav_or_flac_cut_short_after_the_probe_is_not_saved() {
+    for name in ["Bass.wav", "Keys.flac"] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Song");
+        wav(&source.join("Bass.wav"), RATE, 20_000);
+        write_flac(&source.join("Keys.flac"), 24, 2, RATE, &ramp(20_000, 24));
+        let library_dir = dir.path().join("Library");
+        fs::create_dir(&library_dir).unwrap();
+        let draft = probe_import(&source).unwrap();
+
+        cut_in_half(&source.join(name));
+        let error = save(&Library::new(&library_dir), &draft).unwrap_err();
+
+        let ImportError::Stem { name: stem, reason } = &error else {
+            panic!("{error}");
+        };
+        assert_eq!(stem, name);
+        assert!(
+            reason.starts_with("the stem written does not read to its end: "),
+            "{reason}"
+        );
+        assert_eq!(tree(&library_dir), Vec::<String>::new(), "{name}");
+    }
 }

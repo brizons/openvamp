@@ -15,9 +15,10 @@ use symphonia::core::codecs::audio::well_known::CODEC_ID_FLAC;
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
+use symphonia::core::units::Timestamp;
 
 use super::SourceFormat;
 use super::mp4;
@@ -53,8 +54,12 @@ pub(super) struct AudioFacts {
     /// Frames the stem holds once delay and padding are trimmed.
     pub(super) frames: u64,
     /// Decoded frames to drop first: the encoder delay an M4A's edit list
-    /// records (an MP3's decoder drops its own).
+    /// or `iTunSMPB` tag records (an MP3's decoder drops its own).
     pub(super) skip: u64,
+    /// Whether `frames` is only an estimate (an MP3 without a Xing or LAME
+    /// header, an M4A that records no delay): the stem is then as long as
+    /// its decoder makes it.
+    pub(super) estimated: bool,
 }
 
 /// A file open for decoding: its first audio track and a gapless decoder.
@@ -149,12 +154,14 @@ fn describe(error: &SymphoniaError) -> String {
 
 /// Reads the facts of `path` as `format`: the rate and the channels of its
 /// first decoded packet, and its length. The length is the one the
-/// container declares for WAV and FLAC, and for an MP3 whose header records
+/// container declares for WAV and FLAC (whose last declared frame must then
+/// decode: a file cut short is refused), and for an MP3 whose header records
 /// its delay and padding (the decoder trims them; `symphonia` 0.6.1 leaves
-/// them in the packets' durations); else the durations of every packet are
-/// added up, without decoding them.
-pub(super) fn probe(path: &Path, format: SourceFormat) -> Result<AudioFacts, String> {
-    let mut decoding = open(path, format)?;
+/// them in the packets' durations). Otherwise the durations of every packet
+/// are added up without decoding them, and an MP3's or M4A's length is only
+/// an estimate: an MP3 decoder can give a packet less.
+pub(super) fn probe(path: &Path, format: SourceFormat) -> Result<AudioFacts, ProbeError> {
+    let mut decoding = open(path, format).map_err(ProbeError::Undecodable)?;
     let trusted = match format {
         SourceFormat::Wav | SourceFormat::Flac => decoding.declared,
         SourceFormat::Mp3 => decoding.declared.filter(|_| decoding.gapless),
@@ -162,7 +169,9 @@ pub(super) fn probe(path: &Path, format: SourceFormat) -> Result<AudioFacts, Str
     };
     let mut total = 0;
     let mut spec = None;
-    while let Some(packet) = next_packet(decoding.reader.as_mut())? {
+    while let Some(packet) =
+        next_packet(decoding.reader.as_mut()).map_err(ProbeError::Undecodable)?
+    {
         if packet.track_id != decoding.track_id {
             continue;
         }
@@ -171,7 +180,7 @@ pub(super) fn probe(path: &Path, format: SourceFormat) -> Result<AudioFacts, Str
             let decoded = decoding
                 .decoder
                 .decode(&packet)
-                .map_err(|error| describe(&error))?;
+                .map_err(|error| ProbeError::Undecodable(describe(&error)))?;
             spec = Some((
                 decoded.spec().rate(),
                 decoded.spec().channels().count() as u16,
@@ -182,28 +191,89 @@ pub(super) fn probe(path: &Path, format: SourceFormat) -> Result<AudioFacts, Str
             }
         }
     }
-    let (sample_rate, channels) = spec.ok_or_else(|| "it holds no audio".to_owned())?;
-    let (skip, frames) = match format {
+    let (sample_rate, channels) =
+        spec.ok_or_else(|| ProbeError::Undecodable("it holds no audio".to_owned()))?;
+    if matches!(format, SourceFormat::Wav | SourceFormat::Flac)
+        && let Some(declared) = trusted
+        && !reaches(&mut decoding, declared)
+    {
+        return Err(ProbeError::CutShort(declared));
+    }
+    let (skip, frames, estimated) = match format {
         SourceFormat::M4a => {
             let edits = File::open(path)
                 .and_then(|mut file| mp4::edit_list(&mut file))
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| ProbeError::Undecodable(error.to_string()))?;
             match edits {
                 Some(edits) => {
                     let after = total.saturating_sub(edits.skip);
-                    (edits.skip, edits.keep.map_or(after, |keep| keep.min(after)))
+                    let frames = edits.keep.map_or(after, |keep| keep.min(after));
+                    (edits.skip, frames, false)
                 }
-                None => (0, total),
+                None => (0, total, true),
             }
         }
-        _ => (0, total),
+        SourceFormat::Mp3 => (0, total, trusted.is_none()),
+        _ => (0, total, false),
     };
     Ok(AudioFacts {
         sample_rate,
         channels,
         frames,
         skip,
+        estimated,
     })
+}
+
+/// Why [`probe`] found no facts.
+#[derive(Debug)]
+pub(super) enum ProbeError {
+    /// Nothing decodes the file; what the decoder said.
+    Undecodable(String),
+    /// A WAV or FLAC file whose audio stops before the frames its header
+    /// declares, which it holds.
+    CutShort(u64),
+}
+
+/// Why a WAV or FLAC file whose audio stops before its header says is
+/// refused.
+pub(super) fn cut_short(declared: u64) -> String {
+    format!("it ends before the {declared} frames its header declares")
+}
+
+/// Whether the audio of `decoding` reaches the `declared` frames: the packet
+/// holding the last one decodes.
+fn reaches(decoding: &mut Decoding, declared: u64) -> bool {
+    let Some(last) = declared
+        .checked_sub(1)
+        .and_then(|last| i64::try_from(last).ok())
+    else {
+        return false;
+    };
+    let to = SeekTo::Timestamp {
+        ts: Timestamp::new(last),
+        track_id: decoding.track_id,
+    };
+    if decoding.reader.seek(SeekMode::Accurate, to).is_err() {
+        return false;
+    }
+    decoding.decoder.reset();
+    // An accurate seek lands on the packet holding the frame, or before it.
+    loop {
+        let Ok(Some(packet)) = next_packet(decoding.reader.as_mut()) else {
+            return false;
+        };
+        if packet.track_id != decoding.track_id {
+            continue;
+        }
+        let Ok(decoded) = decoding.decoder.decode(&packet) else {
+            return false;
+        };
+        let end = packet.pts.get().saturating_add(decoded.frames() as i64);
+        if end > last {
+            return true;
+        }
+    }
 }
 
 /// The next packet, `None` at the end of the audio.
@@ -221,17 +291,18 @@ fn next_packet(
 }
 
 /// Decodes `path` as `format` and writes it to `out` as 24-bit FLAC: the
-/// `facts.frames` frames after the first `facts.skip`. `report` gets the
-/// frames written so far about every second of audio and at the end; when
-/// it returns `false`, the transcoding stops. The file at `out` is left for
-/// the caller to remove on error.
+/// `facts.frames` frames after the first `facts.skip`, or every frame after
+/// them when `facts.frames` is an estimate. Returns the frames written.
+/// `report` gets the frames written so far about every second of audio and
+/// at the end; when it returns `false`, the transcoding stops. The file at
+/// `out` is left for the caller to remove on error.
 pub(super) fn transcode(
     path: &Path,
     format: SourceFormat,
     facts: AudioFacts,
     out: &Path,
     report: &mut dyn FnMut(u64) -> bool,
-) -> Result<(), TranscodeError> {
+) -> Result<u64, TranscodeError> {
     let mut decoding = open(path, format).map_err(TranscodeError::Source)?;
     let mut writer = FlacWriter::create(out, facts.sample_rate, facts.channels)?;
     let channels = usize::from(facts.channels);
@@ -240,7 +311,7 @@ pub(super) fn transcode(
     let mut to_skip = facts.skip;
     let mut written = 0;
     let mut reported = 0;
-    while written < facts.frames {
+    while facts.estimated || written < facts.frames {
         let Some(packet) = next_packet(decoding.reader.as_mut()).map_err(TranscodeError::Source)?
         else {
             break;
@@ -265,7 +336,12 @@ pub(super) fn transcode(
         let skipped = to_skip.min((frames.len() / channels) as u64);
         frames = &frames[skipped as usize * channels..];
         to_skip -= skipped;
-        let wanted = (facts.frames - written).min((frames.len() / channels) as u64);
+        let available = (frames.len() / channels) as u64;
+        let wanted = if facts.estimated {
+            available
+        } else {
+            (facts.frames - written).min(available)
+        };
         frames = &frames[..wanted as usize * channels];
         samples.clear();
         samples.extend(frames.iter().map(|&sample| to_24_bits(sample)));
@@ -278,7 +354,7 @@ pub(super) fn transcode(
             }
         }
     }
-    if written < facts.frames {
+    if written == 0 || (!facts.estimated && written < facts.frames) {
         return Err(TranscodeError::Source(format!(
             "the audio ends after {written} frames, before the {} the file declares",
             facts.frames
@@ -288,7 +364,7 @@ pub(super) fn transcode(
     if !report(written) {
         return Err(TranscodeError::Stopped);
     }
-    Ok(())
+    Ok(written)
 }
 
 /// A sample from -1 to 1 as a 24-bit integer, rounded to the nearest and
@@ -300,9 +376,20 @@ fn to_24_bits(sample: f64) -> i32 {
 /// A FLAC file written block by block: a placeholder STREAMINFO first, the
 /// frames as they are encoded, then the real STREAMINFO over the
 /// placeholder.
+///
+/// No frame is larger than the verbatim frame of its samples. flacenc 0.5.1
+/// picks each channel's coding from an entropy estimate, and its Rice codes
+/// stop at parameter 14, so for loud noise it can pick a FIXED predictor
+/// whose residuals take far more bits than the samples (frames of tens of
+/// MB, whose size then wraps STREAMINFO's 24-bit frame-size fields). A frame
+/// that comes out larger than its raw samples is therefore encoded again as
+/// verbatim, and the smaller of the two is written; STREAMINFO's frame
+/// sizes are those of the frames written.
 struct FlacWriter {
     file: BufWriter<File>,
     config: Verified<Encoder>,
+    /// Verbatim subframes, channels coded independently.
+    verbatim: Verified<Encoder>,
     info: StreamInfo,
     framebuf: FrameBuf,
     context: Context,
@@ -323,9 +410,20 @@ impl FlacWriter {
         let config = Encoder::default()
             .into_verified()
             .map_err(|(_, error)| invalid(error))?;
+        let mut verbatim = Encoder::default();
+        verbatim.subframe_coding.use_constant = false;
+        verbatim.subframe_coding.use_fixed = false;
+        verbatim.subframe_coding.use_lpc = false;
+        verbatim.stereo_coding.use_leftside = false;
+        verbatim.stereo_coding.use_rightside = false;
+        verbatim.stereo_coding.use_midside = false;
+        let verbatim = verbatim
+            .into_verified()
+            .map_err(|(_, error)| invalid(error))?;
         let mut writer = Self {
             file: BufWriter::new(File::create(path)?),
             config,
+            verbatim,
             framebuf: FrameBuf::with_size(channels, FLAC_BLOCK).map_err(invalid)?,
             context: Context::new(FLAC_BITS, channels),
             info,
@@ -373,14 +471,19 @@ impl FlacWriter {
         self.context
             .fill_interleaved(&self.pending)
             .map_err(fill_error)?;
+        let raw_bits = self.pending.len() * FLAC_BITS;
         self.pending.clear();
-        let frame = flacenc::encode_fixed_size_frame(
-            &self.config,
-            &self.framebuf,
-            self.frame_number,
-            &self.info,
-        )
-        .map_err(|error| io::Error::other(error.to_string()))?;
+        let encode = |config: &Verified<Encoder>| {
+            flacenc::encode_fixed_size_frame(config, &self.framebuf, self.frame_number, &self.info)
+                .map_err(|error| io::Error::other(error.to_string()))
+        };
+        let mut frame = encode(&self.config)?;
+        if frame.count_bits() > raw_bits {
+            let verbatim = encode(&self.verbatim)?;
+            if verbatim.count_bits() < frame.count_bits() {
+                frame = verbatim;
+            }
+        }
         self.frame_number += 1;
         self.info.update_frame_info(&frame);
         self.sink.clear();
