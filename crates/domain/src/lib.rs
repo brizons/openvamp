@@ -9,6 +9,10 @@
 //! orders songs and click-only tiles; [`Setlist::validate`] checks it against
 //! what a [`SongLookup`] knows about the library's songs.
 //!
+//! An import builds a [`SongDraft`] from the stems it finds; the user edits
+//! its title, tempo, time signature, key and parts, and
+//! [`SongDraft::to_package`] turns it into a checked [`SongPackage`].
+//!
 //! A stem's instrument is one of the fixed [`Part`]s: [`part_for_file`] picks
 //! one from its file name by the rules table, and each part belongs to one
 //! bus. Stems play through six [`Bus`]es: [`bus_for_stem`] picks one from the
@@ -23,6 +27,7 @@
 pub mod bus;
 pub mod compile;
 pub mod grid;
+pub mod import;
 pub mod mix;
 pub mod mixer;
 pub mod package;
@@ -38,6 +43,11 @@ pub use compile::{
     DEFAULT_SEAM_CROSSFADE, RenderPlan, Segment, compile, seam_fade,
 };
 pub use grid::{BarBeat, BeatGrid, SourceClick};
+pub use import::{
+    DEFAULT_ARRANGEMENT_NAME, DEFAULT_IMPORT_BPM, DEFAULT_IMPORT_TIME_SIGNATURE, DraftError,
+    DraftStem, DraftWarning, INTRO_SECTION_ID, MapChange, PackagedDraft, STEMS_FOLDER, SongDraft,
+    StoredFormat,
+};
 pub use mix::{
     ArrangementMix, MAX_VOLUME_DB, MIX_FORMAT_VERSION, MixFile, MixValidationError, MixerFile,
     MixerFileError, StemMix, Volume,
