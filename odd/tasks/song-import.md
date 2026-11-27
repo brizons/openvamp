@@ -66,10 +66,10 @@ Requirements quote `docs/mvp-spec.md` (F1) and the user verbatim. Items marked *
 | ID | Specs | Route | Status | Commits |
 |----|-------|-------|--------|---------|
 | T1 | S2 | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L4; verified L7; review approved L8) | 883b398 |
-| T2 | S6 | delegated (parallel unit with T1, disjoint surface `crates/library` decoding, `Cargo.toml`, `Cargo.lock`) | done (L5); independent verifier pending | see L5 |
-| T3 | S1, S3, S4, S5 (library side) | delegated (context backstop); needs T1 and T2 | done (L9); independent verifier pending | see L9 |
-| T4 | S7 | delegated (context backstop); needs T3 | done (L13); independent verifier and screenshot check pending | see L13 |
-| T5 | S8 | inline, with each task's own docs | pending | |
+| T2 | S6 | delegated (parallel unit with T1, disjoint surface `crates/library` decoding, `Cargo.toml`, `Cargo.lock`) | done (L5; blockers fixed L12; verified L15; review approved L16) | 0c390d5, b906f5e |
+| T3 | S1, S3, S4, S5 (library side) | delegated (context backstop); needs T1 and T2 | done (L9; blockers fixed L19; verified L21; reviews approved L22) | 6ea066c, 05b8af2, 4318887, b05d730 |
+| T4 | S7 | delegated (context backstop); needs T3 | done (L13; app run L17; blocker fixed L23; verified and reviews approved L24) | dca6066, f8c6194 |
+| T5 | S8 | inline, with each task's own docs | done (L23) | see L23 |
 
 Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` and the desktop consume (item 3), so each gets an independent verifier. T1 changes the shared bus rules (item 3).
 
@@ -206,3 +206,174 @@ Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` an
     - RED: 27 import tests failed against stubs, plus the picker test.
     - GREEN: `cargo test -p openvamp` passes 281 tests, with clippy, fmt and the workspace check clean. The parent re-ran `--test song_import` (29 passed).
   - Risk: item 4 (background jobs, the cancel flag and result ordering), so T4 gets an independent verifier.
+- **L14** (2026-11-26): the parent reordered the branch, which had not been pushed, so the playback fix sits next to T2 and each review slice is contiguous. Commits:
+  - 883b398 T1
+  - 0c390d5 T2
+  - b906f5e T2 fix (a)
+  - 6ea066c T3 domain
+  - 05b8af2 T3 library
+  - 4318887 import refusal (b)
+  - 6aa0db8 T4
+
+  The final tree is identical to the old head 290f8b8, which is kept as the branch `song-import-backup`. The commit ids in L10–L13 refer to the old order (0c390d5 is unchanged): 7a4c0a2 → 6ea066c, c1f710f → 05b8af2, 904002a → b906f5e, dc218ab → 4318887, 290f8b8 → 6aa0db8.
+
+  Review slices:
+  - T2: 883b398..b906f5e
+  - T3 domain: b906f5e..6ea066c
+  - T3 library: 6ea066c..4318887
+  - T4: 4318887..6aa0db8
+
+  The T2 verifier is rechecking B1–B3 on b906f5e.
+- **L15** (2026-11-26): the machine rebooted, which cleared every temp scratch folder. Nothing in the repository was lost.
+  - **Recheck:** the T2 verifier redid its limited recheck on b906f5e, using its own new probe and the `flac` 1.5.0 CLI rather than the committed fixtures. All three blockers are fixed, in debug and release:
+    - **B1:** 8 compressible stems, 2,192 reads, 0 bad.
+    - **B2:** 32-bit stereo and mono `-b 256` files give one clean `UnsupportedFlacFormat` in `load_song` and `open_streaming`, and the 24-bit controls stay exact.
+    - **B3:** 58 cut or forged SEEKTABLE cases, 0 bad; cuts give clean errors and uncut files play exactly.
+  - **Suites in the copy:** `cargo test -p library` passes 138 tests (2 ignored), and `live_allocations` passes 6.
+  - **T2 review:** slice 883b398..b906f5e, worktree `si-t2`, lenses risk, resilience and reliability. It is high risk, 17 files and 1,988 lines. The user granted it ("Revisar este cambio").
+  - **T3:** its independent verifier launched on 4318887 against b906f5e.
+- **L16** (2026-11-26): the T2 review (lineage review-427e0445a3f6049e, slice 883b398..b906f5e) approved and was acknowledged, so the reviewed boundary is now b906f5e. It left two non-blocking reliability suggestions, kept as follow-ups:
+  - the depth check has no lower bound, though the message says 4- to 24-bit;
+  - bit-identical WAV/FLAC equality is only tested at 16 and 24 bits, and an 8-, 12- or 20-bit case would pin the left-justify shift.
+- **L17** (2026-11-26): the parent ran the dev app (`target/OpenVamp-dev.app`, the binary at 6aa0db8).
+  - **The run:** it opened a library through a test setlist and imported `/Users/cdec/projects/openvamp-demo/Way Maker Stems` with "Import stems" and the macOS picker. The folder holds 11 WAV, 1 MP3 and 1 M4A.
+    - The Song editor showed the 13 stems with AUTO and the expected buses (AG → Acoustic guitar on Guitars, EG 1 → Guitars, Kick → Drums, Click and Guide → Click & Guide) and the header "13 · 48 kHz · WAV + FLAC".
+    - The part menu lists the parts grouped by bus.
+    - "Save song" showed its progress and returned to the Library, which lists "Way Maker Stems · 120 · 0:20 · 13 stems". The WAVs were copied, and the MP3 and M4A were written as FLAC.
+    - The progress label may have gone from 96% to 90%; the T4 verifier checks this.
+  - **Design canvas:** not compared side by side, because the browser pane is not signed in to claude.ai. The screenshots were sent to the user.
+- **L18** (2026-11-26): the T3 verifier found four blockers.
+  - **B1:** loud high-frequency lossy stems produce huge FLAC frames (flacenc never falls back to verbatim; one frame was 33.5 MB, and STREAMINFO's max frame size wraps), so the song saves and does not load, or the save fails with a message naming the source folder.
+  - **B2:** Apple AAC M4A (afconvert, iTunes, Logic) keeps 2112 frames of delay, because `iTunSMPB` is not read (there is no `elst`).
+  - **B3:** a Xing-less 192 kbps 44.1 kHz CBR MP3 passes the probe and is refused at save, one packet short.
+  - **B4:** a truncated WAV or FLAC source is saved as a song that does not play, because the pre-rename check opens headers only.
+  - **What passes:**
+    - folder and ZIP sources, including `../evil.wav`, absolute paths, encrypted entries, zip bombs and symlinks; nothing was written outside the song folder;
+    - byte-identical copies and exact lossless transcodes;
+    - LAME MP3 and ffmpeg AAC gapless (+0 frames);
+    - the draft edits, the bar-to-sample conversion (four hand calculations), folder naming, cancel and mid-save failures (nothing left behind);
+    - render identity with packages written by hand;
+    - `bus_for_stem`, which only changed for a stored `other`;
+    - render-cli unchanged on 22 runs; `cargo test -p library -p domain` 329 passed;
+    - the dependencies, all within the license policy and more than two weeks old.
+  - **Advisories:**
+    - A1: an honest-size ZIP entry is extracted in full before it is refused.
+    - A2: with duplicate ZIP entry names, the last one wins.
+    - A3: folders more than 32 levels deep are skipped.
+    - A4: `kill -9` leaves a hidden `.import-*.tmp` folder behind.
+    - A5: some messages are misleading (fixed with B1).
+    - A6: HE-AAC decodes at its core rate.
+    - A7: an M4A named `.mp3` skips the edit list.
+    - A8: zlib-rs becomes flate2's backend for the other crates too.
+  - **Next:**
+    - the T3 writer was resumed for B1–B4, as one fix commit to be moved after 05b8af2;
+    - the T4 verifier was launched at the same time in a scratch copy.
+- **L19** (2026-11-26): the T3 correction batch landed as b05d730. The parent moved it right after 4318887, so the T3 library slice is 6ea066c..b05d730. T4 is now dca6066 (was 6aa0db8), and the doc commits follow it. The final tree is identical to the previous head, which is kept as `song-import-backup`. The fixes:
+  - **B1:** a frame larger than its raw 24-bit samples is re-encoded verbatim, and STREAMINFO's frame sizes are the written ones. A save failure names the stem and keeps the `LoadError` detail.
+  - **B2:** the `iTunSMPB` fallback in `import/mp4.rs`, with the fixture `tests/import/apple.m4a` (4.5 KB).
+  - **B3:** `ProbedStem.estimated_length`; the save trusts the decoder's frame count for those stems. Fixture `tests/import/noxing.mp3` (32 KB).
+  - **B4:** the probe refuses sources cut short, and `read_through` reads every written stem before the rename.
+  - **Checks:**
+    - RED/GREEN for each blocker;
+    - `cargo test -p library -p domain` passes 335 tests (3 ignored); the workspace check and clippy are clean;
+    - the parent re-ran `--test import` (28 passed, 1 ignored);
+    - the release timing was not re-measured because of low disk.
+
+  The T3 verifier is rechecking B1–B4 on b05d730.
+- **L20** (2026-11-26): the T4 verifier (on 6aa0db8, now dca6066) found one blocker.
+  - **B1:** quitting during "Saving…" (Cmd-Q or closing the last window) leaves the partial song in a hidden `.import-<pid>-<n>.tmp` folder forever, 149 MB in its probe. GPUI gives quit handlers 100 ms and `on_app_quit` only closes the song.
+  - **What passes:**
+    - the S7 flow (probe errors, stems with AUTO and bus, headers, part override, fields, tempo and meter changes, rate mismatch, length warning, refused files, save and mark);
+    - concurrency: stale probe and save results are ignored, 400 of 400 across pages, from one process-wide ticket counter;
+    - Discard mid-save leaves nothing behind;
+    - progress never goes backwards within a save; the 96% then 90% the parent saw were two different saves;
+    - keys typed in the editor do not reach the shortcuts;
+    - wording;
+    - `cargo test -p openvamp` 281 passed; the tests only gained lines.
+  - **Advisories:**
+    - A1: the macOS picker is modeless, so a late pick replaces an open draft silently;
+    - A2: the "Cannot import stems while a song is being saved." notice is hidden behind the editor;
+    - the button stays at 100% during the final read-through.
+  - **Correction:** the T4 writer was resumed to fix B1. It will ask before quitting while a save runs and defer the quit until the save has stopped and cleaned up. A library backstop will remove certainly stale `.import-*.tmp` folders when an import starts, which also covers the T3 advisory A4 (`kill -9`).
+- **L21** (2026-11-26): the T3 verifier's limited recheck on b05d730 confirmed B1–B4 fixed.
+  - **B1:** the crash MP3 gives 2.0 MB and white noise 2.88 MB, both near raw size, with max frame 24,586 B and `flac -t` ok. Quiet sources are unchanged and exact copies are still byte-identical.
+  - **B2:** afconvert AAC at 44.1 and 48 kHz, mono and stereo, gives +0 frames with the impulse at offset 0.
+  - **B3:** Xing-less 192 kbps 44.1 kHz MP3s save at the decoder's length and render.
+  - **B4:** sources cut before the probe are refused with the reason; sources cut between probe and save are refused naming the stem, and the library stays empty.
+  - **Suite:** `cargo test -p library -p domain` 335 passed.
+  - **New advisory:** for a Xing-less MP3 the draft keeps the probe's estimate, one packet (1,152 frames) longer than the saved length, so the length warning, the past-the-end bar check and progress totals can be off by one packet.
+  - **Reviews:** the user granted both T3 slices ("Revisar este cambio" for each):
+    - domain, `si-t3d`, b906f5e..6ea066c, 1,433 lines, lenses risk, reliability and readability;
+    - library, `si-t3l`, 6ea066c..b05d730, 3,701 lines, lenses risk, resilience and reliability.
+- **L22** (2026-11-26): both T3 reviews approved and were acknowledged. The reviewed boundary is now b05d730.
+  - **Domain review** (lineage review-1e6cb1007531f263):
+    - WARNING: `bus_for_stem` matches part ids case-sensitively, and the docs do not say so.
+    - WARNING: a legacy package whose part is exactly `other` now goes to `DEFAULT_BUS`. This is intended (L4), but no migration note exists.
+    - WARNING: the combined value-and-stem error path of `to_package` is untested.
+    - SUGGESTION: the song-length limit is duplicated in `SongDraft::maps`.
+  - **Library review** (lineage review-3a694fbba2888f49):
+    - WARNING: mp4.rs box size overflow (a debug panic or a release wrap on a crafted M4A). A scan error refuses an otherwise decodable M4A.
+    - WARNING: a ZIP entry copied as is is not `sync_all`ed before its rename.
+    - WARNING: a long ZIP entry extraction ignores cancel and sends no progress.
+    - SUGGESTIONS: the probe extracts every ZIP entry; one `report` result is discarded; no test saves a transcoded stem from a ZIP.
+  - **Routing:** the box overflow, the ZIP sync and the discarded `report` were sent to the T4 writer, to land in the T4 slice. The rest are follow-ups, as is the user's preference ([[fewer-review-rounds]]).
+- **L23** (2026-11-26): the T4 correction landed as f8c6194.
+  - **Quit while saving:**
+    - Quitting while a song saves asks "A song is being saved" (Quit / Keep saving). Quit cancels the save and quits only after the job reports back, with a 10 s fallback.
+    - Quits that cannot ask (Dock, logout) block in GPUI's synchronous quit handler until the job stops, at most 5 s.
+    - Dropping a running save waits too.
+  - **Sweep:** `save_import` removes `.import-<pid>-<n>.tmp` folders from another pid that have been unchanged for over an hour, and nothing else.
+  - **T3 review fixes folded in:** the mp4 box size check (an unreadable box keeps the M4A untrimmed and estimated), `sync_all` for ZIP entries copied as they are, and `Cancelled` after a copied ZIP entry.
+  - **Checks:**
+    - `cargo test -p openvamp` 285 passed; `--test import` 31 passed; fmt, clippy and the workspace check are clean;
+    - the parent re-ran `--test song_import` (31) and `--test ending` (12).
+  - **Risk:** item 4 (the cancel and wait across threads); the sweep deletes leftover data under a strict rule (item 1).
+  - **The T4 verifier rechecks B1 on f8c6194.**
+  - **T5 docs:**
+    - `docs/mvp-spec.md`: the lossy-import decision is decided, and the storage note is updated.
+    - `docs/architecture.md`:
+      - Decision 6 is now Decided and says what was built;
+      - the license table adds `hound`, `flacenc` and `zip`;
+      - the `symphonia` row lists FLAC, MP3, AAC and M4A.
+    - `README.md`: the status adds the song import and the Mixer and Audio output screens, and "Not built yet" no longer lists the mixer and routing, which were merged in PRs #15–#21.
+    - The desktop README's import section came with T4.
+- **L24** (2026-11-26): T4 closed.
+  - **Recheck:** the T4 verifier confirmed B1 fixed on f8c6194. All four quit paths left only the old song, with 0 bytes of stems. Its independent sweep check removed only stale folders of the exact pattern from another pid and kept every other case. `--test import` passed 31. Low disk kept it from building the desktop suite.
+  - **Reviews:** the T4 slice of 4,090 lines went over the review's context budget, so it was reviewed in two slices, each granted by the user:
+    - b05d730..dca6066 (lineage review-578e9015a5a9bd88)
+    - dca6066..f8c6194 (lineage review-4188f24682624610)
+
+    Both approved and were acknowledged, so the reviewed boundary is now f8c6194.
+  - **Seam check:** the parent ran `cargo test --workspace`: 934 passed, 0 failed, 8 ignored.
+  - **Follow-ups** (non-blocking review warnings and verifier advisories, not fixed here, per [[fewer-review-rounds]]):
+    - **Song editor:**
+      - Discard during a save has no escape if the save never returns, for example on a hung drive;
+      - `Saving::drop` blocks the UI for up to 5 s when another library opens mid-save;
+      - the deferred-quit glue in screen.rs is untested;
+      - the probe-during-save branch is untested;
+      - the saving question promises more than a cancel at about 100% guarantees;
+      - the `ChangeEdit` doc is stale, and `ClosePartMenu` is unused by the UI;
+      - on Windows the import picker may not pick files and folders at once;
+      - a late macOS picker result replaces an open draft;
+      - the save notice can be hidden behind the editor.
+    - **Library:**
+      - the sweep trusts mtimes, which can be wrong on a network share with clock skew;
+      - `mp4::edit_list` swallows every I/O error, not just a cut-short box;
+      - cancel is not checked during a long ZIP entry extraction;
+      - the probe extracts every ZIP entry;
+      - a Xing-less MP3's draft length is one packet long;
+      - with duplicate ZIP names, the last entry wins;
+      - folders more than 32 levels deep are skipped;
+      - HE-AAC decodes at its core rate;
+      - an M4A named `.mp3` is not trimmed;
+      - zlib-rs is now flate2's backend for the other crates too.
+    - **Domain and FLAC:**
+      - part-id case sensitivity is not documented;
+      - no migration note for a legacy part `other`;
+      - the combined `to_package` error path is untested;
+      - the song-length limit is duplicated;
+      - `Part::ALL` coverage is unchecked;
+      - the FLAC depth check has no lower bound;
+      - WAV/FLAC equality is tested only at 16 and 24 bits.
+  - **Delivery:** the branch is ready for the stacked PRs. Pushing and opening the PRs are the user's call.
+

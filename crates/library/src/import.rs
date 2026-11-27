@@ -67,6 +67,15 @@
 //! removed and nothing else changes; an error about a stem names it
 //! ([`ImportError::Stem`]).
 //!
+//! An import cut off before it could remove its hidden folder (the app
+//! crashed or was killed, the machine lost power) leaves it in the library
+//! folder, hidden from the song list. The next import removes such folders
+//! first: a folder named exactly `.import-<pid>-<n>.tmp`, made by another
+//! process, in which nothing has changed for an hour. An import that runs
+//! writes into its folder all the time, so one that has been still for an
+//! hour will never finish; a file, a link, any other name and this
+//! process's own folders are never touched.
+//!
 //! The folder name is the title made safe on Windows, macOS and Linux:
 //! `/`, `\` and `:` become `-`; `* ? " < > |` and control characters are
 //! left out; leading and trailing dots and spaces are trimmed; a name Windows

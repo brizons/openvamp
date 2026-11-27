@@ -385,23 +385,23 @@ fn end_requests_while_a_ramp_runs_or_the_question_is_open() {
     use TransportState::*;
     for transport in [Stopping, Panicking, Pausing, Paused, Stopped] {
         assert_eq!(
-            end_request(Some(transport), false),
+            end_request(Some(transport), false, false),
             EndRequest::EndNow,
             "{transport:?}"
         );
         assert_eq!(
-            end_request(Some(transport), true),
+            end_request(Some(transport), false, true),
             EndRequest::Wait,
             "{transport:?}"
         );
     }
     for transport in [Playing, Starting] {
-        assert_eq!(end_request(Some(transport), false), EndRequest::Ask);
-        assert_eq!(end_request(Some(transport), true), EndRequest::Wait);
+        assert_eq!(end_request(Some(transport), false, false), EndRequest::Ask);
+        assert_eq!(end_request(Some(transport), false, true), EndRequest::Wait);
     }
     // The question open when the song went away (no song): still waits.
-    assert_eq!(end_request(None, true), EndRequest::Wait);
-    assert_eq!(end_request(None, false), EndRequest::EndNow);
+    assert_eq!(end_request(None, false, true), EndRequest::Wait);
+    assert_eq!(end_request(None, false, false), EndRequest::EndNow);
     // Changed with the per-platform order: the ending answer is the first
     // one in the Mac's dialog.
     let question = Ending::Quit.question(Dialog::Mac);

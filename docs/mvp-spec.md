@@ -223,7 +223,7 @@ Example Song.song/
 | Positions (`at`, `start`) are **sample offsets** at `sampleRate`. | Exact and unambiguous; the editor shows bars and time. |
 | A section ends where the next section starts; the last one ends at the song end. | No overlapping or gapped sections by construction. |
 | `role` is `track`, `click`, or `guide`. | Click and guide stems replace the generated ones and bypass solo. |
-| Lossy imports (MP3, M4A) are transcoded to FLAC. | Sample-accurate seeking for section jumps. **Decision needed:** confirm storage cost. |
+| Lossy imports (MP3, M4A) are transcoded to FLAC; WAV and FLAC stems are copied as they are. | Sample-accurate seeking for section jumps. Decided 2026-11-26: the extra storage is accepted. |
 
 ## Non-functional requirements
 
@@ -268,7 +268,7 @@ Shells: the SwiftUI app covers iPadOS and iPhone; the Compose app covers Android
 - [ ] **Guide voices** — record original voices or use an open TTS voice with a compatible license.
 - [ ] **Reference hardware** — one low-end device per Tier 1 platform for the performance targets.
 - [ ] **Platform tiers** — confirm the table above.
-- [ ] **Lossy import** — transcode to FLAC (exact, larger) or decode lossy files directly (smaller, harder seeking).
+- [x] **Lossy import** — decided 2026-11-26: MP3 and M4A are transcoded to 24-bit FLAC (exact seeking, larger files); WAV and FLAC are copied.
 - [x] **Project name** — OpenVamp, decided 2026-11-19 ("open" for open source, "vamp" for the section a band repeats); logo files in [brand/](brand/).
 
 ## Next step

@@ -16,7 +16,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use domain::{Bus, MapChange, Part, SongDraft, StoredFormat, TimeSignature};
 use library::{
@@ -25,6 +26,12 @@ use library::{
 
 use crate::line_edit::{LineEdit, LineKey, LineOutcome};
 use crate::mixer::stem_icon;
+
+/// The longest the app waits for a cancelled save to stop before it lets
+/// go of it ([`crate::library_page::LibraryPage::stop_save`]): a save stops
+/// within about a second of audio per stem being written, and then removes
+/// its hidden folder.
+pub const STOP_PATIENCE: Duration = Duration::from_secs(5);
 
 /// How many bars after the last change "Tempo or meter change" adds the
 /// next one, the first one after bar 1.
@@ -130,6 +137,55 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Where a save job stands, so the editor can wait for it to stop.
+#[derive(Debug, Default)]
+struct Stage {
+    state: Mutex<Run>,
+    changed: Condvar,
+}
+
+/// What a save job is doing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Run {
+    /// It has not started: once its cancel flag is set, it writes nothing.
+    #[default]
+    Waiting,
+    /// It runs, and may have written into its hidden folder.
+    Running,
+    /// It returned, or was dropped without running: nothing of it is left
+    /// to remove.
+    Done,
+}
+
+impl Stage {
+    fn set(&self, run: Run) {
+        *lock(&self.state) = run;
+        self.changed.notify_all();
+    }
+
+    /// Waits until the job is not running, at most until `deadline`;
+    /// whether it is not.
+    fn wait(&self, deadline: Instant) -> bool {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(lock(&self.state), timeout, |run| *run == Run::Running)
+            .unwrap_or_else(PoisonError::into_inner);
+        *state != Run::Running
+    }
+}
+
+/// Marks its job done when dropped: when the job returns, panics, or is
+/// dropped without running.
+#[derive(Debug)]
+struct Finish(Arc<Stage>);
+
+impl Drop for Finish {
+    fn drop(&mut self) {
+        self.0.set(Run::Done);
+    }
+}
+
 /// Saves a draft as a song folder of the library ([`Library::save_import`])
 /// and lists the library's songs again: run off the UI thread, since it
 /// copies and transcodes every stem.
@@ -140,26 +196,40 @@ pub struct SaveJob {
     draft: ImportDraft,
     progress: Progress,
     cancel: Arc<AtomicBool>,
+    finish: Finish,
 }
 
 impl SaveJob {
     /// Saves the song, reporting its progress to the editor; it blocks
-    /// until the song is saved, fails or is cancelled.
+    /// until the song is saved, fails or is cancelled. On a cancel or a
+    /// failure, it returns once it has removed what it wrote.
     pub fn run(self) -> Saved {
-        let progress = Arc::clone(&self.progress);
-        let result = self.library.save_import(
-            &self.draft,
+        let Self {
+            ticket,
+            library,
+            draft,
+            progress,
+            cancel,
+            finish,
+        } = self;
+        // Set under the stage's lock: a cancel set before it is seen by
+        // the save, which then writes nothing.
+        finish.0.set(Run::Running);
+        let result = library.save_import(
+            &draft,
             &mut |update| *lock(&progress) = Some(update),
-            &self.cancel,
+            &cancel,
         );
         // The song list as it is now, the new song in it.
-        let listing = result.is_ok().then(|| self.library.list_songs());
-        Saved {
-            ticket: self.ticket,
-            root: self.library.root().to_owned(),
+        let listing = result.is_ok().then(|| library.list_songs());
+        let saved = Saved {
+            ticket,
+            root: library.root().to_owned(),
             result,
             listing,
-        }
+        };
+        drop(finish);
+        saved
     }
 }
 
@@ -190,6 +260,7 @@ pub(crate) struct Saving {
     pub(crate) ticket: u64,
     progress: Progress,
     cancel: Arc<AtomicBool>,
+    stage: Arc<Stage>,
     /// Whether Discard cancelled it: once it stops, the Library shows.
     pub(crate) discarded: bool,
     /// The percentage last drawn ([`SongImport::progress_moved`]).
@@ -200,13 +271,23 @@ impl Saving {
     fn percent(&self) -> Option<u32> {
         lock(&self.progress).map(|progress| (progress.fraction().clamp(0.0, 1.0) * 100.0) as u32)
     }
+
+    /// Cancels the save, as Discard does: once it stops, the Library shows.
+    fn cancel(&mut self) {
+        self.discarded = true;
+        self.cancel.store(true, Ordering::SeqCst);
+    }
 }
 
 impl Drop for Saving {
-    /// A save the editor no longer waits for (another library opened, the
-    /// app closing) stops: it leaves nothing behind.
+    /// A save the editor lets go of (another library opened, the window
+    /// gone) is cancelled, and this waits, at most [`STOP_PATIENCE`], until
+    /// it has stopped and removed what it wrote: the process may end next,
+    /// and a save cut off by the end of the process would leave its hidden
+    /// folder in the library.
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel();
+        self.stage.wait(Instant::now() + STOP_PATIENCE);
     }
 }
 
@@ -278,8 +359,7 @@ impl SongImport {
             if action == ImportAction::Discard
                 && let Some(saving) = &mut self.saving
             {
-                saving.discarded = true;
-                saving.cancel.store(true, Ordering::Relaxed);
+                saving.cancel();
             }
             return Outcome::Stay;
         }
@@ -364,6 +444,18 @@ impl SongImport {
     pub(crate) fn save_failed(&mut self, error: &ImportError) {
         self.saving = None;
         self.save_problem = Some(full_stop(format!("The song could not be saved: {error}")));
+    }
+
+    /// Cancels the save under way, as Discard does, and waits at most
+    /// `patience` until it has stopped and removed what it wrote; whether
+    /// no save runs any more. The editor still waits for the save's result
+    /// ([`crate::library_page::LibraryPage::saved`]).
+    pub(crate) fn stop_save(&mut self, patience: Duration) -> bool {
+        let Some(saving) = &mut self.saving else {
+            return true;
+        };
+        saving.cancel();
+        saving.stage.wait(Instant::now() + patience)
     }
 
     /// Whether the progress of the save under way changed since it was last
@@ -462,12 +554,14 @@ impl SongImport {
     fn start_save(&mut self, library: &Library) -> SaveJob {
         let progress = Progress::default();
         let cancel = Arc::new(AtomicBool::new(false));
+        let stage = Arc::new(Stage::default());
         let ticket = next_ticket();
         self.save_problem = None;
         self.saving = Some(Saving {
             ticket,
             progress: Arc::clone(&progress),
             cancel: Arc::clone(&cancel),
+            stage: Arc::clone(&stage),
             discarded: false,
             drawn: None,
         });
@@ -477,6 +571,7 @@ impl SongImport {
             draft: self.draft.clone(),
             progress,
             cancel,
+            finish: Finish(stage),
         }
     }
 
