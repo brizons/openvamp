@@ -96,6 +96,14 @@ pub fn danger_bg() -> Rgba {
 pub fn danger_text() -> Rgba {
     rgb(0xFFB3B3)
 }
+/// The border of "Delete marker", as on the design canvas.
+pub fn danger_border() -> Rgba {
+    rgb(0x5A2A2C)
+}
+/// The right edge of the selected section on the waveform.
+pub fn selection_edge() -> Rgba {
+    rgb(0x5A606B)
+}
 /// "hold" under the panic label.
 pub fn danger_hint() -> Rgba {
     rgb(0xFF9A9A)
@@ -220,6 +228,10 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/back-to-start.svg",
         include_bytes!("../assets/icons/back-to-start.svg"),
     ),
+    (
+        "icons/bar-lines.svg",
+        include_bytes!("../assets/icons/bar-lines.svg"),
+    ),
     ("icons/bass.svg", include_bytes!("../assets/icons/bass.svg")),
     (
         "icons/bridge.svg",
@@ -261,6 +273,10 @@ const ICONS: &[(&str, &[u8])] = &[
     ("icons/fade.svg", include_bytes!("../assets/icons/fade.svg")),
     ("icons/flag.svg", include_bytes!("../assets/icons/flag.svg")),
     (
+        "icons/flag-plus.svg",
+        include_bytes!("../assets/icons/flag-plus.svg"),
+    ),
+    (
         "icons/folder.svg",
         include_bytes!("../assets/icons/folder.svg"),
     ),
@@ -289,6 +305,10 @@ const ICONS: &[(&str, &[u8])] = &[
     ),
     ("icons/link.svg", include_bytes!("../assets/icons/link.svg")),
     ("icons/loop.svg", include_bytes!("../assets/icons/loop.svg")),
+    (
+        "icons/magnet.svg",
+        include_bytes!("../assets/icons/magnet.svg"),
+    ),
     (
         "icons/maraca.svg",
         include_bytes!("../assets/icons/maraca.svg"),
@@ -416,6 +436,14 @@ const ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/voices.svg"),
     ),
     ("icons/wave.svg", include_bytes!("../assets/icons/wave.svg")),
+    (
+        "icons/zoom-in.svg",
+        include_bytes!("../assets/icons/zoom-in.svg"),
+    ),
+    (
+        "icons/zoom-out.svg",
+        include_bytes!("../assets/icons/zoom-out.svg"),
+    ),
 ];
 
 impl AssetSource for Icons {
@@ -441,6 +469,17 @@ mod tests {
     use openvamp_desktop::{mixer, view};
 
     use super::{Icons, icon_path};
+
+    #[test]
+    fn every_icon_the_song_editor_draws_is_registered() {
+        for name in crate::song_sections_ui::ICONS {
+            let path = icon_path(name);
+            assert!(
+                Icons.load(&path).unwrap().is_some(),
+                "{path} is not in ICONS"
+            );
+        }
+    }
 
     #[test]
     fn every_icon_a_stem_bus_or_section_can_name_is_registered() {

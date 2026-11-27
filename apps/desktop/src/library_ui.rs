@@ -1339,6 +1339,17 @@ fn song_row(song: &SongRow, cx: &mut Context<Perform>) -> AnyElement {
                         .child(song_fact("stems", &song.stems)),
                 ),
         )
+        // The edit link opens the song in the Song editor (S4).
+        .child(
+            small_square(
+                ("edit-song", song.index),
+                cx,
+                act(LibraryAction::EditSong(song.index)),
+            )
+            .size(px(44.))
+            .tooltip(hint(format!("Edit {}", song.title)))
+            .child(icon("wave", theme::text(), 16.)),
+        )
         .child(
             small_square(
                 ("add-song", song.index),

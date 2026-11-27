@@ -11,6 +11,7 @@ mod mixer_ui;
 mod output_ui;
 mod screen;
 mod song_editor_ui;
+mod song_sections_ui;
 mod theme;
 mod ui;
 

@@ -20,7 +20,9 @@ use io_cpal::CpalOutput;
 use library::ConfigStore;
 use openvamp_desktop::action::{Intent, Page, UiAction, disarms_removal};
 use openvamp_desktop::audio_settings::AudioSettings;
-use openvamp_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_request};
+use openvamp_desktop::ending::{
+    Dialog, EndRequest, Ending, Leaving, Question, control_acts, end_request,
+};
 use openvamp_desktop::facts::{self, FactsCache};
 use openvamp_desktop::hold::PanicHold;
 use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, Typed, is_panic_key, typed};
@@ -37,8 +39,9 @@ use openvamp_desktop::tick::Timed;
 use openvamp_desktop::view::{PerformView, SongFacts};
 
 use crate::library_ui::{DraggedItem, DraggedSetlist};
+use crate::song_sections_ui::{DraggedChip, DraggedMarker};
 use crate::ui::DraggedTile;
-use crate::{library_ui, mixer_ui, output_ui, song_editor_ui, ui};
+use crate::{library_ui, mixer_ui, output_ui, song_editor_ui, song_sections_ui, ui};
 
 /// How often the session is polled: about 30 Hz (Decision 3). The timer
 /// keeps running while the window is hidden, since a waiting play starts
@@ -189,6 +192,16 @@ impl Perform {
     /// ([`Self::end_once_saved`]). Returns whether it ended at once, which
     /// lets the window close.
     fn end_show(&mut self, ending: Ending, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // Edits of a library song not saved ask first, whatever plays.
+        if !self.controls_wait()
+            && self
+                .library
+                .as_ref()
+                .is_some_and(LibraryPage::has_unsaved_song)
+        {
+            self.ask_leave(Leaving::End(ending), AfterLeave::End(ending), window, cx);
+            return false;
+        }
         let transport = self.loaded.as_mut().map(|show| {
             show.poll();
             show.snapshot().transport
@@ -266,18 +279,11 @@ impl Perform {
         } else {
             ending.question(Dialog::HERE)
         };
-        let buttons = question.answers.map(|answer| {
-            if answer.keeps_playing {
-                PromptButton::cancel(answer.label)
-            } else {
-                PromptButton::new(answer.label)
-            }
-        });
         let answer = window.prompt(
             PromptLevel::Warning,
             question.message,
             Some(question.detail),
-            &buttons,
+            &prompt_buttons(&question),
             cx,
         );
         self.asking = true;
@@ -292,6 +298,53 @@ impl Perform {
             });
         })
         .detach();
+    }
+
+    /// Asks `leaving`'s question before the edits of the library song in
+    /// the Song editor are dropped, and does `then` on the answer that drops
+    /// them; the other keeps the editor as it was.
+    fn ask_leave(
+        &mut self,
+        leaving: Leaving,
+        then: AfterLeave,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let question = leaving.question(Dialog::HERE);
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            question.message,
+            Some(question.detail),
+            &prompt_buttons(&question),
+            cx,
+        );
+        self.asking = true;
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = answer.await.ok();
+            let _ = this.update_in(cx, |screen, window, cx| {
+                screen.asking = false;
+                if question.ends(answer) {
+                    screen.after_leave(then, window, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Drops the edits of the library song in the Song editor, which
+    /// cancels its waveform, and does what was asked.
+    fn after_leave(&mut self, then: AfterLeave, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(library) = &mut self.library {
+            library.discard_song_edit();
+        }
+        match then {
+            AfterLeave::Discard => {}
+            AfterLeave::OpenLibrary(root, file, opened) => {
+                self.open_library(&root, file.as_deref(), opened);
+            }
+            AfterLeave::End(ending) => self.end_once_saved(ending, window, cx),
+        }
     }
 
     /// Opens what `path` names ([`Source::for_path`]); one that cannot be
@@ -540,7 +593,7 @@ impl Perform {
             Intent::OpenSetlist => self.prompt_for(Pick::Setlist, window, cx),
             Intent::OpenLibrary => self.prompt_for(Pick::Library, window, cx),
             Intent::ImportStems => self.prompt_for(Pick::Import, window, cx),
-            Intent::ShowPage(page) => self.show_page(page),
+            Intent::ShowPage(page) => self.show_page(page, window, cx),
             Intent::Library(action) => {
                 // The setlist on Perform cannot be removed.
                 let playing = self.playing_file().map(str::to_owned);
@@ -550,6 +603,14 @@ impl Perform {
                 }
                 self.follow_library_moves();
                 self.run_save(cx);
+                self.run_song_jobs(cx);
+                if let Some(leaving) = self
+                    .library
+                    .as_mut()
+                    .and_then(LibraryPage::take_leave_question)
+                {
+                    self.ask_leave(leaving, AfterLeave::Discard, window, cx);
+                }
             }
             Intent::PerformSetlist => self.perform_setlist(cx),
             Intent::DismissProblems => self.problems.clear(),
@@ -558,9 +619,9 @@ impl Perform {
     }
 
     /// Asks for a song folder or a setlist file, then opens it.
-    fn prompt_for(&mut self, pick: Pick, _window: &mut Window, cx: &mut Context<Self>) {
+    fn prompt_for(&mut self, pick: Pick, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(pick.options());
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let chosen = match paths.await {
                 Ok(Ok(Some(paths))) => paths.into_iter().next(),
                 Ok(Err(error)) => {
@@ -575,14 +636,16 @@ impl Perform {
                 _ => None,
             };
             if let Some(path) = chosen {
-                let _ = this.update(cx, |screen, cx| {
+                let _ = this.update_in(cx, |screen, window, cx| {
                     match pick {
                         Pick::Song => screen.open(&Source::Song(path), cx),
                         Pick::Setlist => match Source::picked_setlist(&path) {
                             Ok(source) => screen.open(&source, cx),
                             Err(problem) => screen.problems = vec![problem],
                         },
-                        Pick::Library => screen.open_library(&path, None, Opened::Picked),
+                        Pick::Library => {
+                            screen.open_library_asking(path, None, Opened::Picked, window, cx);
+                        }
                         Pick::Import => screen.import_stems(&path, cx),
                     }
                     cx.notify();
@@ -595,7 +658,7 @@ impl Perform {
     /// Shows `page`. The Library screen opens on the library of the
     /// setlist that plays, with that setlist in the editor, when no library
     /// is open yet.
-    fn show_page(&mut self, page: Page) {
+    fn show_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         self.page = page;
         if page == Page::Output {
             self.output
@@ -615,7 +678,7 @@ impl Perform {
             .as_ref()
             .map(|library| (library.root(), self.opened));
         if let Some((root, file)) = library_to_open(open, playing) {
-            self.open_library(&root, Some(&file), Opened::Followed);
+            self.open_library_asking(root, Some(file), Opened::Followed, window, cx);
         }
     }
 
@@ -872,6 +935,143 @@ impl Perform {
         .detach();
     }
 
+    /// Runs the jobs the Song editor of a library song started, if any, on
+    /// the background executor: reading the song the edit link opens (and
+    /// then its waveform), reading or building its waveform, and saving it.
+    /// Each hands its result to the Library screen, which draws again.
+    fn run_song_jobs(&mut self, cx: &mut Context<Self>) {
+        let Some(library) = &mut self.library else {
+            return;
+        };
+        if let Some(job) = library.take_open() {
+            let read = cx.background_executor().spawn(async move { job.run() });
+            cx.spawn(async move |this, cx| {
+                let done = read.await;
+                let _ = this.update(cx, |screen, cx| {
+                    if let Some(library) = &mut screen.library {
+                        library.song_opened(done);
+                    }
+                    // The editor that opened reads its waveform.
+                    screen.run_song_jobs(cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        if let Some(job) = library.take_waveform() {
+            let read = cx.background_executor().spawn(async move { job.run() });
+            cx.spawn(async move |this, cx| {
+                let done = read.await;
+                let _ = this.update(cx, |screen, cx| {
+                    if let Some(library) = &mut screen.library {
+                        library.waveform_done(done);
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        if let Some(job) = library.take_song_save() {
+            let save = cx.background_executor().spawn(async move { job.run() });
+            cx.spawn(async move |this, cx| {
+                let done = save.await;
+                let _ = this.update(cx, |screen, cx| {
+                    if let Some(library) = &mut screen.library {
+                        library.song_saved(done);
+                        if let Some(row) = library.imported_row() {
+                            screen.songs_scroll.scroll_to_item(row);
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// A drag of marker `index` is this far across the bars shown.
+    pub fn marker_drag_over(&mut self, index: usize, along: u32, cx: &mut Context<Self>) {
+        if let Some(library) = &mut self.library {
+            library.marker_drag_over(index, along);
+            cx.notify();
+        }
+    }
+
+    /// The drag of marker `index` was released over the bars.
+    pub fn marker_drop(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.controls_wait() {
+            return;
+        }
+        if let Some(library) = &mut self.library {
+            library.marker_drop(index);
+            cx.notify();
+        }
+    }
+
+    /// A marker's drag left the bars, or ended anywhere else.
+    pub fn marker_drag_left(&mut self, cx: &mut Context<Self>) {
+        if let Some(library) = &mut self.library
+            && library.cancel_marker_drag()
+        {
+            cx.notify();
+        }
+    }
+
+    /// A drag of chip `from` is over chip `over`, in its `half`.
+    pub fn chip_drag_over(&mut self, from: usize, over: usize, half: Half, cx: &mut Context<Self>) {
+        if let Some(library) = &mut self.library {
+            library.chip_drag_over(from, over, half);
+            cx.notify();
+        }
+    }
+
+    /// The drag of chip `from` was dropped on the chips.
+    pub fn chip_drop(&mut self, from: usize, cx: &mut Context<Self>) {
+        if self.controls_wait() {
+            return;
+        }
+        if let Some(library) = &mut self.library {
+            library.chip_drop(from);
+            cx.notify();
+        }
+    }
+
+    /// A chip's drag left the chips, or ended anywhere else.
+    pub fn chip_drag_left(&mut self, cx: &mut Context<Self>) {
+        if let Some(library) = &mut self.library
+            && library.cancel_chip_drag()
+        {
+            cx.notify();
+        }
+    }
+
+    /// Opens the library folder `root` as [`Self::open_library`] does,
+    /// asking first when a library song in the Song editor has edits not
+    /// saved.
+    fn open_library_asking(
+        &mut self,
+        root: PathBuf,
+        file: Option<String>,
+        opened: Opened,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .library
+            .as_ref()
+            .is_some_and(LibraryPage::has_unsaved_song)
+        {
+            self.ask_leave(
+                Leaving::OpenLibrary,
+                AfterLeave::OpenLibrary(root, file, opened),
+                window,
+                cx,
+            );
+        } else {
+            self.open_library(&root, file.as_deref(), opened);
+        }
+    }
+
     /// Opens the library folder `root` on the Library screen, with `file`
     /// in the editor when given.
     fn open_library(&mut self, root: &Path, file: Option<&str>, opened: Opened) {
@@ -1013,6 +1213,29 @@ fn current_click(show: &Show) -> Option<SongFacts> {
     ))
 }
 
+/// What is done once the edits of a library song are dropped
+/// ([`Perform::ask_leave`]).
+enum AfterLeave {
+    /// Discard or the Library link: the Library shows.
+    Discard,
+    /// Another library folder opens.
+    OpenLibrary(PathBuf, Option<String>, Opened),
+    /// The app quits or its window closes.
+    End(Ending),
+}
+
+/// The buttons of `question` in the platform's dialog: its answer that
+/// keeps the show going is the cancel answer.
+fn prompt_buttons(question: &Question) -> [PromptButton; 2] {
+    question.answers.map(|answer| {
+        if answer.keeps_playing {
+            PromptButton::cancel(answer.label)
+        } else {
+            PromptButton::new(answer.label)
+        }
+    })
+}
+
 /// The modifiers the keyboard rules read; Shift is left out.
 fn mods(modifiers: &Modifiers) -> Mods {
     Mods {
@@ -1063,12 +1286,16 @@ impl Render for Perform {
         };
         let body = match (self.page, &self.loaded) {
             (Page::Library, _) => match &self.library {
-                Some(library) => match library.song_editor() {
-                    Some(editor) => {
+                Some(library) => match (library.song_edit_view(), library.song_editor()) {
+                    (Some(edit), _) => {
+                        song_sections_ui::song_edit(&edit, window.viewport_size(), cx)
+                            .into_any_element()
+                    }
+                    (None, Some(editor)) => {
                         song_editor_ui::song_editor(&editor, window.viewport_size(), cx)
                             .into_any_element()
                     }
-                    None => {
+                    (None, None) => {
                         let view = library.view(self.playing_file());
                         library_ui::library(&view, &self.songs_scroll, cx).into_any_element()
                     }
@@ -1115,6 +1342,12 @@ impl Render for Perform {
             }))
             .on_drop(cx.listener(|screen, _: &DraggedTile, _, cx| {
                 screen.strip_drag_cancelled(cx);
+            }))
+            .on_drop(cx.listener(|screen, _: &DraggedMarker, _, cx| {
+                screen.marker_drag_left(cx);
+            }))
+            .on_drop(cx.listener(|screen, _: &DraggedChip, _, cx| {
+                screen.chip_drag_left(cx);
             }))
             .child(ui::nav(self.page, cx))
             .child(ui::main().child(body))
