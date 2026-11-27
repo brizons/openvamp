@@ -188,11 +188,11 @@ impl Waved {
     }
 }
 
-/// A waveform job under way; dropping it (the editor closing) cancels the
-/// job.
+/// A waveform job under way; dropping it (the editor closing; on Perform,
+/// another song showing or play starting) cancels the job.
 #[derive(Debug)]
-pub(super) struct WaveformRun {
-    pub(super) ticket: u64,
+pub(crate) struct WaveformRun {
+    pub(crate) ticket: u64,
     progress: WaveProgress,
     cancel: Arc<AtomicBool>,
     /// The percentage last drawn ([`super::SongEdit::waveform_moved`]).
@@ -201,8 +201,8 @@ pub(super) struct WaveformRun {
 
 impl WaveformRun {
     /// A waveform job for the song folder `folder`, and the run the editor
-    /// keeps of it.
-    pub(super) fn start(folder: PathBuf) -> (WaveformJob, Self) {
+    /// (or the Perform song map, [`crate::map_wave`]) keeps of it.
+    pub(crate) fn start(folder: PathBuf) -> (WaveformJob, Self) {
         let progress = WaveProgress::default();
         let cancel = Arc::new(AtomicBool::new(false));
         let ticket = next_ticket();

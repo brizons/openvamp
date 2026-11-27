@@ -165,17 +165,27 @@ pub(crate) fn wave_bars(
                     SectionKind::of(&marker.section_type.label(marker.number))
                 });
             let height = overview.map_or(WAVE_LOW, |overview| {
-                let peak = overview.peak();
-                if peak > 0.0 {
-                    let level = (overview.range_level(range) / peak).clamp(0.0, 1.0);
-                    WAVE_LOW + (WAVE_HIGH - WAVE_LOW) * level
-                } else {
-                    WAVE_LOW
-                }
+                bar_height(overview, range, WAVE_LOW..WAVE_HIGH)
             });
             WaveBar { kind, height }
         })
         .collect()
+}
+
+/// How tall a waveform's bar of the source frames `frames` stands, as a
+/// share of the waveform's height within `heights`: its level in
+/// `overview` over the song's peak, from `heights.start` for silence to
+/// `heights.end` for the peak; `heights.start` for a silent song. The
+/// Song editor draws its bars in [`WAVE_LOW`]..[`WAVE_HIGH`], the Perform
+/// song map in [`crate::view::MAP_WAVE_LOW`]..[`crate::view::MAP_WAVE_HIGH`].
+pub(crate) fn bar_height(overview: &Overview, frames: Range<u64>, heights: Range<f32>) -> f32 {
+    let peak = overview.peak();
+    if peak > 0.0 {
+        let level = (overview.range_level(frames) / peak).clamp(0.0, 1.0);
+        heights.start + (heights.end - heights.start) * level
+    } else {
+        heights.start
+    }
 }
 
 /// The ruler's labels in `window`: bars 1, 9, 17… ([`RULER_STEP_BARS`]).

@@ -62,7 +62,7 @@ Requirements quote `docs/mvp-spec.md` (F2) and the user verbatim. Items marked *
 | T1 | S1, S2 (domain) | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L3; verified L4; review approved L6) | 57965f1 |
 | T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | done (L5; verified L7; review approved L8) | d35205d |
 | T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | done (L9); split, verifier and screenshot check pending | |
-| T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | pending | |
+| T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | done (L10); verifier and screenshot check pending | see L10 |
 | T5 | S6 | inline, with each task's own docs | pending | |
 
 Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and T3 drives background jobs (item 4), so each gets an independent verifier.
@@ -194,4 +194,28 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
     - opening runs `list_songs`.
   - **Size:** the change is about 6,400 lines, too big for one review slice, so the writer is splitting it into 2–3 compiling commits in a scratch clone. The parent will apply them.
   - Risk: item 3 (the import header and `SongDraft` maps, which are shared) and item 4 (background jobs and cancel), so T3 gets an independent verifier.
+- **L10** (2026-11-27): the T3 split landed as three commits:
+  - 0d0975e: domain `BarMaps`, the shared header and `song_sections.rs`;
+  - 19e1a0f: the editor's view model, jobs and Library wiring;
+  - dc274d7: the drawing, theme, icons and README.
+
+  Each compiles and passes on its own. The applied series matched the tested working tree file for file, and the T3 verifier was launched on dc274d7.
+
+  T4 delivered:
+  - **`map_wave.rs` (`MapWaveform`):** it reads the cache for the song on Perform and builds it with the editor's `WaveformJob`.
+  - **`view.rs` and `ui.rs`:** the song map's track shows one bar per source bar inside each position, 18–96 % high, with played bars at opacity 1 and bars ahead at 0.38. The playhead gets a 1 px background ring.
+  - **Shared bar height:** `song_sections::bar_height` is now used by both the editor and Perform.
+  - **Stems panel:** stem rows show the file name only.
+  - **README:** describes the Perform waveform.
+
+  **Parent decision (live safety):** Perform builds a missing overview only while the transport is stopped or paused. Play cancels a running build within a tick (the cancel leaves no cache). A cached overview shows at any time, because `load_overview` only stats files.
+
+  **Checks:**
+  - RED first for each rule, and 4 deliberate mutations were caught.
+  - `cargo test -p openvamp` passes 338; fmt, clippy and the workspace check are clean. The parent re-ran `--test song_map_wave` (12).
+  - Size: about 1,300 changed lines.
+
+  **Still open:** a failed read is not retried while its song shows; a Perform read and an editor build can run at once (safe, since both write atomically).
+
+  Risk: item 4 (background jobs tied to the transport), so T4 gets an independent verifier.
 
