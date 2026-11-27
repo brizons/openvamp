@@ -63,7 +63,7 @@ Requirements quote `docs/mvp-spec.md` (F2) and the user verbatim. Items marked *
 | T1 | S1, S2 (domain) | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L3; verified L4; review approved L6) | 57965f1 |
 | T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | done (L5; verified L7; review approved L8) | d35205d |
 | T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | done (L9; split L10; verified L11 with B1 in correction; reviews approved L12) | 0d0975e, 19e1a0f, dc274d7 |
-| T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | done (L10; verified L15); review running | 0010532 |
+| T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | done (L10; verified L15; review approved L16) | 0010532 |
 | T5 | S6 | inline, with each task's own docs | pending | |
 
 Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and T3 drives background jobs (item 4), so each gets an independent verifier.
@@ -315,4 +315,16 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
     - a build that finished just before play has its result dropped, so the cache is not shown during that play and is rebuilt at the next stop (fix: on an ignored `Ok`, go back to reading the cache);
     - `StemRow.file`'s doc is stale.
   - **Final reviews:** the user granted both final review slices: T4 (dc274d7..0010532) and the setlist fix (0010532..c43d0d0).
+- **L16** (2026-11-27): the T4 review (dc274d7..0010532) approved and was acknowledged. Warnings, kept as follow-ups:
+  - after a pause with no cache, a build can still read the drive for one tick after play resumes;
+  - a failed read is never retried while its song shows (×2);
+  - a build that finishes just before play is dropped (×1);
+  - the stems panel now shows bare file names, so two stems with the same name in different folders look alike.
+
+  The setlist-fix review (0010532..c43d0d0, lineage review-678073cd8a620ef2) returned `correction_required` with one CRITICAL finding, reported by three lenses: `write_fixes` re-matched items after each fix, so an item one fix moved could match a later fix and move twice. Two items at Live positions 2 and 3 both ended at (4,4).
+  - **Correction:** made in the review worktree as de8a3e8 (91 changed lines; planned 80, budget 200). Every item is matched against the setlist as it was read before any edit, and each file is opened once (`dedup` only removed adjacent duplicates).
+  - **Checks:**
+    - RED: the new `each_setlist_item_moves_once_even_when_another_lands_on_its_old_positions` failed with `[(4,4),(4,4)]`.
+    - GREEN: `cargo test -p openvamp` passes 350; fmt and clippy are clean.
+  - The native targeted validator is running.
 
