@@ -13,7 +13,7 @@
 | 3 | Threads | Real-time audio thread fed by lock-free queues | Proposed |
 | 4 | Key and tempo change (v0.2) | Offline render with Signalsmith Stretch | Proposed |
 | 5 | Licenses | MPL-2.0 project; permissive dependencies by default; GPL-only features are opt-in | Decided |
-| 6 | Storage | Open song package, stems stored as FLAC | Proposed |
+| 6 | Storage | Open song package; WAV and FLAC stems, lossy imports stored as FLAC | Decided |
 
 ## System overview
 
@@ -141,7 +141,10 @@ Render transposed and time-stretched stems **offline**, into a cache keyed by ke
 |------------|---------|---------|---------------|
 | `cpal` (audio I/O) | 0.18.2 | Apache-2.0 | Yes |
 | `midir` (MIDI) | 0.11.1 | MIT | Yes |
-| `symphonia` (decoding) | 0.6.1 | MPL-2.0 | Yes |
+| `hound` (WAV reading and writing) | 3.5.1 | Apache-2.0 | Yes |
+| `symphonia` (FLAC, MP3, AAC and M4A decoding) | 0.6.1 | MPL-2.0 | Yes |
+| `flacenc` (FLAC encoding on import) | 0.5.1 | Apache-2.0 | Yes |
+| `zip` (ZIP import; deflate through `flate2` with `zlib-rs`) | 9.5.1 | MIT | Yes |
 | `signalsmith-stretch` | 0.1.3 | MIT | Yes (v0.2) |
 | `uniffi` (Swift and Kotlin bindings) | 0.32.2 | MPL-2.0 | Yes |
 | `gpui` (desktop shell) | 0.2.2 | Apache-2.0 | Yes |
@@ -157,7 +160,7 @@ Render transposed and time-stretched stems **offline**, into a cache keyed by ke
 
 ## Decision 6 — Storage
 
-Songs use the [open song package](mvp-spec.md#song-package-format-v1). Lossy imports are transcoded to FLAC so the disk thread can seek to any sample exactly; that costs storage and is listed as an open decision in the spec.
+Songs use the [open song package](mvp-spec.md#song-package-format-v1). Stems are WAV or FLAC. An import copies WAV and FLAC files as they are and transcodes MP3 and M4A to 24-bit FLAC, so the disk thread can seek to any sample exactly; the extra storage was accepted on 2026-11-26. FLAC is read through `symphonia`, which is given only STREAMINFO and the audio frames (it mishandles seek tables in cut or forged files), and FLAC deeper than 24 bits is refused because `symphonia` 0.6.1 decodes it wrongly.
 
 Mixing and routing add three JSON files, each with its own `formatVersion` (1); `domain` documents the formats and `library` reads and writes them:
 

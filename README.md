@@ -19,9 +19,10 @@ Early development. Built so far:
 - **Disk streaming:** stems stream from disk, so memory use stays nearly flat as songs get longer.
 - **`app` API:** one API of commands and state snapshots that every app uses, with a `cpal` audio output.
 - **`play-cli`:** a terminal player with single-key controls, for one song or a setlist.
-- **Desktop app:** the Perform screen, which plays one song or a setlist, and a Library screen that edits setlists, built with [GPUI](https://github.com/zed-industries/zed).
+- **Song import:** a folder or ZIP of WAV, FLAC, MP3 or M4A stems becomes a song package; parts come from the file names, and MP3 and M4A are stored as FLAC.
+- **Desktop app:** the Perform screen, which plays one song or a setlist; the Mixer and Audio output screens; and a Library screen that edits setlists and imports stems through the Song editor, built with [GPUI](https://github.com/zed-industries/zed).
 
-Not built yet: the mixer, the output routing matrix, MIDI control, and the iPhone, iPad and Android apps. The plan is in [docs/mvp-spec.md](docs/mvp-spec.md), and the design is in [docs/architecture.md](docs/architecture.md).
+Not built yet: marking sections and arrangements in the app, MIDI control, and the iPhone, iPad and Android apps. The plan is in [docs/mvp-spec.md](docs/mvp-spec.md), and the design is in [docs/architecture.md](docs/architecture.md).
 
 ## Try it
 

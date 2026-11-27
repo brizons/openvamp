@@ -68,8 +68,8 @@ Requirements quote `docs/mvp-spec.md` (F1) and the user verbatim. Items marked *
 | T1 | S2 | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L4; verified L7; review approved L8) | 883b398 |
 | T2 | S6 | delegated (parallel unit with T1, disjoint surface `crates/library` decoding, `Cargo.toml`, `Cargo.lock`) | done (L5; blockers fixed L12; verified L15; review approved L16) | 0c390d5, b906f5e |
 | T3 | S1, S3, S4, S5 (library side) | delegated (context backstop); needs T1 and T2 | done (L9; blockers fixed L19; verified L21; reviews approved L22) | 6ea066c, 05b8af2, 4318887, b05d730 |
-| T4 | S7 | delegated (context backstop); needs T3 | done (L13); independent verifier and screenshot check pending | see L13 |
-| T5 | S8 | inline, with each task's own docs | pending | |
+| T4 | S7 | delegated (context backstop); needs T3 | done (L13; app run L17; blocker fixed L23); recheck pending | dca6066, f8c6194 |
+| T5 | S8 | inline, with each task's own docs | done (L23) | see L23 |
 
 Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` and the desktop consume (item 3), so each gets an independent verifier. T1 changes the shared bus rules (item 3).
 
@@ -317,4 +317,24 @@ Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` an
     - WARNING: a long ZIP entry extraction ignores cancel and sends no progress.
     - SUGGESTIONS: the probe extracts every ZIP entry; one `report` result is discarded; no test saves a transcoded stem from a ZIP.
   - **Routing:** the box overflow, the ZIP sync and the discarded `report` were sent to the T4 writer, to land in the T4 slice. The rest are follow-ups, as is the user's preference ([[fewer-review-rounds]]).
+- **L23** (2026-11-26): the T4 correction landed as f8c6194.
+  - **Quit while saving:**
+    - Quitting while a song saves asks "A song is being saved" (Quit / Keep saving). Quit cancels the save and quits only after the job reports back, with a 10 s fallback.
+    - Quits that cannot ask (Dock, logout) block in GPUI's synchronous quit handler until the job stops, at most 5 s.
+    - Dropping a running save waits too.
+  - **Sweep:** `save_import` removes `.import-<pid>-<n>.tmp` folders from another pid that have been unchanged for over an hour, and nothing else.
+  - **T3 review fixes folded in:** the mp4 box size check (an unreadable box keeps the M4A untrimmed and estimated), `sync_all` for ZIP entries copied as they are, and `Cancelled` after a copied ZIP entry.
+  - **Checks:**
+    - `cargo test -p openvamp` 285 passed; `--test import` 31 passed; fmt, clippy and the workspace check are clean;
+    - the parent re-ran `--test song_import` (31) and `--test ending` (12).
+  - **Risk:** item 4 (the cancel and wait across threads); the sweep deletes leftover data under a strict rule (item 1).
+  - **The T4 verifier rechecks B1 on f8c6194.**
+  - **T5 docs:**
+    - `docs/mvp-spec.md`: the lossy-import decision is decided, and the storage note is updated.
+    - `docs/architecture.md`:
+      - Decision 6 is now Decided and says what was built;
+      - the license table adds `hound`, `flacenc` and `zip`;
+      - the `symphonia` row lists FLAC, MP3, AAC and M4A.
+    - `README.md`: the status adds the song import and the Mixer and Audio output screens, and "Not built yet" no longer lists the mixer and routing, which were merged in PRs #15–#21.
+    - The desktop README's import section came with T4.
 
