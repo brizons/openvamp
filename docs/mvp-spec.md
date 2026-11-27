@@ -81,8 +81,8 @@ Each requirement has an ID for traceability in issues and tests.
 | F2.3 | Create named arrangements by reordering, repeating, and removing sections. A **Default** arrangement always exists and cannot be deleted. |
 | F2.4 | Mark a section as **infinite loop** by default in an arrangement. |
 
-- [ ] An arrangement `Intro, Verse, Chorus, Chorus, Outro` renders the chorus twice with no gap or click at the seam.
-- [ ] Moving a marker updates every arrangement that uses that section.
+- [x] An arrangement `Intro, Verse, Chorus, Chorus, Outro` renders the chorus twice with no gap or click at the seam.
+- [x] Moving a marker updates every arrangement that uses that section.
 
 ### F3 — Click and count-in
 

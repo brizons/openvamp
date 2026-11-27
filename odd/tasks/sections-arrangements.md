@@ -64,7 +64,7 @@ Requirements quote `docs/mvp-spec.md` (F2) and the user verbatim. Items marked *
 | T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | done (L5; verified L7; review approved L8) | d35205d |
 | T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | done (L9; split L10; verified L11 with B1 in correction; reviews approved L12) | 0d0975e, 19e1a0f, dc274d7 |
 | T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | done (L10; verified L15; review approved L16) | 0010532 |
-| T5 | S6 | inline, with each task's own docs | pending | |
+| T5 | S6 | inline, with each task's own docs | done (L17) | see L17 |
 
 Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and T3 drives background jobs (item 4), so each gets an independent verifier.
 
@@ -327,4 +327,15 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
     - RED: the new `each_setlist_item_moves_once_even_when_another_lands_on_its_old_positions` failed with `[(4,4),(4,4)]`.
     - GREEN: `cargo test -p openvamp` passes 350; fmt and clippy are clean.
   - The native targeted validator is running.
+- **L17** (2026-11-27): the setlist-fix review (lineage review-678073cd8a620ef2) closed.
+  - **Validation:** the native targeted validator approved the correction de8a3e8, and the review was acknowledged. The parent cherry-picked it into the branch as aa4ff27, with identical content.
+  - **Follow-ups from that review:**
+    - a quit, close or log-out during the "Save anyway / Keep editing" question is dropped, so the user must quit again;
+    - `Saving` drop and `stop_save` block the UI thread, and two waits can add up;
+    - the unreadable-setlists note is awkward when the folder itself cannot be listed.
+  - **T5 docs:**
+    - `docs/mvp-spec.md` marks both F2 acceptance items.
+    - `docs/architecture.md` (Decision 6) describes `waveforms/overview.bin`, its fingerprints, the rebuild rules (the editor in the background, Perform only while stopped or paused) and the atomic song save.
+    - `README.md` lists the Song editor's sections and arrangements and the Perform waveform, and "Not built yet" drops F2.
+    - The desktop README came with T3 and T4.
 
