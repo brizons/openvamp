@@ -19,7 +19,9 @@
 //! [`library_page`] carries out its controls and says what it shows,
 //! [`shelf`] lists, creates, duplicates and moves setlists, [`editor`] edits and
 //! saves one, [`song_import`] reads a folder or ZIP of stems, edits the song
-//! it makes in the Song editor and saves it into the library, and
+//! it makes in the Song editor and saves it into the library,
+//! [`song_edit`] edits a library song's header, stems, section markers and
+//! arrangements on its waveform ([`song_sections`] is what it shows), and
 //! [`line_edit`] is their one-line text field. The GPUI views
 //! in the binary only draw these views and dispatch these actions.
 
@@ -42,6 +44,7 @@ pub mod reorder;
 pub mod shelf;
 pub mod show;
 pub mod song;
+pub mod song_edit;
 mod song_header;
 pub mod song_import;
 pub mod song_sections;

@@ -8,9 +8,6 @@
 //! bars ([`BarScale`]): a frame inside a bar sits at its share of that
 //! bar, and a marker snapped to a beat sits inside its bar.
 
-// The Song editor of a library song draws these in the next change.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::ops::Range;
 
 use domain::{BarBeat, SongEditor};

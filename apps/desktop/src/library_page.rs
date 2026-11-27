@@ -10,6 +10,15 @@
 //! writes it off the UI thread ([`LibraryPage::take_save`],
 //! [`LibraryPage::saved`]); the song list then reads the library again and
 //! marks the new song.
+//!
+//! A song row's edit link (S4, F2) opens that song in the Song editor: it
+//! is read off the UI thread ([`LibraryPage::take_open`],
+//! [`LibraryPage::song_opened`]), its waveform too
+//! ([`LibraryPage::take_waveform`], [`LibraryPage::waveform_done`]), and
+//! "Save song" rewrites its `song.json` off the UI thread
+//! ([`LibraryPage::take_song_save`], [`LibraryPage::song_saved`]), after
+//! which the Library shows again, read anew. Discard or the Library link
+//! with edits not saved asks first ([`LibraryPage::take_leave_question`]).
 
 use std::path::{Path, PathBuf};
 
@@ -21,12 +30,19 @@ use library::{ArrangementEntry, Library, SetlistError, SongEntry, SongListing, T
 
 use crate::catalog::{Audience, Catalog};
 use crate::editor::{Edit, SetlistEditor};
+use crate::ending::Leaving;
 use crate::line_edit::{LineEdit, LineKey, LineOutcome};
 use crate::reorder::{Half, drop_index, drop_slot};
 use crate::shelf::Shelf;
-use crate::song_import::{
-    ImportAction, Outcome, ProbeJob, Probed, SaveJob, Saved, SongEditorView, SongImport,
+use crate::song_edit::{
+    EditOutcome, OpenSongJob, OpenedSong, SaveSongJob, SongAction, SongEdit, SongSaved, Waved,
+    WaveformJob,
 };
+use crate::song_import::{
+    ImportAction, Outcome, ProbeJob, Probed, SaveJob, Saved, SongEditorView, SongImport, full_stop,
+    sentence,
+};
+use crate::song_sections::SongEditView;
 
 /// The label of an armed remove control. It does not repeat the name: the
 /// setlist's name is in the editor's header (an unreadable file's in the
@@ -129,8 +145,15 @@ pub enum LibraryAction {
     Search,
     /// Hides the last problem and the last warning.
     DismissNotice,
-    /// A control of the Song editor, while a draft is open in it.
+    /// A control of the Song editor's header or stems, while a draft or a
+    /// song of the library is open in it.
     Import(ImportAction),
+    /// The edit link of this row of the song list: opens the song in the
+    /// Song editor.
+    EditSong(usize),
+    /// A control of the Song editor's sections and arrangements, while a
+    /// song of the library is open in it.
+    Song(SongAction),
 }
 
 impl LibraryAction {
@@ -191,8 +214,20 @@ pub struct LibraryPage {
     probing: Option<(u64, PathBuf)>,
     /// The save asked for and not taken yet ([`Self::take_save`]).
     pending_save: Option<SaveJob>,
-    /// The song folder last imported, marked in the song list.
+    /// The song folder last imported or saved, marked in the song list.
     imported: Option<String>,
+    /// The song of the library open in the Song editor.
+    song_edit: Option<SongEdit>,
+    /// The song being read for the Song editor, by its job's ticket, with
+    /// its title.
+    opening: Option<(u64, String)>,
+    /// The read asked for and not taken yet ([`Self::take_open`]).
+    pending_open: Option<OpenSongJob>,
+    /// The song save asked for and not taken yet ([`Self::take_song_save`]).
+    pending_song_save: Option<SaveSongJob>,
+    /// Whether Discard asked to leave edits not saved: the screen asks
+    /// first ([`Self::take_leave_question`]).
+    leave_question: bool,
 }
 
 impl LibraryPage {
@@ -262,6 +297,11 @@ impl LibraryPage {
             probing: None,
             pending_save: None,
             imported: None,
+            song_edit: None,
+            opening: None,
+            pending_open: None,
+            pending_song_save: None,
+            leave_question: false,
         };
         let file = file
             .map(str::to_owned)
@@ -380,6 +420,10 @@ impl LibraryPage {
             return;
         }
         self.probing = None;
+        if self.song_edit.is_some() {
+            self.notice = Some("Cannot import stems while a song is being edited.".to_owned());
+            return;
+        }
         if self
             .import
             .as_ref()
@@ -454,10 +498,194 @@ impl LibraryPage {
         self.import.as_ref().map(SongImport::view)
     }
 
-    /// Whether the progress of the save under way changed since the last
-    /// call: the screen draws again ([`crate::tick::Timed::turn`]).
+    /// Whether the progress of the save under way, or of the waveform
+    /// being read for the Song editor, changed since the last call: the
+    /// screen draws again ([`crate::tick::Timed::turn`]).
     pub fn import_moved(&mut self) -> bool {
-        self.import.as_mut().is_some_and(SongImport::progress_moved)
+        let saving = self.import.as_mut().is_some_and(SongImport::progress_moved);
+        let waveform = self
+            .song_edit
+            .as_mut()
+            .is_some_and(SongEdit::waveform_moved);
+        saving || waveform
+    }
+
+    /// The read the edit link started, to run off the UI thread, once.
+    pub fn take_open(&mut self) -> Option<OpenSongJob> {
+        self.pending_open.take()
+    }
+
+    /// What [`Self::take_open`]'s job read: the Song editor opens on the
+    /// song, or the notice says why it cannot be edited. The song list is
+    /// read anew either way. A read a newer one replaced changes nothing.
+    pub fn song_opened(&mut self, done: OpenedSong) {
+        let Some((ticket, title)) = self.opening.take() else {
+            return;
+        };
+        if ticket != done.ticket {
+            self.opening = Some((ticket, title));
+            return;
+        }
+        if let Some(listing) = done.listing {
+            self.list(listing);
+        }
+        if self.import.is_some() || self.song_edit.is_some() {
+            return;
+        }
+        let opened = done
+            .result
+            .and_then(|source| SongEdit::open(self.shelf.library(), &done.song, source));
+        match opened {
+            Ok(edit) => {
+                self.song_edit = Some(edit);
+                self.typing = None;
+                self.armed = None;
+            }
+            Err(problem) => {
+                self.notice = Some(full_stop(format!("Cannot edit \"{title}\": {problem}")));
+            }
+        }
+    }
+
+    /// The waveform job the Song editor started, to run off the UI thread,
+    /// once.
+    pub fn take_waveform(&mut self) -> Option<WaveformJob> {
+        self.song_edit.as_mut()?.take_waveform()
+    }
+
+    /// What [`Self::take_waveform`]'s job gave: the waveform draws. A job
+    /// of an editor since closed changes nothing.
+    pub fn waveform_done(&mut self, done: Waved) {
+        if let Some(edit) = &mut self.song_edit {
+            edit.waveform_done(done);
+        }
+    }
+
+    /// The Song editor of a library song, while one is open.
+    pub fn song_edit_view(&self) -> Option<SongEditView> {
+        self.song_edit.as_ref().map(SongEdit::view)
+    }
+
+    /// The save "Save song" started for a library song, to run off the UI
+    /// thread, once.
+    pub fn take_song_save(&mut self) -> Option<SaveSongJob> {
+        self.pending_song_save.take()
+    }
+
+    /// What [`Self::take_song_save`]'s job did: a saved song closes the
+    /// editor, and the Library shows again with the songs read anew and the
+    /// song marked; a failed save keeps the editor open with the reason.
+    pub fn song_saved(&mut self, done: SongSaved) {
+        let ours = self
+            .song_edit
+            .as_ref()
+            .and_then(SongEdit::saving)
+            .is_some_and(|ticket| ticket == done.ticket);
+        if !ours {
+            if let (Ok(_), Some(listing)) = (&done.result, done.listing)
+                && done.root == self.root
+            {
+                self.list(listing);
+            }
+            return;
+        }
+        match done.result {
+            Ok(entry) => {
+                self.song_edit = None;
+                if let Some(listing) = done.listing {
+                    self.list(listing);
+                }
+                self.mark_imported(entry.song);
+                if let Some(problem) = done.mix_problem {
+                    self.warning = Some(sentence(&problem));
+                }
+            }
+            Err(error) => {
+                let mut message = full_stop(format!("The song could not be saved: {error}"));
+                if let library::SaveSongError::Invalid(problems) = &error {
+                    for problem in problems {
+                        message.push(' ');
+                        message.push_str(&sentence(&problem.to_string()));
+                    }
+                }
+                if let Some(edit) = &mut self.song_edit {
+                    edit.save_failed(message);
+                }
+            }
+        }
+    }
+
+    /// Whether a song of the library is open in the Song editor with edits
+    /// not saved, nor being saved: leaving it asks first.
+    pub fn has_unsaved_song(&self) -> bool {
+        self.song_edit
+            .as_ref()
+            .is_some_and(|edit| edit.saving().is_none() && edit.has_edits())
+    }
+
+    /// The question Discard or the Library link asked for, once: the edits
+    /// are not saved ([`Leaving::question`]).
+    pub fn take_leave_question(&mut self) -> Option<Leaving> {
+        std::mem::take(&mut self.leave_question).then_some(Leaving::Discard)
+    }
+
+    /// The answer to [`Self::take_leave_question`]: `discard` drops the
+    /// edits and shows the Library; otherwise the editor stays as it was.
+    pub fn leave_answered(&mut self, discard: bool) {
+        if discard {
+            self.discard_song_edit();
+        }
+    }
+
+    /// Drops the song open in the Song editor and its edits, cancelling its
+    /// waveform build: the Library shows again.
+    pub fn discard_song_edit(&mut self) {
+        self.song_edit = None;
+        self.leave_question = false;
+    }
+
+    /// A drag of marker `index` is this far across the bars shown (out of
+    /// [`crate::song_sections::ALONG`]).
+    pub fn marker_drag_over(&mut self, index: usize, along: u32) {
+        if let Some(edit) = &mut self.song_edit {
+            edit.drag_marker(index, along);
+        }
+    }
+
+    /// The drag of marker `index` was released over the bars: it moves,
+    /// snapped.
+    pub fn marker_drop(&mut self, index: usize) {
+        if let Some(edit) = &mut self.song_edit {
+            edit.drop_marker(index);
+        }
+    }
+
+    /// A marker's drag ended elsewhere; whether its ghost was showing.
+    pub fn cancel_marker_drag(&mut self) -> bool {
+        self.song_edit
+            .as_mut()
+            .is_some_and(SongEdit::cancel_marker_drag)
+    }
+
+    /// A drag of chip `from` is over chip `over`, in its `half`.
+    pub fn chip_drag_over(&mut self, from: usize, over: usize, half: Half) {
+        if let Some(edit) = &mut self.song_edit {
+            edit.drag_chip(from, over, half);
+        }
+    }
+
+    /// The drag of chip `from` was dropped on the chips.
+    pub fn chip_drop(&mut self, from: usize) {
+        if let Some(edit) = &mut self.song_edit {
+            edit.drop_chip(from);
+        }
+    }
+
+    /// A chip's drag ended elsewhere; whether its line was showing.
+    pub fn cancel_chip_drag(&mut self) -> bool {
+        self.song_edit
+            .as_mut()
+            .is_some_and(SongEdit::cancel_chip_drag)
     }
 
     /// Whether a song is being saved: the Song editor waits for its save.
@@ -483,9 +711,10 @@ impl LibraryPage {
     /// Whether the keys type into a field: the song search, a setlist's
     /// name, or a field of the Song editor.
     pub fn takes_keys(&self) -> bool {
-        match &self.import {
-            Some(import) => import.typing().is_some(),
-            None => self.typing.is_some(),
+        match (&self.song_edit, &self.import) {
+            (Some(edit), _) => edit.takes_keys(),
+            (None, Some(import)) => import.typing().is_some(),
+            (None, None) => self.typing.is_some(),
         }
     }
 
@@ -661,6 +890,33 @@ impl LibraryPage {
                 self.notice = None;
                 self.warning = None;
             }
+            A::Import(action) if self.song_edit.is_some() => {
+                let library = self.shelf.library();
+                if let Some(edit) = &mut self.song_edit {
+                    match edit.act_header(action, library) {
+                        EditOutcome::Stay => {}
+                        EditOutcome::Close => self.song_edit = None,
+                        EditOutcome::Ask => self.leave_question = true,
+                        EditOutcome::Save(job) => self.pending_song_save = Some(*job),
+                    }
+                }
+            }
+            A::Song(action) => {
+                if let Some(edit) = &mut self.song_edit {
+                    edit.act(action);
+                }
+            }
+            A::EditSong(row) => {
+                if self.import.is_some() || self.song_edit.is_some() {
+                    return Ok(());
+                }
+                let Some(song) = self.found_songs().get(row).map(|song| (*song).clone()) else {
+                    return Ok(());
+                };
+                let job = OpenSongJob::new(self.shelf.library(), &song.song);
+                self.opening = Some((job.ticket(), song.title.clone()));
+                self.pending_open = Some(job);
+            }
             A::Import(action) => {
                 let Some(import) = &mut self.import else {
                     return Ok(());
@@ -678,6 +934,10 @@ impl LibraryPage {
     /// A key typed into the field that has the focus.
     pub fn type_key(&mut self, key: LineKey<'_>) {
         self.armed = None;
+        if let Some(edit) = &mut self.song_edit {
+            edit.type_key(key);
+            return;
+        }
         if let Some(import) = &mut self.import {
             import.type_key(key);
             return;
@@ -706,6 +966,10 @@ impl LibraryPage {
     /// Text pasted into the field that has the focus.
     pub fn paste(&mut self, text: &str) {
         self.armed = None;
+        if let Some(edit) = &mut self.song_edit {
+            edit.paste(text);
+            return;
+        }
         if let Some(import) = &mut self.import {
             import.paste(text);
             return;
@@ -723,6 +987,9 @@ impl LibraryPage {
         self.typing = None;
         if let Some(import) = &mut self.import {
             import.stop_typing();
+        }
+        if let Some(edit) = &mut self.song_edit {
+            edit.stop_typing();
         }
     }
 
@@ -1033,13 +1300,21 @@ impl LibraryPage {
             searching: self.typing == Some(Field::Search),
             notice: self.notice.clone(),
             warning: self.warning.clone(),
-            importing: self.probing.as_ref().map(|(_, source)| {
-                let name = source.file_name().map_or_else(
-                    || source.display().to_string(),
-                    |name| name.to_string_lossy().into_owned(),
-                );
-                format!("Reading {name}…")
-            }),
+            importing: self
+                .probing
+                .as_ref()
+                .map(|(_, source)| {
+                    let name = source.file_name().map_or_else(
+                        || source.display().to_string(),
+                        |name| name.to_string_lossy().into_owned(),
+                    );
+                    format!("Reading {name}…")
+                })
+                .or_else(|| {
+                    self.opening
+                        .as_ref()
+                        .map(|(_, title)| format!("Opening {title}…"))
+                }),
         }
     }
 
@@ -1540,6 +1815,7 @@ pub struct LibraryView {
     /// setlist saved without its place in the stored order.
     pub warning: Option<String>,
     /// What the import is reading, such as "Reading First Light…", while
-    /// it reads.
+    /// it reads; or the song the edit link opens, such as "Opening First
+    /// Light…".
     pub importing: Option<String>,
 }

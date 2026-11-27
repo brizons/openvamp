@@ -7,6 +7,11 @@
 //! plays: quitting cancels the save, and the app ends only once the save
 //! has stopped and removed what it wrote
 //! ([`crate::library_page::LibraryPage::stop_save`]).
+//!
+//! Leaving the Song editor of a library song with edits not saved (S4)
+//! asks first as well, whichever way it is left ([`Leaving`]): Discard or
+//! the Library link, opening another library, quitting, or closing the
+//! window.
 
 use app::TransportState;
 
@@ -86,8 +91,8 @@ pub struct Answer {
     /// Its label.
     pub label: &'static str,
     /// Whether it keeps the show going (the song playing, the save
-    /// running); it is then the dialog's cancel answer, the one Escape
-    /// picks.
+    /// running, the edits open); it is then the dialog's cancel answer, the
+    /// one Escape picks.
     pub keeps_playing: bool,
 }
 
@@ -159,6 +164,49 @@ impl Ending {
                 }
                 Self::CloseWindow => {
                     "Close the window and quit anyway? The save is cancelled and nothing of the song is kept; a song that plays stops."
+                }
+            },
+            answers: match dialog {
+                Dialog::Mac | Dialog::InWindow => [end, keep],
+                Dialog::Windows => [keep, end],
+            },
+        }
+    }
+}
+
+/// What leaves the Song editor of a library song while its edits are not
+/// saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leaving {
+    /// Discard, or the Library link: back to the Library.
+    Discard,
+    /// Another library folder opening on the Library screen.
+    OpenLibrary,
+    /// Quitting the app, or closing its window.
+    End(Ending),
+}
+
+impl Leaving {
+    /// The question to ask in `dialog` before the edits are dropped: the
+    /// answers go in the same order as [`Ending::question`]'s, so neither
+    /// Space nor Escape drops them.
+    pub fn question(self, dialog: Dialog) -> Question {
+        let end = Answer {
+            label: "Discard changes",
+            keeps_playing: false,
+        };
+        let keep = Answer {
+            label: "Keep editing",
+            keeps_playing: true,
+        };
+        Question {
+            message: "The song has edits that are not saved",
+            detail: match self {
+                Self::Discard => "Discard them and go back to the Library?",
+                Self::OpenLibrary => "Opening another library discards them.",
+                Self::End(Ending::Quit) => "Quitting discards them; a song that plays stops.",
+                Self::End(Ending::CloseWindow) => {
+                    "Closing the window discards them and quits; a song that plays stops."
                 }
             },
             answers: match dialog {
