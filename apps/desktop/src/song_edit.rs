@@ -18,11 +18,21 @@
 //! [`library::Library::save_song`]); an arrangement deleted also leaves
 //! the song's `mix.json`. Leaving with edits not saved asks first
 //! ([`crate::ending::Leaving`]).
+//!
+//! A setlist item that plays part of an arrangement (a start or end
+//! position, F5.3) keeps playing the same audio: the save moves its
+//! positions to where the editor's [`domain::PositionMap`] says that audio
+//! plays now (a new marker or a reorder moves them). When positions it
+//! played were removed or play in another order, the save asks first
+//! ([`crate::ending::SaveQuestion`]), and "Save anyway" has the item play
+//! the whole arrangement. Deleting an arrangement a setlist plays is
+//! refused, as is deleting one while a setlist cannot be read.
 
 mod jobs;
 mod view;
 
-use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use domain::{
     BarMaps, DEFAULT_ARRANGEMENT_ID, SectionType, Snap, SongEditError, SongEditor, SongPackage,
@@ -32,12 +42,15 @@ use library::Library;
 use crate::line_edit::{LineEdit, LineKey, LineOutcome};
 use crate::reorder::{Half, drop_index, drop_slot};
 use crate::song_header::{HeaderFields, HeaderValues};
-use crate::song_import::{ImportAction, SongField, full_stop, next_ticket, sentence};
+use crate::song_import::{
+    Finish, ImportAction, STOP_PATIENCE, SongField, Stage, full_stop, next_ticket, sentence,
+};
 use crate::song_sections::{BarScale, MIN_VISIBLE_BARS, Window};
 
 pub(crate) use jobs::SongSource;
 pub(crate) use jobs::WaveformRun;
 pub use jobs::{OpenSongJob, OpenedSong, SaveSongJob, SongSaved, Waved, WaveformJob};
+use jobs::{SetlistFix, SetlistUses};
 use jobs::{Waveform, package_problems};
 pub use view::stems_summary;
 
@@ -122,8 +135,27 @@ pub(crate) enum EditOutcome {
     Close,
     /// Leaving would lose edits: ask first.
     Ask,
+    /// Saving would move setlists off what they played: ask first
+    /// ([`SongEdit::save_question`]).
+    AskSave,
     /// This save is to run off the UI thread.
     Save(Box<SaveSongJob>),
+}
+
+/// A save under way, which cannot be cancelled once it writes.
+#[derive(Debug)]
+struct SongSaving {
+    ticket: u64,
+    stage: Arc<Stage>,
+}
+
+impl Drop for SongSaving {
+    /// An editor let go of while its song is written (another library
+    /// opened, the window gone) waits, at most [`STOP_PATIENCE`], until the
+    /// write is over, as an import's save does.
+    fn drop(&mut self) {
+        self.stage.wait(Instant::now() + STOP_PATIENCE);
+    }
 }
 
 /// A local field of the editor that the keys type into.
@@ -168,13 +200,14 @@ pub struct SongEdit {
     /// The text of the local field typed into, as it was when typing
     /// started: Escape puts it back.
     before: String,
-    in_use: BTreeMap<String, Vec<String>>,
+    /// What the library's setlists play of the song, as it was opened.
+    uses: SetlistUses,
     /// The last refusal or failed save, until the next edit that applies.
     note: Option<String>,
     waveform: Waveform,
     pending_waveform: Option<WaveformJob>,
-    /// The ticket of the save under way.
-    saving: Option<u64>,
+    /// The save under way.
+    saving: Option<SongSaving>,
 }
 
 impl SongEdit {
@@ -184,7 +217,7 @@ impl SongEdit {
         let SongSource {
             package,
             length,
-            in_use,
+            uses,
         } = source;
         let editor =
             SongEditor::new(package.clone(), length).map_err(|errors| package_problems(&errors))?;
@@ -242,7 +275,7 @@ impl SongEdit {
             rename: LineEdit::default(),
             typing: None,
             before: String::new(),
-            in_use,
+            uses,
             note: None,
             waveform: Waveform::Reading(run),
             pending_waveform: Some(job),
@@ -291,9 +324,18 @@ impl SongEdit {
         self.package() != self.original
     }
 
-    /// Whether a save is under way.
+    /// The ticket of the save under way, if any.
     pub(crate) fn saving(&self) -> Option<u64> {
+        self.saving.as_ref().map(|saving| saving.ticket)
+    }
+
+    /// Waits at most `patience` until the save under way, if any, is done;
+    /// whether none is under way any more. A save cannot be cancelled: a
+    /// quit waits for it ([`crate::library_page::LibraryPage::stop_save`]).
+    pub(crate) fn wait_for_save(&self, patience: Duration) -> bool {
         self.saving
+            .as_ref()
+            .is_none_or(|saving| saving.stage.wait_done(Instant::now() + patience))
     }
 
     /// Whether the keys type into a field.
@@ -353,17 +395,17 @@ impl SongEdit {
             }
             ImportAction::ClosePartMenu => {}
             ImportAction::SetPart(index, part) => {
-                if index < self.editor.package().stems.len() {
-                    self.rebuild(|package| {
-                        let stem = &mut package.stems[index];
-                        stem.part = part.id().to_owned();
-                        stem.role = part.role();
-                    });
+                if let Some(id) = self.editor.package().stems.get(index).map(|s| s.id.clone()) {
+                    let set = self.editor.set_stem_part(&id, part.id(), part.role());
+                    self.applied(set);
                 }
             }
             ImportAction::ShowAllStems => self.all_stems = true,
             ImportAction::Save => {
                 if self.problems().is_empty() {
+                    if self.setlist_fixes().iter().any(|fix| fix.lost) {
+                        return EditOutcome::AskSave;
+                    }
                     return EditOutcome::Save(Box::new(self.start_save(library)));
                 }
             }
@@ -608,6 +650,45 @@ impl SongEdit {
         self.chip_insertion.take().is_some()
     }
 
+    /// What the question before a save that moves setlists off what they
+    /// played says of each one ([`crate::ending::SaveQuestion::detail`]);
+    /// `None` when the save moves none.
+    pub(crate) fn save_question(&self) -> Option<String> {
+        let lines: Vec<String> = self
+            .setlist_fixes()
+            .iter()
+            .filter(|fix| fix.lost)
+            .map(|fix| {
+                let first = fix.from.0.unwrap_or(0) + 1;
+                let last = match fix.from.1 {
+                    Some(end) => end + 1,
+                    None => self
+                        .original
+                        .arrangements
+                        .iter()
+                        .find(|a| a.id == fix.arrangement)
+                        .map_or(first, |a| a.sections.len()),
+                };
+                let positions = if first == last {
+                    format!("position {first}")
+                } else {
+                    format!("positions {first} to {last}")
+                };
+                format!(
+                    "\"{}\" plays {positions} of {}, which this edit removes or plays in another order: it will play all of {}.",
+                    fix.name, fix.arrangement_name, fix.arrangement_name
+                )
+            })
+            .collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    /// "Save anyway", the answer to [`Self::save_question`]: the save,
+    /// with the setlists it asked about playing their whole arrangements.
+    pub(crate) fn save_anyway(&mut self, library: &Library) -> Option<SaveSongJob> {
+        (self.saving.is_none() && self.problems().is_empty()).then(|| self.start_save(library))
+    }
+
     /// The save failed with `message`: the editor stays with the reason.
     pub(crate) fn save_failed(&mut self, message: String) {
         self.saving = None;
@@ -674,15 +755,24 @@ impl SongEdit {
 
     fn delete_arrangement(&mut self) {
         let id = self.arrangement.clone();
-        if id != DEFAULT_ARRANGEMENT_ID
-            && let Some(names) = self.in_use.get(&id).filter(|names| !names.is_empty())
-            && self.original.arrangements.iter().any(|a| a.id == id)
-        {
+        // An arrangement made since the editor opened is in no setlist.
+        if id != DEFAULT_ARRANGEMENT_ID && self.original.arrangements.iter().any(|a| a.id == id) {
             let name = self
                 .shown_arrangement()
                 .map_or(id.clone(), |a| a.name.clone());
-            self.note = Some(in_use_note(&name, names));
-            return;
+            let names = self.uses.playing(&id);
+            if !names.is_empty() {
+                self.note = Some(in_use_note(&name, &names));
+                return;
+            }
+            // What a setlist that cannot be read plays is not known: the
+            // delete is refused rather than guessed.
+            if let Some(unread) = self.uses.unread.first() {
+                self.note = Some(format!(
+                    "\"{name}\" cannot be deleted: {unread} could not be read, so whether a setlist plays it is not known."
+                ));
+                return;
+            }
         }
         let deleted = self.editor.delete_arrangement(&id);
         if self.applied(deleted).is_some() {
@@ -706,21 +796,6 @@ impl SongEdit {
         }
     }
 
-    /// Edits the package outside the markers and arrangements (the maps, a
-    /// stem's part), checking it again; a package that breaks a rule is
-    /// refused with the note, and the edit stays as it was.
-    fn rebuild(&mut self, change: impl FnOnce(&mut SongPackage)) {
-        let mut package = self.editor.package().clone();
-        change(&mut package);
-        match SongEditor::new(package, self.editor.length_frames()) {
-            Ok(editor) => {
-                self.editor = editor;
-                self.note = None;
-            }
-            Err(errors) => self.note = Some(package_problems(&errors)),
-        }
-    }
-
     /// Puts what the header's fields read into the edit: the title and key
     /// as they are, the tempo and meter as maps when they make some.
     fn sync_header(&mut self) {
@@ -740,10 +815,8 @@ impl SongEdit {
                 if tempo_map != package.tempo_map
                     || time_signature_map != package.time_signature_map
                 {
-                    self.rebuild(|package| {
-                        package.tempo_map = tempo_map;
-                        package.time_signature_map = time_signature_map;
-                    });
+                    let set = self.editor.set_maps(tempo_map, time_signature_map);
+                    self.applied(set);
                     self.clamp_window();
                 }
             }
@@ -865,9 +938,71 @@ impl SongEdit {
         BarScale::of(&self.editor).frames(self.window().units_at(along))
     }
 
+    /// The setlist items the save moves: each item of a setlist that plays
+    /// part of an arrangement the edit changed (a start or end position),
+    /// to the positions that play the same audio now, or to the whole
+    /// arrangement when some of it was removed or plays in another order.
+    /// Positions that were already outside the arrangement are left alone.
+    fn setlist_fixes(&self) -> Vec<SetlistFix> {
+        let mut fixes: Vec<SetlistFix> = Vec::new();
+        for setlist in &self.uses.setlists {
+            for item in &setlist.items {
+                if item.start.is_none() && item.end.is_none() {
+                    continue;
+                }
+                let Some(map) = self.editor.position_map(&item.arrangement) else {
+                    continue;
+                };
+                let Some(last_original) = map.original_len().checked_sub(1) else {
+                    continue;
+                };
+                let (first, last) = (item.start.unwrap_or(0), item.end.unwrap_or(last_original));
+                if map.is_identity() || first > last || last > last_original {
+                    continue;
+                }
+                let (to, lost) = match map.range(first, last) {
+                    // A bound at the arrangement's edge is stored as none.
+                    Some(run) => (
+                        (
+                            (*run.start() > 0).then_some(*run.start()),
+                            (*run.end() + 1 < map.len()).then_some(*run.end()),
+                        ),
+                        false,
+                    ),
+                    None => ((None, None), true),
+                };
+                let from = (item.start, item.end);
+                let fix = SetlistFix {
+                    file: setlist.file.clone(),
+                    name: setlist.name.clone(),
+                    arrangement: item.arrangement.clone(),
+                    arrangement_name: self
+                        .editor
+                        .package()
+                        .arrangements
+                        .iter()
+                        .find(|a| a.id == item.arrangement)
+                        .map_or_else(|| item.arrangement.clone(), |a| a.name.clone()),
+                    from,
+                    to,
+                    lost,
+                };
+                if to != from && !fixes.contains(&fix) {
+                    fixes.push(fix);
+                }
+            }
+        }
+        fixes
+    }
+
     fn start_save(&mut self, library: &Library) -> SaveSongJob {
         let ticket = next_ticket();
-        self.saving = Some(ticket);
+        let stage = Arc::new(Stage::default());
+        self.saving = Some(SongSaving {
+            ticket,
+            stage: Arc::clone(&stage),
+        });
+        let fixes = self.setlist_fixes();
         let package = self.package();
         let deleted = self
             .original
@@ -883,6 +1018,8 @@ impl SongEdit {
             package,
             length: self.editor.length_frames(),
             deleted,
+            fixes,
+            finish: Finish(stage),
         }
     }
 

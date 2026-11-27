@@ -47,6 +47,7 @@ Requirements quote `docs/mvp-spec.md` (F2) and the user verbatim. Items marked *
   - the Stems panel, where each stem's part can be changed.
 - **Assumption:** "Save song" validates the package and rewrites `song.json` atomically. Discard drops the edits. Positions stay sample offsets, so a tempo edit keeps every marker on the same audio.
 - **Assumption:** a song saved while it is open on Perform keeps playing as it was loaded, and the edits apply the next time it opens.
+- User (L11): "Ajustar solos". On save, setlist items that play part of an edited arrangement (F5.3 start and end positions) are remapped, so they keep playing the same audio. If a range can no longer be kept (a position it used was removed, or it is no longer contiguous), the save asks first and names the setlist. "Save anyway" clears that item's range, and "Keep editing" cancels. A setlist open in the Library is read again after the save, and quitting waits for a song save in flight.
 - **Assumption:** the import editor stays as it is (one Intro section). Its sections are edited after the save, from the song's edit link.
 
 ### S5 — Perform song map
@@ -61,9 +62,9 @@ Requirements quote `docs/mvp-spec.md` (F2) and the user verbatim. Items marked *
 |----|-------|-------|--------|---------|
 | T1 | S1, S2 (domain) | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L3; verified L4; review approved L6) | 57965f1 |
 | T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | done (L5; verified L7; review approved L8) | d35205d |
-| T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | done (L9); split, verifier and screenshot check pending | |
-| T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | done (L10); verifier and screenshot check pending | see L10 |
-| T5 | S6 | inline, with each task's own docs | pending | |
+| T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | done (L9; split L10; reviews approved L12; B1 fixed L13, rechecked L14, review with correction approved L16–L17) | 0d0975e, 19e1a0f, dc274d7, c43d0d0, aa4ff27 |
+| T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | done (L10; verified L15; review approved L16) | 0010532 |
+| T5 | S6 | inline, with each task's own docs | done (L17) | see L17 |
 
 Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and T3 drives background jobs (item 4), so each gets an independent verifier.
 
@@ -218,4 +219,143 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
   **Still open:** a failed read is not retried while its song shows; a Perform read and an editor build can run at once (safe, since both write atomically).
 
   Risk: item 4 (background jobs tied to the transport), so T4 gets an independent verifier.
+- **L11** (2026-11-27): the T3 verifier found one blocker; everything else passed.
+  - **What passes:**
+    - 2,400 random editor steps matched `domain::SongEditor`, with the refusal notes word for word;
+    - the waveform heights are right by hand, and placeholders, redraw without rebuild and cancel on close all work;
+    - save, leaving and the unsaved question, `mix.json` cleanup, unknown fields and the read-only error work;
+    - header maps round-trip;
+    - the import editor is byte-identical at baseline and candidate (400 drafts, 12 × 150 controls);
+    - stale results are ignored;
+    - `cargo test -p openvamp` passes 325 and `-p domain` 203.
+  - **B1:** setlist items address arrangement positions by index, so a split, a removed chip or a reorder silently changes what a setlist with start and end positions (F5.3) plays, or makes it invalid. An open setlist editor is not refreshed.
+  - **Advisories:**
+    - quit does not wait for a library song save in flight;
+    - a stale note after a bad number;
+    - the import notice is hidden behind the editor;
+    - "Mix.json" is capitalized in a warning;
+    - setlists that cannot be read are left out of the in-use check.
+  - **User decision (verbatim):** "Ajustar solos". The option chosen: "Al guardar, el setlist se corrige para que siga tocando el mismo audio: un marcador nuevo o un reordenamiento mueven sus límites. Si un bloque que usa el setlist desaparece, se pregunta antes de guardar y se nombra el setlist."
+  - **S4 assumption added:**
+    - On save, setlist ranges that use an edited arrangement are remapped to the same audio.
+    - When a range can no longer be kept, the save asks first, naming the setlist. "Save anyway" clears that item's range, and "Keep editing" cancels.
+    - A setlist open in the Library is refreshed.
+    - Quit waits for a song save in flight.
+  - **Correction:** the T3 writer was resumed for the fix, which lands after T4.
+- **L12** (2026-11-27): the three T3 reviews were granted by the user ("Revisar este cambio" for each). All approved and were acknowledged:
+  - 7a28f89..0d0975e
+  - 0d0975e..19e1a0f
+  - 19e1a0f..dc274d7
+
+  **Sent to the T3 writer** with the B1 correction:
+  - the in-use setlist guard fails open on unreadable setlists;
+  - a quit while another prompt shows skips the unsaved question;
+  - the "Delete marker" tooltip names the wrong reason;
+  - the `ICONS` list is incomplete.
+
+  **Kept as follow-ups:**
+  - doc links to `song_edit` from the first commit (they resolve at the series end);
+  - the header ↔ import two-way module dependency;
+  - `import_moved` naming;
+  - `saving` returning a ticket;
+  - the `start_rename` probe on Default;
+  - the bar-thousandths constant;
+  - a dead match arm;
+  - `maps_locked` only dimming;
+  - duplicated small builders;
+  - a few untested branches.
+
+  The quit-during-song-save warning is already part of the B1 correction batch.
+- **L13** (2026-11-27): the T3 B1 correction landed, with the four review fixes.
+  - **Domain:** `SongEditor` tracks a `PositionMap` per arrangement. A split keeps both parts with their parent, inserts belong to no original, and removes, moves and deletes are tracked. `set_maps` and `set_stem_part` keep the history across header and part edits, and `UnknownStem` is new.
+  - **Remap:**
+    - On save, ranges that still play the same audio in one run are moved silently.
+    - Otherwise the save asks first: "This save changes setlists that play part of the song", with `"Gig" plays positions 3 to 4 of Live, which this edit removes or plays in another order: it will play all of Live.`
+    - "Save anyway" clears the item's range and leaves a warning, and "Keep editing" writes nothing.
+    - Setlists are written through `SetlistEditor::apply(Edit::StartEnd)`, matching items by song, arrangement and old range. A write failure gives a warning, and the song stays saved.
+  - **Refresh:** the setlist list and the open setlist editor are read again after a save.
+  - **Quit waits** for a song save in flight (10 s when asked from the app, 5 s from the Dock or a logout, 5 s when opening another library).
+  - **Review fixes:**
+    - the arrangement delete fails closed on unreadable setlists;
+    - `end_show` waits for an open question and then asks about unsaved edits;
+    - `delete_hint` gives the real reason;
+    - `ICONS` lists all 18 icons.
+  - **Writer's decisions, kept:**
+    - a moved marker keeps its positions, so neighbouring ranges follow the new boundary;
+    - a deleted marker counts as removed positions and asks;
+    - unreadable setlists get no fix at save time.
+  - **Checks:**
+    - RED: the new tests failed to compile first, and 12 deliberate mutations were caught.
+    - GREEN: `cargo test -p openvamp` passes 349 and `-p domain` 211; fmt and clippy are clean. The parent re-ran `--test song_edit_setlists` (11).
+  - **Size:** 1,749 changed lines.
+  - Risk: item 1 (rewrites setlists and `song.json`), item 3 (`SongEditor` API added) and item 4 (quit waits), so the T3 verifier rechecks B1.
+- **L14** (2026-11-27): the T3 verifier's limited recheck on c43d0d0 confirmed B1 fixed, (a)–(f) all passing.
+  - **(a) Split:** before the range, Gig moves 2–3 → 3–4 on the same frames with no question; inside the range, it becomes 3–6.
+  - **(b) Removed chip:** the save asks once, naming Gig. "Keep editing" leaves every file byte-identical; "Save anyway" leaves Gig valid, playing the whole arrangement, with a warning.
+  - **(c) Reorders:** outside the range they shift silently; inside it they ask.
+  - **(d) Open setlist editor:** it is refreshed with no problems.
+  - **(e) One session:** tempo, part and split edits in one session still remap.
+  - **(f) Unreadable setlist:** the delete is refused, naming the file.
+  - **Suite:** `cargo test -p openvamp -p domain` passes 349 and 211.
+  - **Advisories (follow-ups):**
+    - an open-ended range ("to the end") becomes an explicit end when remapped, so a section appended later is not included;
+    - a split saves with no warning when a setlist file cannot be read;
+    - deleting a marker inside a range asks, though the merged section plays the same frames.
+- **L15** (2026-11-27): the T4 verifier found no blockers.
+  - **Bars:** each position covers its own source range, a repeated section gives identical heights, heights match the hand formula within 2e-3 and stay inside 18–96 %, a mid-bar start cuts its bar, and opacity is right at more than 500 bars and seams.
+  - **Live safety:**
+    - no build starts in any playing state, and no `waveforms/` folder is created;
+    - play cancels a build without leaving a cache;
+    - builds resume after stop or pause;
+    - a cache shows while playing, without decoding: garbage stems of the same size and modified time still show it.
+  - **Stale results:** they are ignored, and a click-only tile clears the waveform.
+  - **No change elsewhere:** the `PerformView` dump is identical at baseline and candidate apart from the new `wave` field.
+  - **Suite:** `cargo test -p openvamp` passes 338.
+  - **Advisories (follow-ups):**
+    - a build that finished just before play has its result dropped, so the cache is not shown during that play and is rebuilt at the next stop (fix: on an ignored `Ok`, go back to reading the cache);
+    - `StemRow.file`'s doc is stale.
+  - **Final reviews:** the user granted both final review slices: T4 (dc274d7..0010532) and the setlist fix (0010532..c43d0d0).
+- **L16** (2026-11-27): the T4 review (dc274d7..0010532) approved and was acknowledged. Warnings, kept as follow-ups:
+  - after a pause with no cache, a build can still read the drive for one tick after play resumes;
+  - a failed read is never retried while its song shows (×2);
+  - a build that finishes just before play is dropped (×1);
+  - the stems panel now shows bare file names, so two stems with the same name in different folders look alike.
+
+  The setlist-fix review (0010532..c43d0d0, lineage review-678073cd8a620ef2) returned `correction_required` with one CRITICAL finding, reported by three lenses: `write_fixes` re-matched items after each fix, so an item one fix moved could match a later fix and move twice. Two items at Live positions 2 and 3 both ended at (4,4).
+  - **Correction:** made in the review worktree as de8a3e8 (91 changed lines; planned 80, budget 200). Every item is matched against the setlist as it was read before any edit, and each file is opened once (`dedup` only removed adjacent duplicates).
+  - **Checks:**
+    - RED: the new `each_setlist_item_moves_once_even_when_another_lands_on_its_old_positions` failed with `[(4,4),(4,4)]`.
+    - GREEN: `cargo test -p openvamp` passes 350; fmt and clippy are clean.
+  - The native targeted validator is running.
+- **L17** (2026-11-27): the setlist-fix review (lineage review-678073cd8a620ef2) closed.
+  - **Validation:** the native targeted validator approved the correction de8a3e8, and the review was acknowledged. The parent cherry-picked it into the branch as aa4ff27, with identical content.
+  - **Follow-ups from that review:**
+    - a quit, close or log-out during the "Save anyway / Keep editing" question is dropped, so the user must quit again;
+    - `Saving` drop and `stop_save` block the UI thread, and two waits can add up;
+    - the unreadable-setlists note is awkward when the folder itself cannot be listed.
+  - **T5 docs:**
+    - `docs/mvp-spec.md` marks both F2 acceptance items.
+    - `docs/architecture.md` (Decision 6) describes `waveforms/overview.bin`, its fingerprints, the rebuild rules (the editor in the background, Perform only while stopped or paused) and the atomic song save.
+    - `README.md` lists the Song editor's sections and arrangements and the Perform waveform, and "Not built yet" drops F2.
+    - The desktop README came with T3 and T4.
+- **L18** (2026-11-27): the feature is closed.
+  - **Seam check:** `cargo test --workspace` passed 1,068, failed 0, ignored 9.
+  - **Branch:** 20 commits on main d9e25b1, about 13,750 changed lines.
+  - **Reviews:** every slice was reviewed and approved:
+    - T1: 2827125..57965f1
+    - T2: 57965f1..d35205d
+    - T3: 7a28f89..0d0975e, 0d0975e..19e1a0f, 19e1a0f..dc274d7
+    - T4: dc274d7..0010532
+    - setlist fix: 0010532..c43d0d0, with its correction
+  - **Delivery:** stacked PRs to `main`, one per review slice. Push and PRs are the user's call.
+  - **Follow-ups**, collected from the logs:
+    - **Domain:** split looped sections, the `SectionType::ALL` sync, open-ended ranges becoming explicit;
+    - **Waveform cache:** coarse mtimes, silent write failures, an unbounded `song.json` read in `load_overview`;
+    - **Perform:** a failed read is not retried, a build finished just before play is dropped;
+    - **Editor:**
+      - a quit during the save question is dropped;
+      - UI-thread waits on library switch;
+      - a stale note after a bad number;
+      - the import notice hidden behind the editor;
+    - **Save:** a 0600 `song.json` becomes 0644.
 

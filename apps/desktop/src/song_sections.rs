@@ -351,8 +351,11 @@ pub struct InspectorView {
     pub infinite_loop: bool,
     /// The line under the loop switch.
     pub loop_hint: String,
-    /// Whether its marker can be deleted: every one but the first.
+    /// Whether its marker can be deleted: not the first, nor one whose
+    /// section is all an arrangement plays.
     pub can_delete: bool,
+    /// Why it cannot, when it cannot.
+    pub delete_hint: Option<String>,
 }
 
 /// A tab of the "Arrangement" panel.

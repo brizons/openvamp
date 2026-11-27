@@ -162,6 +162,8 @@ Render transposed and time-stretched stems **offline**, into a cache keyed by ke
 
 Songs use the [open song package](mvp-spec.md#song-package-format-v1). Stems are WAV or FLAC. An import copies WAV and FLAC files as they are and transcodes MP3 and M4A to 24-bit FLAC, so the disk thread can seek to any sample exactly; the extra storage was accepted on 2026-11-26. FLAC is read through `symphonia`, which is given only STREAMINFO and the audio frames (it mishandles seek tables in cut or forged files), and FLAC deeper than 24 bits is refused because `symphonia` 0.6.1 decodes it wrongly.
 
+The song folder's `waveforms/overview.bin` caches a peak overview of the track stems mixed at unity, about 100 values per second, keyed by each stem's name, role, size and modified time. It is safe to delete: the Song editor rebuilds it in the background, and Perform rebuilds it only while the transport is stopped or paused, so it never competes with playback for the drive. Saving an edited song rewrites `song.json` atomically and keeps fields this version does not know.
+
 Mixing and routing add three JSON files, each with its own `formatVersion` (1); `domain` documents the formats and `library` reads and writes them:
 
 | File | Where | Holds | Format docs |

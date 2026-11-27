@@ -22,9 +22,18 @@
 //! Of the arrangements: the Default arrangement cannot be renamed or
 //! deleted, every arrangement keeps at least one section, and a section is
 //! an infinite loop only in an arrangement that plays it.
+//!
+//! The editor remembers where each position of each arrangement, as it was
+//! opened, went through every edit ([`SongEditor::position_map`]), so a
+//! setlist that plays part of an arrangement (F5.3) can be moved to the
+//! positions that play the same audio: a split keeps both parts of a
+//! position, a moved position keeps its audio, and a removed one (a deleted
+//! marker's, or one taken out of the arrangement) plays nowhere. A moved
+//! marker changes what its sections play, not which positions play them.
 
+use std::collections::BTreeMap;
 use std::fmt;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 
 use thiserror::Error;
 
@@ -32,7 +41,7 @@ use crate::grid::{BarBeat, BeatGrid};
 use crate::import::{slug_or, unique_id};
 use crate::package::{
     Arrangement, DEFAULT_ARRANGEMENT_ID, SectionMarker, SectionType, SongPackage, StemInfo,
-    ValidationError, validate,
+    StemRole, TempoPoint, TimeSignaturePoint, ValidationError, validate,
 };
 
 /// Which lines a placed or moved marker snaps to.
@@ -54,8 +63,104 @@ pub struct SongEditor {
     /// Every stem `length_frames` long at the package rate, so
     /// [`crate::validate`] checks edits against the song length.
     infos: Vec<StemInfo>,
-    /// The edits keep the maps, so the grid stays the song's.
+    /// The grid of the song's maps, built again when they change.
     grid: BeatGrid,
+    /// Per arrangement id, where its positions came from.
+    origins: BTreeMap<String, Origins>,
+}
+
+/// Where an arrangement's positions came from: the original position each
+/// one plays the audio of (a split's new position has its parent's), or
+/// `None` for one added since the editor opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Origins {
+    /// How many positions the arrangement had when the editor opened; 0 for
+    /// one made since.
+    original: usize,
+    /// One per current position.
+    now: Vec<Option<usize>>,
+}
+
+/// Where an arrangement's positions, as the editor opened them, play now
+/// ([`SongEditor::position_map`]). Positions are counted from 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionMap {
+    /// Per original position, the current positions that play its audio.
+    moved: Vec<Vec<usize>>,
+    /// How many positions the arrangement has now.
+    len: usize,
+}
+
+impl PositionMap {
+    fn of(origins: &Origins) -> Self {
+        let mut moved = vec![Vec::new(); origins.original];
+        for (index, origin) in origins.now.iter().enumerate() {
+            if let Some(slot) = origin.and_then(|origin| moved.get_mut(origin)) {
+                slot.push(index);
+            }
+        }
+        Self {
+            moved,
+            len: origins.now.len(),
+        }
+    }
+
+    /// How many positions the arrangement had when the editor opened.
+    pub fn original_len(&self) -> usize {
+        self.moved.len()
+    }
+
+    /// How many positions it has now.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether it has no positions now.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The current positions that play original position `original`, in
+    /// order: one, two or more when markers split its section, none when it
+    /// was removed (or there was no such position).
+    pub fn positions(&self, original: usize) -> &[usize] {
+        self.moved.get(original).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether every position plays where it did and nothing was added.
+    pub fn is_identity(&self) -> bool {
+        self.len == self.moved.len()
+            && self
+                .moved
+                .iter()
+                .enumerate()
+                .all(|(index, now)| now.as_slice() == [index])
+    }
+
+    /// The current positions that play what original positions `first`
+    /// to `last` (inclusive) played, in the same order and nothing else: one
+    /// run with no gap, every original position still played. `None` when
+    /// one of them was removed, when they no longer play in that order or
+    /// side by side, or when the range is empty or past the end.
+    pub fn range(&self, first: usize, last: usize) -> Option<RangeInclusive<usize>> {
+        if first > last || last >= self.moved.len() {
+            return None;
+        }
+        let mut run = self.moved[first..=last].iter().flatten().copied();
+        let start = run.next()?;
+        let mut end = start;
+        for index in run {
+            if index != end + 1 {
+                return None;
+            }
+            end = index;
+        }
+        // Every original position plays somewhere in the run.
+        self.moved[first..=last]
+            .iter()
+            .all(|now| !now.is_empty())
+            .then_some(start..=end)
+    }
 }
 
 /// What an arrangement plays, as the arrangement panel sums it up.
@@ -185,6 +290,12 @@ pub enum SongEditError {
         /// Its name.
         name: String,
     },
+    /// No stem has this id.
+    #[error("there is no stem \"{id}\"")]
+    UnknownStem {
+        /// The id asked for.
+        id: String,
+    },
     /// The Default arrangement always exists under its name (F2.3).
     #[error("the Default arrangement cannot be renamed or deleted")]
     DefaultArrangementFixed,
@@ -266,12 +377,68 @@ impl SongEditor {
             .collect();
         let validated = validate(&package, &infos)?;
         let grid = BeatGrid::new(&validated.song);
+        let origins = package
+            .arrangements
+            .iter()
+            .map(|arrangement| {
+                let len = arrangement.sections.len();
+                let origins = Origins {
+                    original: len,
+                    now: (0..len).map(Some).collect(),
+                };
+                (arrangement.id.clone(), origins)
+            })
+            .collect();
         Ok(Self {
             package,
             length_frames,
             infos,
             grid,
+            origins,
         })
+    }
+
+    /// Where the positions arrangement `id` had when the editor opened play
+    /// now (see the [module docs](self)); `None` when it has no such
+    /// arrangement now. One made since has no original positions.
+    pub fn position_map(&self, id: &str) -> Option<PositionMap> {
+        self.arrangement(id)?;
+        self.origins.get(id).map(PositionMap::of)
+    }
+
+    /// Gives the song new tempo and time-signature maps; the grid follows
+    /// and every marker stays on its sample.
+    pub fn set_maps(
+        &mut self,
+        tempo_map: Vec<TempoPoint>,
+        time_signature_map: Vec<TimeSignaturePoint>,
+    ) -> Result<(), SongEditError> {
+        let mut candidate = self.package.clone();
+        candidate.tempo_map = tempo_map;
+        candidate.time_signature_map = time_signature_map;
+        let validated = validate(&candidate, &self.infos).map_err(SongEditError::Package)?;
+        self.grid = BeatGrid::new(&validated.song);
+        self.package = candidate;
+        Ok(())
+    }
+
+    /// Gives stem `id` the part `part`, with its `role`.
+    pub fn set_stem_part(
+        &mut self,
+        id: &str,
+        part: &str,
+        role: StemRole,
+    ) -> Result<(), SongEditError> {
+        let index = self
+            .package
+            .stems
+            .iter()
+            .position(|stem| stem.id == id)
+            .ok_or_else(|| SongEditError::UnknownStem { id: id.to_owned() })?;
+        let mut candidate = self.package.clone();
+        candidate.stems[index].part = part.to_owned();
+        candidate.stems[index].role = role;
+        self.commit(candidate)
     }
 
     /// The package as edited so far.
@@ -374,19 +541,30 @@ impl SongEditor {
         };
 
         let mut candidate = self.package.clone();
+        let mut origins = self.origins.clone();
         candidate.sections.insert(split + 1, marker);
         for arrangement in &mut candidate.arrangements {
+            let tracked = origins.get_mut(&arrangement.id);
+            let old = tracked.as_ref().map(|t| t.now.clone()).unwrap_or_default();
             let mut sections = Vec::with_capacity(arrangement.sections.len() + 1);
-            for section in arrangement.sections.drain(..) {
+            let mut now = Vec::with_capacity(old.len() + 1);
+            for (index, section) in arrangement.sections.drain(..).enumerate() {
+                let origin = old.get(index).copied().flatten();
                 let splits = section == split_id;
                 sections.push(section);
+                now.push(origin);
                 if splits {
+                    // The new part plays the rest of its parent's audio.
                     sections.push(id.clone());
+                    now.push(origin);
                 }
             }
             arrangement.sections = sections;
+            if let Some(tracked) = tracked {
+                tracked.now = now;
+            }
         }
-        self.commit(candidate)?;
+        self.commit_tracked(candidate, origins)?;
         Ok(id)
     }
 
@@ -465,12 +643,17 @@ impl SongEditor {
             });
         }
         let mut candidate = self.package.clone();
+        let mut origins = self.origins.clone();
         candidate.sections.remove(index);
         for arrangement in &mut candidate.arrangements {
+            if let Some(tracked) = origins.get_mut(&arrangement.id) {
+                let mut kept = arrangement.sections.iter().map(|section| section != id);
+                tracked.now.retain(|_| kept.next().unwrap_or(true));
+            }
             arrangement.sections.retain(|section| section != id);
             arrangement.infinite_loop.retain(|section| section != id);
         }
-        self.commit(candidate)
+        self.commit_tracked(candidate, origins)
     }
 
     /// Creates an arrangement named `name` that plays every section once,
@@ -486,18 +669,27 @@ impl SongEditor {
             arrangements.iter().any(|arrangement| arrangement.id == id)
         });
         let mut candidate = self.package.clone();
+        let sections: Vec<String> = self
+            .package
+            .sections
+            .iter()
+            .map(|marker| marker.id.clone())
+            .collect();
+        let mut origins = self.origins.clone();
+        origins.insert(
+            id.clone(),
+            Origins {
+                original: 0,
+                now: vec![None; sections.len()],
+            },
+        );
         candidate.arrangements.push(Arrangement {
             id: id.clone(),
             name: name.to_owned(),
-            sections: self
-                .package
-                .sections
-                .iter()
-                .map(|marker| marker.id.clone())
-                .collect(),
+            sections,
             infinite_loop: Vec::new(),
         });
-        self.commit(candidate)?;
+        self.commit_tracked(candidate, origins)?;
         Ok(id)
     }
 
@@ -546,7 +738,9 @@ impl SongEditor {
         }
         let mut candidate = self.package.clone();
         candidate.arrangements.remove(index);
-        self.commit(candidate)
+        let mut origins = self.origins.clone();
+        origins.remove(id);
+        self.commit_tracked(candidate, origins)
     }
 
     /// Inserts section `section` at position `index` of arrangement
@@ -568,7 +762,8 @@ impl SongEditor {
         candidate.arrangements[at]
             .sections
             .insert(index, section.to_owned());
-        self.commit(candidate)
+        let origins = self.track(arrangement, |now| now.insert(index, None));
+        self.commit_tracked(candidate, origins)
     }
 
     /// Adds section `section` at the end of arrangement `arrangement`.
@@ -605,7 +800,10 @@ impl SongEditor {
         if !target.sections.contains(&removed) {
             target.infinite_loop.retain(|section| *section != removed);
         }
-        self.commit(candidate)?;
+        let origins = self.track(arrangement, |now| {
+            now.remove(index);
+        });
+        self.commit_tracked(candidate, origins)?;
         Ok(removed)
     }
 
@@ -624,7 +822,11 @@ impl SongEditor {
         let sections = &mut candidate.arrangements[at].sections;
         let section = sections.remove(from);
         sections.insert(to, section);
-        self.commit(candidate)
+        let origins = self.track(arrangement, |now| {
+            let origin = now.remove(from);
+            now.insert(to, origin);
+        });
+        self.commit_tracked(candidate, origins)
     }
 
     /// Marks section `section` as an infinite loop by default in
@@ -660,9 +862,35 @@ impl SongEditor {
     /// Keeps `candidate` if [`crate::validate`] accepts it; otherwise the
     /// package stays as it was.
     fn commit(&mut self, candidate: SongPackage) -> Result<(), SongEditError> {
+        let origins = self.origins.clone();
+        self.commit_tracked(candidate, origins)
+    }
+
+    /// [`Self::commit`], keeping `origins` as where the positions came from
+    /// when `candidate` is kept.
+    fn commit_tracked(
+        &mut self,
+        candidate: SongPackage,
+        origins: BTreeMap<String, Origins>,
+    ) -> Result<(), SongEditError> {
         validate(&candidate, &self.infos).map_err(SongEditError::Package)?;
         self.package = candidate;
+        self.origins = origins;
         Ok(())
+    }
+
+    /// Where the positions came from, with `change` made to those of
+    /// arrangement `id`, as its sections change.
+    fn track(
+        &self,
+        id: &str,
+        change: impl FnOnce(&mut Vec<Option<usize>>),
+    ) -> BTreeMap<String, Origins> {
+        let mut origins = self.origins.clone();
+        if let Some(tracked) = origins.get_mut(id) {
+            change(&mut tracked.now);
+        }
+        origins
     }
 
     fn marker_index(&self, id: &str) -> Option<usize> {
