@@ -235,3 +235,37 @@ Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` an
 - **L16** (2026-11-26): the T2 review (lineage review-427e0445a3f6049e, slice 883b398..b906f5e) approved and was acknowledged, so the reviewed boundary is now b906f5e. It left two non-blocking reliability suggestions, kept as follow-ups:
   - the depth check has no lower bound, though the message says 4- to 24-bit;
   - bit-identical WAV/FLAC equality is only tested at 16 and 24 bits, and an 8-, 12- or 20-bit case would pin the left-justify shift.
+- **L17** (2026-11-26): the parent ran the dev app (`target/OpenVamp-dev.app`, the binary at 6aa0db8).
+  - **The run:** it opened a library through a test setlist and imported `/Users/cdec/projects/openvamp-demo/Way Maker Stems` with "Import stems" and the macOS picker. The folder holds 11 WAV, 1 MP3 and 1 M4A.
+    - The Song editor showed the 13 stems with AUTO and the expected buses (AG → Acoustic guitar on Guitars, EG 1 → Guitars, Kick → Drums, Click and Guide → Click & Guide) and the header "13 · 48 kHz · WAV + FLAC".
+    - The part menu lists the parts grouped by bus.
+    - "Save song" showed its progress and returned to the Library, which lists "Way Maker Stems · 120 · 0:20 · 13 stems". The WAVs were copied, and the MP3 and M4A were written as FLAC.
+    - The progress label may have gone from 96% to 90%; the T4 verifier checks this.
+  - **Design canvas:** not compared side by side, because the browser pane is not signed in to claude.ai. The screenshots were sent to the user.
+- **L18** (2026-11-26): the T3 verifier found four blockers.
+  - **B1:** loud high-frequency lossy stems produce huge FLAC frames (flacenc never falls back to verbatim; one frame was 33.5 MB, and STREAMINFO's max frame size wraps), so the song saves and does not load, or the save fails with a message naming the source folder.
+  - **B2:** Apple AAC M4A (afconvert, iTunes, Logic) keeps 2112 frames of delay, because `iTunSMPB` is not read (there is no `elst`).
+  - **B3:** a Xing-less 192 kbps 44.1 kHz CBR MP3 passes the probe and is refused at save, one packet short.
+  - **B4:** a truncated WAV or FLAC source is saved as a song that does not play, because the pre-rename check opens headers only.
+  - **What passes:**
+    - folder and ZIP sources, including `../evil.wav`, absolute paths, encrypted entries, zip bombs and symlinks; nothing was written outside the song folder;
+    - byte-identical copies and exact lossless transcodes;
+    - LAME MP3 and ffmpeg AAC gapless (+0 frames);
+    - the draft edits, the bar-to-sample conversion (four hand calculations), folder naming, cancel and mid-save failures (nothing left behind);
+    - render identity with packages written by hand;
+    - `bus_for_stem`, which only changed for a stored `other`;
+    - render-cli unchanged on 22 runs; `cargo test -p library -p domain` 329 passed;
+    - the dependencies, all within the license policy and more than two weeks old.
+  - **Advisories:**
+    - A1: an honest-size ZIP entry is extracted in full before it is refused.
+    - A2: with duplicate ZIP entry names, the last one wins.
+    - A3: folders more than 32 levels deep are skipped.
+    - A4: `kill -9` leaves a hidden `.import-*.tmp` folder behind.
+    - A5: some messages are misleading (fixed with B1).
+    - A6: HE-AAC decodes at its core rate.
+    - A7: an M4A named `.mp3` skips the edit list.
+    - A8: zlib-rs becomes flate2's backend for the other crates too.
+  - **Next:**
+    - the T3 writer was resumed for B1–B4, as one fix commit to be moved after 05b8af2;
+    - the T4 verifier was launched at the same time in a scratch copy.
+
