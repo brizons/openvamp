@@ -217,6 +217,51 @@ impl Leaving {
     }
 }
 
+/// The question asked before a library song's save changes what setlists
+/// that play part of one of its arrangements play (S4, F5.3): `detail`
+/// names each setlist and what happens to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveQuestion {
+    /// The question.
+    pub message: &'static str,
+    /// The setlists, one line each.
+    pub detail: String,
+    /// "Save anyway" and "Keep editing", in the order the dialog lists them
+    /// ([`Dialog`]), as [`Ending::question`] orders its own, so neither
+    /// Space nor Escape saves.
+    pub answers: [Answer; 2],
+}
+
+impl SaveQuestion {
+    /// The question with `detail`, in `dialog`.
+    pub fn new(detail: String, dialog: Dialog) -> Self {
+        let save = Answer {
+            label: "Save anyway",
+            keeps_playing: false,
+        };
+        let keep = Answer {
+            label: "Keep editing",
+            keeps_playing: true,
+        };
+        Self {
+            message: "This save changes setlists that play part of the song",
+            detail,
+            answers: match dialog {
+                Dialog::Mac | Dialog::InWindow => [save, keep],
+                Dialog::Windows => [keep, save],
+            },
+        }
+    }
+
+    /// Whether `answer`, the index of the answer chosen (`None` when the
+    /// dialog went away unanswered), saves.
+    pub fn saves(&self, answer: Option<usize>) -> bool {
+        answer
+            .and_then(|index| self.answers.get(index))
+            .is_some_and(|answer| !answer.keeps_playing)
+    }
+}
+
 /// Whether `intent` acts while the question before ending the show is on
 /// screen (`asking`): nothing does but the release of the panic control,
 /// so a hold never stays counting. gpui's in-window question lets clicks

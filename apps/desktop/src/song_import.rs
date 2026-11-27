@@ -138,16 +138,17 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Where a save job stands, so the editor can wait for it to stop.
+/// Where a save job stands, so the editor can wait for it to stop. A
+/// library song's save ([`crate::song_edit::SaveSongJob`]) keeps one too.
 #[derive(Debug, Default)]
-struct Stage {
+pub(crate) struct Stage {
     state: Mutex<Run>,
     changed: Condvar,
 }
 
 /// What a save job is doing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum Run {
+pub(crate) enum Run {
     /// It has not started: once its cancel flag is set, it writes nothing.
     #[default]
     Waiting,
@@ -159,27 +160,37 @@ enum Run {
 }
 
 impl Stage {
-    fn set(&self, run: Run) {
+    pub(crate) fn set(&self, run: Run) {
         *lock(&self.state) = run;
         self.changed.notify_all();
     }
 
     /// Waits until the job is not running, at most until `deadline`;
     /// whether it is not.
-    fn wait(&self, deadline: Instant) -> bool {
+    pub(crate) fn wait(&self, deadline: Instant) -> bool {
+        self.wait_while(deadline, |run| run == Run::Running)
+    }
+
+    /// Waits until the job is done, at most until `deadline`, for a job that
+    /// cannot be cancelled and writes once it starts; whether it is done.
+    pub(crate) fn wait_done(&self, deadline: Instant) -> bool {
+        self.wait_while(deadline, |run| run != Run::Done)
+    }
+
+    fn wait_while(&self, deadline: Instant, waits: impl Fn(Run) -> bool) -> bool {
         let timeout = deadline.saturating_duration_since(Instant::now());
         let (state, _) = self
             .changed
-            .wait_timeout_while(lock(&self.state), timeout, |run| *run == Run::Running)
+            .wait_timeout_while(lock(&self.state), timeout, |run| waits(*run))
             .unwrap_or_else(PoisonError::into_inner);
-        *state != Run::Running
+        !waits(*state)
     }
 }
 
 /// Marks its job done when dropped: when the job returns, panics, or is
 /// dropped without running.
 #[derive(Debug)]
-struct Finish(Arc<Stage>);
+pub(crate) struct Finish(pub(crate) Arc<Stage>);
 
 impl Drop for Finish {
     fn drop(&mut self) {

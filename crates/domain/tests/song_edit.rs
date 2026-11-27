@@ -826,3 +826,169 @@ fn the_summary_counts_sections_bars_and_whole_seconds() {
         "1 section · 1833 bars · 61:05"
     );
 }
+
+/// Where each of `id`'s positions as the editor opened it plays now.
+#[track_caller]
+fn moved_to(editor: &SongEditor, id: &str) -> Vec<Vec<usize>> {
+    let map = editor.position_map(id).expect("the arrangement is there");
+    (0..map.original_len())
+        .map(|original| map.positions(original).to_vec())
+        .collect()
+}
+
+#[test]
+fn an_unedited_arrangement_maps_each_position_to_itself() {
+    let editor = editor();
+
+    let map = editor.position_map("live").unwrap();
+
+    assert_eq!(moved_to(&editor, "live"), [[0], [1], [2], [3], [4]]);
+    assert!(map.is_identity());
+    assert_eq!(map.range(1, 3), Some(1..=3));
+    assert_eq!(map.range(3, 1), None, "an empty range");
+    assert_eq!(map.range(4, 5), None, "past the end");
+    assert_eq!(editor.position_map("nope"), None);
+}
+
+#[test]
+fn a_split_adds_the_new_sections_positions_right_after_their_parents() {
+    let mut editor = editor();
+
+    editor.add_marker(7 * BAR, Snap::Bar).unwrap();
+
+    // Live plays the chorus three times; each turn is now two positions.
+    assert_eq!(
+        moved_to(&editor, "live"),
+        [vec![0], vec![1, 2], vec![3, 4], vec![5, 6], vec![7]]
+    );
+    let map = editor.position_map("live").unwrap();
+    assert!(!map.is_identity());
+    assert_eq!(map.range(1, 2), Some(1..=4));
+    assert_eq!(map.range(4, 4), Some(7..=7));
+    assert_eq!(
+        moved_to(&editor, "default"),
+        [vec![0], vec![1], vec![2, 3], vec![4]]
+    );
+}
+
+#[test]
+fn removed_inserted_and_moved_positions_are_tracked() {
+    let mut editor = editor();
+
+    editor.remove_section("live", 0).unwrap();
+    assert_eq!(
+        moved_to(&editor, "live"),
+        [vec![], vec![0], vec![1], vec![2], vec![3]]
+    );
+    // A position added plays no original one.
+    editor.insert_section("live", 1, "verse").unwrap();
+    editor.append_section("live", "intro").unwrap();
+    assert_eq!(
+        moved_to(&editor, "live"),
+        [vec![], vec![0], vec![2], vec![3], vec![4]]
+    );
+    // The outro moves to the front.
+    editor.move_section("live", 4, 0).unwrap();
+    assert_eq!(
+        moved_to(&editor, "live"),
+        [vec![], vec![1], vec![3], vec![4], vec![0]]
+    );
+
+    let map = editor.position_map("live").unwrap();
+    assert_eq!(map.range(0, 1), None, "the intro was removed");
+    assert_eq!(map.range(1, 3), None, "the verse came in between");
+    assert_eq!(map.range(2, 3), Some(3..=4));
+    assert_eq!(map.range(4, 4), Some(0..=0));
+}
+
+#[test]
+fn a_reorder_inside_a_range_breaks_its_order() {
+    let mut editor = editor();
+
+    // The first chorus of Live goes after the third.
+    editor.move_section("live", 1, 3).unwrap();
+
+    assert_eq!(moved_to(&editor, "live"), [[0], [3], [1], [2], [4]]);
+    let map = editor.position_map("live").unwrap();
+    assert_eq!(map.range(1, 3), None, "played out of order");
+    assert_eq!(map.range(2, 3), Some(1..=2), "shifted, in order");
+}
+
+#[test]
+fn a_deleted_marker_takes_its_positions_out_of_every_map() {
+    let mut editor = editor();
+
+    editor.delete_marker("chorus").unwrap();
+
+    assert_eq!(
+        moved_to(&editor, "live"),
+        [vec![0], vec![], vec![], vec![], vec![1]]
+    );
+    assert_eq!(
+        moved_to(&editor, "default"),
+        [vec![0], vec![1], vec![], vec![2]]
+    );
+}
+
+#[test]
+fn a_refused_edit_leaves_the_map_as_it_was() {
+    let mut editor = editor();
+    editor.remove_section("live", 0).unwrap();
+    let before = moved_to(&editor, "live");
+
+    assert!(editor.move_section("live", 0, 9).is_err());
+    assert!(editor.delete_marker("intro").is_err());
+
+    assert_eq!(moved_to(&editor, "live"), before);
+}
+
+#[test]
+fn a_new_arrangement_has_no_original_positions_and_a_deleted_one_no_map() {
+    let mut editor = editor();
+
+    let id = editor.new_arrangement("Encore").unwrap();
+    editor.delete_arrangement("live").unwrap();
+
+    let map = editor.position_map(&id).unwrap();
+    assert_eq!(map.original_len(), 0);
+    assert!(!map.is_identity(), "every position is new");
+    assert_eq!(editor.position_map("live"), None);
+}
+
+#[test]
+fn new_maps_and_a_stems_new_part_keep_the_positions_and_move_the_grid() {
+    let mut editor = editor();
+    editor.add_marker(7 * BAR, Snap::Bar).unwrap();
+    let split = moved_to(&editor, "live");
+
+    // 60 BPM: a bar of 4/4 is twice as long.
+    let mut package = editor.package().clone();
+    package.tempo_map[0].bpm = 60.0;
+    editor
+        .set_maps(
+            package.tempo_map.clone(),
+            package.time_signature_map.clone(),
+        )
+        .unwrap();
+    editor
+        .set_stem_part("drums", "percussion", domain::StemRole::Track)
+        .unwrap();
+
+    assert_eq!(moved_to(&editor, "live"), split);
+    assert_eq!(editor.package().tempo_map[0].bpm, 60.0);
+    assert_eq!(editor.grid().bar_lines()[1], 2 * BAR);
+    assert_eq!(editor.package().stems[0].part, "percussion");
+    let mut bad = package.tempo_map.clone();
+    bad[0].bpm = 0.0;
+    assert!(matches!(
+        editor.set_maps(bad, package.time_signature_map.clone()),
+        Err(SongEditError::Package(_))
+    ));
+    assert_eq!(editor.package().tempo_map[0].bpm, 60.0, "refused");
+    assert_eq!(
+        editor.set_stem_part("nope", "bass", domain::StemRole::Track),
+        Err(SongEditError::UnknownStem {
+            id: "nope".to_owned()
+        })
+    );
+}

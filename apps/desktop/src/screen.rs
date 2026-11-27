@@ -22,7 +22,7 @@ use library::ConfigStore;
 use openvamp_desktop::action::{Intent, Page, UiAction, disarms_removal};
 use openvamp_desktop::audio_settings::AudioSettings;
 use openvamp_desktop::ending::{
-    Dialog, EndRequest, Ending, Leaving, Question, control_acts, end_request,
+    Answer, Dialog, EndRequest, Ending, Leaving, SaveQuestion, control_acts, end_request,
 };
 use openvamp_desktop::facts::{self, FactsCache};
 use openvamp_desktop::hold::PanicHold;
@@ -200,14 +200,22 @@ impl Perform {
     /// ([`Self::end_once_saved`]). Returns whether it ended at once, which
     /// lets the window close.
     fn end_show(&mut self, ending: Ending, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // A question on screen, or an ending put off until a save stops:
+        // nothing ends, and nothing is dropped, until it is answered or
+        // done; the request comes again then if it is still wanted.
+        if self.controls_wait() {
+            return false;
+        }
+        let library = self.library.as_ref();
         // Edits of a library song not saved ask first, whatever plays.
-        if !self.controls_wait()
-            && self
-                .library
-                .as_ref()
-                .is_some_and(LibraryPage::has_unsaved_song)
-        {
+        if library.is_some_and(LibraryPage::has_unsaved_song) {
             self.ask_leave(Leaving::End(ending), AfterLeave::End(ending), window, cx);
+            return false;
+        }
+        // A library song being written is waited for, as an import's save
+        // is, without a question: it cannot be cancelled and ends soon.
+        if library.is_some_and(LibraryPage::song_saving) {
+            self.end_once_saved(ending, window, cx);
             return false;
         }
         let transport = self.loaded.as_mut().map(|show| {
@@ -245,7 +253,11 @@ impl Perform {
     /// the app open; the quit handler then still waits for the save.
     fn end_once_saved(&mut self, ending: Ending, window: &mut Window, cx: &mut Context<Self>) {
         self.close_song();
-        let Some(library) = self.library.as_mut().filter(|library| library.saving()) else {
+        let Some(library) = self
+            .library
+            .as_mut()
+            .filter(|library| library.saving() || library.song_saving())
+        else {
             match ending {
                 Ending::Quit => cx.quit(),
                 Ending::CloseWindow => window.remove_window(),
@@ -291,7 +303,7 @@ impl Perform {
             PromptLevel::Warning,
             question.message,
             Some(question.detail),
-            &prompt_buttons(&question),
+            &prompt_buttons(&question.answers),
             cx,
         );
         self.asking = true;
@@ -323,7 +335,7 @@ impl Perform {
             PromptLevel::Warning,
             question.message,
             Some(question.detail),
-            &prompt_buttons(&question),
+            &prompt_buttons(&question.answers),
             cx,
         );
         self.asking = true;
@@ -334,6 +346,31 @@ impl Perform {
                 if question.ends(answer) {
                     screen.after_leave(then, window, cx);
                 }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Asks `question` before a library song's save moves setlists off
+    /// what they play; "Save anyway" starts the save.
+    fn ask_save(&mut self, question: SaveQuestion, window: &mut Window, cx: &mut Context<Self>) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            question.message,
+            Some(&question.detail),
+            &prompt_buttons(&question.answers),
+            cx,
+        );
+        self.asking = true;
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = answer.await.ok();
+            let _ = this.update_in(cx, |screen, _, cx| {
+                screen.asking = false;
+                if let Some(library) = &mut screen.library {
+                    library.save_answered(question.saves(answer));
+                }
+                screen.run_song_jobs(cx);
                 cx.notify();
             });
         })
@@ -658,6 +695,13 @@ impl Perform {
                     .and_then(LibraryPage::take_leave_question)
                 {
                     self.ask_leave(leaving, AfterLeave::Discard, window, cx);
+                }
+                if let Some(question) = self
+                    .library
+                    .as_mut()
+                    .and_then(|library| library.take_save_question(Dialog::HERE))
+                {
+                    self.ask_save(question, window, cx);
                 }
             }
             Intent::PerformSetlist => self.perform_setlist(cx),
@@ -1030,6 +1074,16 @@ impl Perform {
                             screen.songs_scroll.scroll_to_item(row);
                         }
                     }
+                    // A setlist on Perform follows a file the save moved.
+                    screen.follow_library_moves();
+                    // A quit put off until the song was written goes ahead.
+                    if !screen
+                        .library
+                        .as_ref()
+                        .is_some_and(LibraryPage::song_saving)
+                    {
+                        screen.finish_ending(cx);
+                    }
                     cx.notify();
                 });
             })
@@ -1272,10 +1326,10 @@ enum AfterLeave {
     End(Ending),
 }
 
-/// The buttons of `question` in the platform's dialog: its answer that
-/// keeps the show going is the cancel answer.
-fn prompt_buttons(question: &Question) -> [PromptButton; 2] {
-    question.answers.map(|answer| {
+/// The buttons of a question's `answers` in the platform's dialog: the
+/// answer that keeps the show going is the cancel answer.
+fn prompt_buttons(answers: &[Answer; 2]) -> [PromptButton; 2] {
+    answers.map(|answer| {
         if answer.keeps_playing {
             PromptButton::cancel(answer.label)
         } else {

@@ -266,4 +266,27 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
   - a few untested branches.
 
   The quit-during-song-save warning is already part of the B1 correction batch.
+- **L13** (2026-11-27): the T3 B1 correction landed, with the four review fixes.
+  - **Domain:** `SongEditor` tracks a `PositionMap` per arrangement. A split keeps both parts with their parent, inserts belong to no original, and removes, moves and deletes are tracked. `set_maps` and `set_stem_part` keep the history across header and part edits, and `UnknownStem` is new.
+  - **Remap:**
+    - On save, ranges that still play the same audio in one run are moved silently.
+    - Otherwise the save asks first: "This save changes setlists that play part of the song", with `"Gig" plays positions 3 to 4 of Live, which this edit removes or plays in another order: it will play all of Live.`
+    - "Save anyway" clears the item's range and leaves a warning, and "Keep editing" writes nothing.
+    - Setlists are written through `SetlistEditor::apply(Edit::StartEnd)`, matching items by song, arrangement and old range. A write failure gives a warning, and the song stays saved.
+  - **Refresh:** the setlist list and the open setlist editor are read again after a save.
+  - **Quit waits** for a song save in flight (10 s when asked from the app, 5 s from the Dock or a logout, 5 s when opening another library).
+  - **Review fixes:**
+    - the arrangement delete fails closed on unreadable setlists;
+    - `end_show` waits for an open question and then asks about unsaved edits;
+    - `delete_hint` gives the real reason;
+    - `ICONS` lists all 18 icons.
+  - **Writer's decisions, kept:**
+    - a moved marker keeps its positions, so neighbouring ranges follow the new boundary;
+    - a deleted marker counts as removed positions and asks;
+    - unreadable setlists get no fix at save time.
+  - **Checks:**
+    - RED: the new tests failed to compile first, and 12 deliberate mutations were caught.
+    - GREEN: `cargo test -p openvamp` passes 349 and `-p domain` 211; fmt and clippy are clean. The parent re-ran `--test song_edit_setlists` (11).
+  - **Size:** 1,749 changed lines.
+  - Risk: item 1 (rewrites setlists and `song.json`), item 3 (`SongEditor` API added) and item 4 (quit waits), so the T3 verifier rechecks B1.
 

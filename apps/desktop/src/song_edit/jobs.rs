@@ -1,10 +1,10 @@
 //! The Song editor's jobs off the UI thread: reading a library song
 //! ([`OpenSongJob`]), reading or building its waveform ([`WaveformJob`]),
-//! and saving it ([`SaveSongJob`]). Each runs on the screen's background
+//! and saving it ([`SaveSongJob`]), with the setlists that play part of it
+//! ([`SetlistUses`], [`SetlistFix`]). Each runs on the screen's background
 //! executor and hands back a result with its ticket, so a result of a job
 //! a newer one replaced, or of an editor since closed, changes nothing.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +16,8 @@ use library::{
     SongEntry, SongListing, build_overview, load_overview, read_mix, write_mix,
 };
 
-use crate::song_import::{next_ticket, sentence};
+use crate::editor::{Edit, SetlistEditor};
+use crate::song_import::{Finish, Run, next_ticket, sentence};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -27,8 +28,121 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) struct SongSource {
     pub(super) package: SongPackage,
     pub(super) length: u64,
-    /// The names of the setlists that play each arrangement, by its id.
-    pub(super) in_use: BTreeMap<String, Vec<String>>,
+    /// What the library's setlists play of the song.
+    pub(super) uses: SetlistUses,
+}
+
+/// What the setlists of a library play of one song, read when the editor
+/// opens: which arrangement each item plays, and from where to where.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SetlistUses {
+    /// Every setlist with an item of the song.
+    pub(super) setlists: Vec<SetlistUse>,
+    /// Why some setlists could not be read, so what they play is not known:
+    /// a file of the setlists folder, named, or the folder itself. Empty
+    /// when every setlist was read.
+    pub(super) unread: Vec<String>,
+}
+
+/// A setlist with items of the song.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetlistUse {
+    /// Its file in the setlists folder.
+    pub(super) file: String,
+    /// Its name.
+    pub(super) name: String,
+    /// Its items of the song, in setlist order.
+    pub(super) items: Vec<ItemUse>,
+}
+
+/// What one item of a setlist plays of the song.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ItemUse {
+    /// The arrangement's id.
+    pub(super) arrangement: String,
+    /// Its first position, when it does not start the arrangement.
+    pub(super) start: Option<usize>,
+    /// Its last position, when it does not end it.
+    pub(super) end: Option<usize>,
+}
+
+impl SetlistUses {
+    /// Reads every setlist of `library` for its items of `song`. A setlist
+    /// that cannot be read, or a setlists folder that cannot be listed, is
+    /// kept as unread, so whatever depends on what the setlists play can
+    /// refuse rather than guess.
+    pub(super) fn read(library: &Library, song: &str) -> Self {
+        let mut uses = Self::default();
+        let listing = match library.list_setlists() {
+            Ok(listing) => listing,
+            Err(error) => {
+                uses.unread.push(error.to_string());
+                return uses;
+            }
+        };
+        uses.unread
+            .extend(listing.unreadable.iter().map(|file| file.file.clone()));
+        uses.unread
+            .extend(listing.entry_errors.iter().map(ToString::to_string));
+        for entry in &listing.setlists {
+            let setlist = match library.load_setlist(&entry.file) {
+                Ok(setlist) => setlist,
+                Err(_) => {
+                    uses.unread.push(entry.file.clone());
+                    continue;
+                }
+            };
+            let items: Vec<ItemUse> = setlist
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    SetlistItem::Song(item) if item.song == song => Some(ItemUse {
+                        arrangement: item.arrangement.clone(),
+                        start: item.start_position,
+                        end: item.end_position,
+                    }),
+                    _ => None,
+                })
+                .collect();
+            if !items.is_empty() {
+                uses.setlists.push(SetlistUse {
+                    file: entry.file.clone(),
+                    name: setlist.name.clone(),
+                    items,
+                });
+            }
+        }
+        uses
+    }
+
+    /// The names of the setlists that play arrangement `id`, once each.
+    pub(super) fn playing(&self, id: &str) -> Vec<String> {
+        self.setlists
+            .iter()
+            .filter(|setlist| setlist.items.iter().any(|item| item.arrangement == id))
+            .map(|setlist| setlist.name.clone())
+            .collect()
+    }
+}
+
+/// What a save changes in a setlist item that plays part of an edited
+/// arrangement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetlistFix {
+    /// The setlist's file and name.
+    pub(super) file: String,
+    pub(super) name: String,
+    /// The arrangement's id and name.
+    pub(super) arrangement: String,
+    pub(super) arrangement_name: String,
+    /// The item's start and end as the setlist has them.
+    pub(super) from: (Option<usize>, Option<usize>),
+    /// What they become: the positions that play the same audio, or the
+    /// whole arrangement when `lost`.
+    pub(super) to: (Option<usize>, Option<usize>),
+    /// Whether positions the item played were removed or play in another
+    /// order, so it plays the whole arrangement.
+    pub(super) lost: bool,
 }
 
 /// Reads the song at `song` (a path in the library, as listed) for the
@@ -106,34 +220,8 @@ fn read_source(
     Ok(SongSource {
         package,
         length: entry.length_frames,
-        in_use: setlists_using(library, song),
+        uses: SetlistUses::read(library, song),
     })
-}
-
-/// The names of the setlists of `library` that play `song`, by the id of
-/// the arrangement they play. A setlist that cannot be read is left out:
-/// the Library lists it as unreadable.
-fn setlists_using(library: &Library, song: &str) -> BTreeMap<String, Vec<String>> {
-    let mut used: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let Ok(listing) = library.list_setlists() else {
-        return used;
-    };
-    for entry in &listing.setlists {
-        let Ok(setlist) = library.load_setlist(&entry.file) else {
-            continue;
-        };
-        for item in &setlist.items {
-            if let SetlistItem::Song(item) = item
-                && item.song == song
-            {
-                let names = used.entry(item.arrangement.clone()).or_default();
-                if !names.contains(&setlist.name) {
-                    names.push(setlist.name.clone());
-                }
-            }
-        }
-    }
-    used
 }
 
 /// How far a waveform build has got, written by its thread.
@@ -242,7 +330,9 @@ pub(super) enum Waveform {
 
 /// Saves the edited package as the song's `song.json`
 /// ([`Library::save_song`]), drops the deleted arrangements from its
-/// `mix.json`, and lists the library's songs again; run off the UI thread.
+/// `mix.json`, moves the setlist items that play part of an edited
+/// arrangement ([`SetlistFix`]), and lists the library's songs again; run
+/// off the UI thread.
 #[derive(Debug)]
 pub struct SaveSongJob {
     pub(super) ticket: u64,
@@ -253,11 +343,16 @@ pub struct SaveSongJob {
     /// The ids of the arrangements the edit deleted, which `mix.json` is
     /// to forget.
     pub(super) deleted: Vec<String>,
+    /// The setlist items to move, once the song is saved.
+    pub(super) fixes: Vec<SetlistFix>,
+    pub(super) finish: Finish,
 }
 
 impl SaveSongJob {
-    /// Saves the song; it blocks until done.
+    /// Saves the song, then its setlists; it blocks until done.
     pub fn run(self) -> SongSaved {
+        // Set under the stage's lock: a quit waiting for the save sees it.
+        self.finish.0.set(Run::Running);
         let result = self.library.save_song(&self.song, &self.package);
         let mix_problem = match &result {
             Ok(_) if !self.deleted.is_empty() => forget_mixes(
@@ -269,15 +364,95 @@ impl SaveSongJob {
             .err(),
             _ => None,
         };
+        let (notes, moves) = if result.is_ok() {
+            write_fixes(&self.library, &self.song, &self.fixes)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let listing = result.is_ok().then(|| self.library.list_songs());
-        SongSaved {
+        let saved = SongSaved {
             ticket: self.ticket,
             root: self.library.root().to_owned(),
             result,
             mix_problem,
+            setlist_notes: notes,
+            moves,
             listing,
+        };
+        drop(self.finish);
+        saved
+    }
+}
+
+/// Moves the setlist items `fixes` names in the setlists of `library`, as
+/// the setlist editor edits them ([`Edit::StartEnd`]); every item of
+/// `song` with the arrangement and positions a fix was made for moves.
+/// Returns what to tell (an item that now plays a whole arrangement, a
+/// setlist that could not be written) and the setlist files that moved.
+fn write_fixes(
+    library: &Library,
+    song: &str,
+    fixes: &[SetlistFix],
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut notes = Vec::new();
+    let mut moves = Vec::new();
+    let mut files: Vec<&str> = fixes.iter().map(|fix| fix.file.as_str()).collect();
+    files.dedup();
+    for file in files {
+        let of_file: Vec<&SetlistFix> = fixes.iter().filter(|fix| fix.file == file).collect();
+        let name = &of_file[0].name;
+        let mut editor = match SetlistEditor::open(library.clone(), file) {
+            Ok(editor) => editor,
+            Err(error) => {
+                notes.push(not_updated(name, &error.to_string()));
+                continue;
+            }
+        };
+        let mut failed = None;
+        for fix in &of_file {
+            let items: Vec<usize> = editor
+                .setlist()
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| match item {
+                    SetlistItem::Song(item)
+                        if item.song == song
+                            && item.arrangement == fix.arrangement
+                            && (item.start_position, item.end_position) == fix.from =>
+                    {
+                        Some(index)
+                    }
+                    _ => None,
+                })
+                .collect();
+            for index in items {
+                if let Err(error) = editor.apply(Edit::StartEnd(index, fix.to.0, fix.to.1)) {
+                    failed.get_or_insert(error.to_string());
+                }
+            }
+        }
+        match failed {
+            Some(error) => notes.push(not_updated(name, &error)),
+            None => notes.extend(of_file.iter().filter(|fix| fix.lost).map(|fix| {
+                format!(
+                    "\"{}\" now plays all of {}.",
+                    fix.name, fix.arrangement_name
+                )
+            })),
+        }
+        if editor.file() != file {
+            moves.push((file.to_owned(), editor.file().to_owned()));
         }
     }
+    (notes, moves)
+}
+
+/// Why setlist `name` still plays what it did before the edit.
+fn not_updated(name: &str, error: &str) -> String {
+    sentence(&format!(
+        "\"{name}\" could not be updated to the edit: {error}"
+    ))
 }
 
 /// What a [`SaveSongJob`] did, for
@@ -289,6 +464,12 @@ pub struct SongSaved {
     pub(crate) result: Result<SongEntry, SaveSongError>,
     /// Why `mix.json` still has a deleted arrangement's mix.
     pub(crate) mix_problem: Option<String>,
+    /// What happened to the setlists the save moved: an item now playing a
+    /// whole arrangement, a setlist that could not be written.
+    pub(crate) setlist_notes: Vec<String>,
+    /// The setlist files that moved, as (from, to): a file named by hand
+    /// moves to its name's on its first change.
+    pub(crate) moves: Vec<(String, String)>,
     pub(crate) listing: Option<Result<SongListing, SetlistError>>,
 }
 

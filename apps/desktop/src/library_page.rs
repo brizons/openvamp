@@ -19,6 +19,9 @@
 //! ([`LibraryPage::take_song_save`], [`LibraryPage::song_saved`]), after
 //! which the Library shows again, read anew. Discard or the Library link
 //! with edits not saved asks first ([`LibraryPage::take_leave_question`]).
+//! A save that would move setlists off the audio they play asks first too
+//! ([`LibraryPage::take_save_question`]); the setlists it moves, and the one
+//! in the setlist editor, are read again once it is done.
 
 use std::path::{Path, PathBuf};
 
@@ -30,7 +33,7 @@ use library::{ArrangementEntry, Library, SetlistError, SongEntry, SongListing, T
 
 use crate::catalog::{Audience, Catalog};
 use crate::editor::{Edit, SetlistEditor};
-use crate::ending::Leaving;
+use crate::ending::{Dialog, Leaving, SaveQuestion};
 use crate::line_edit::{LineEdit, LineKey, LineOutcome};
 use crate::reorder::{Half, drop_index, drop_slot};
 use crate::shelf::Shelf;
@@ -228,6 +231,9 @@ pub struct LibraryPage {
     /// Whether Discard asked to leave edits not saved: the screen asks
     /// first ([`Self::take_leave_question`]).
     leave_question: bool,
+    /// Whether Save song asked to move setlists off what they play: the
+    /// screen asks first ([`Self::take_save_question`]).
+    save_question: bool,
 }
 
 impl LibraryPage {
@@ -302,6 +308,7 @@ impl LibraryPage {
             pending_open: None,
             pending_song_save: None,
             leave_question: false,
+            save_question: false,
         };
         let file = file
             .map(str::to_owned)
@@ -596,9 +603,16 @@ impl LibraryPage {
                     self.list(listing);
                 }
                 self.mark_imported(entry.song);
-                if let Some(problem) = done.mix_problem {
-                    self.warning = Some(sentence(&problem));
+                let notes: Vec<String> = done
+                    .mix_problem
+                    .iter()
+                    .map(|problem| sentence(problem))
+                    .chain(done.setlist_notes)
+                    .collect();
+                if !notes.is_empty() {
+                    self.warning = Some(notes.join(" "));
                 }
+                self.setlists_rewritten(done.moves);
             }
             Err(error) => {
                 let mut message = full_stop(format!("The song could not be saved: {error}"));
@@ -613,6 +627,58 @@ impl LibraryPage {
                 }
             }
         }
+    }
+
+    /// The setlists the song's save rewrote, some moved from one file to
+    /// another (`moves`): the list and the setlist in the editor are read
+    /// again, so its positions and problems are current.
+    fn setlists_rewritten(&mut self, moves: Vec<(String, String)>) {
+        if let Err(error) = self.shelf.refresh() {
+            self.notice = Some(error.to_string());
+        }
+        if let Some(file) = self.selected_file().map(str::to_owned) {
+            let file = moves
+                .iter()
+                .find(|(from, _)| *from == file)
+                .map_or(file, |(_, to)| to.clone());
+            self.select(&file);
+        }
+        self.moves.extend(moves);
+    }
+
+    /// The question Save song asked for, once, in `dialog`: the save would
+    /// move setlists off the audio they play ([`SaveQuestion`]).
+    pub fn take_save_question(&mut self, dialog: Dialog) -> Option<SaveQuestion> {
+        if !std::mem::take(&mut self.save_question) {
+            return None;
+        }
+        let detail = self.song_edit.as_ref()?.save_question()?;
+        Some(SaveQuestion::new(detail, dialog))
+    }
+
+    /// The answer to [`Self::take_save_question`]: `save` ("Save anyway")
+    /// starts the save, the setlists it asked about playing their whole
+    /// arrangements; otherwise the editor stays as it was.
+    pub fn save_answered(&mut self, save: bool) {
+        if !save {
+            return;
+        }
+        let library = self.shelf.library();
+        if let Some(job) = self
+            .song_edit
+            .as_mut()
+            .and_then(|edit| edit.save_anyway(library))
+        {
+            self.pending_song_save = Some(job);
+        }
+    }
+
+    /// Whether a library song is being saved from the Song editor: quitting
+    /// waits for it ([`Self::stop_save`]).
+    pub fn song_saving(&self) -> bool {
+        self.song_edit
+            .as_ref()
+            .is_some_and(|edit| edit.saving().is_some())
     }
 
     /// Whether a song of the library is open in the Song editor with edits
@@ -701,11 +767,18 @@ impl LibraryPage {
     /// only cancels; the Song editor reads "Cancelling…" until
     /// [`Self::saved`] has the save's result, and the Library shows then.
     /// Quitting while a song is being saved goes through here, so the
-    /// process never ends in the middle of a save.
+    /// process never ends in the middle of a save. A library song's save
+    /// cannot be cancelled: this waits for it, at most `patience` too.
     pub fn stop_save(&mut self, patience: std::time::Duration) -> bool {
-        self.import
+        let import = self
+            .import
             .as_mut()
-            .is_none_or(|import| import.stop_save(patience))
+            .is_none_or(|import| import.stop_save(patience));
+        let song = self
+            .song_edit
+            .as_ref()
+            .is_none_or(|edit| edit.wait_for_save(patience));
+        import && song
     }
 
     /// Whether the keys type into a field: the song search, a setlist's
@@ -897,6 +970,7 @@ impl LibraryPage {
                         EditOutcome::Stay => {}
                         EditOutcome::Close => self.song_edit = None,
                         EditOutcome::Ask => self.leave_question = true,
+                        EditOutcome::AskSave => self.save_question = true,
                         EditOutcome::Save(job) => self.pending_song_save = Some(*job),
                     }
                 }

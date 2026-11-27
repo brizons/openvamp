@@ -83,7 +83,7 @@ impl SongEdit {
             } else {
                 Vec::new()
             },
-            saving: self.saving.map(|_| SavingView {
+            saving: self.saving.as_ref().map(|_| SavingView {
                 label: "Saving…".to_owned(),
                 percent: 0,
                 cancelling: false,
@@ -164,6 +164,17 @@ impl SongEdit {
         let arrangement = self.shown_arrangement();
         let plays = arrangement.is_some_and(|a| a.sections.iter().any(|s| s == id));
         let arrangement_name = arrangement.map_or_else(String::new, |a| a.name.clone());
+        // Why its marker cannot be deleted, as the domain would refuse it.
+        let delete_hint = if self.selected == 0 {
+            Some("The first marker starts the song".to_owned())
+        } else {
+            editor
+                .package()
+                .arrangements
+                .iter()
+                .find(|a| a.sections.iter().all(|section| section == id))
+                .map(|a| format!("\"{label}\" is all that {} plays", a.name))
+        };
         InspectorView {
             index: self.selected,
             icon: section_icon(&label),
@@ -195,7 +206,8 @@ impl SongEdit {
                 format!("Not in {arrangement_name}")
             },
             arrangement: arrangement_name,
-            can_delete: self.selected > 0,
+            can_delete: delete_hint.is_none(),
+            delete_hint,
             name: label,
         }
     }

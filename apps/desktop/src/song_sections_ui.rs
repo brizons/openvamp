@@ -37,24 +37,30 @@ use crate::song_editor_ui::{
 use crate::theme;
 use crate::ui::{DragPreview, button, drag_preview, half_across, hint, icon, one_line_text};
 
-/// The icons this module draws, besides the sections' own, for the app to
-/// carry each one.
+/// Every icon this module draws by name (through [`icon`],
+/// [`panel_heading`] and its summary figures), besides the sections' own
+/// ([`openvamp_desktop::view::section_icons`]), for the app to carry each
+/// one.
 #[cfg(test)]
-pub(crate) const ICONS: [&str; 14] = [
+pub(crate) const ICONS: [&str; 18] = [
+    "arrangement",
+    "bar-lines",
+    "check",
+    "clock",
+    "close",
+    "down",
     "flag",
     "flag-plus",
-    "magnet",
-    "zoom-in",
-    "zoom-out",
-    "arrangement",
-    "plus",
-    "pencil",
-    "trash",
     "grip",
     "infinite",
-    "bar-lines",
-    "clock",
+    "magnet",
+    "metronome",
+    "pencil",
+    "plus",
     "speech",
+    "trash",
+    "zoom-in",
+    "zoom-out",
 ];
 
 /// The height of the "Section markers" panel, as on the canvas.
@@ -782,10 +788,8 @@ fn inspector(view: &InspectorView, cx: &mut Context<Perform>) -> impl IntoElemen
                 .text_color(theme::danger_hint())
                 .text_size(px(14.))
                 .font_weight(FontWeight::SEMIBOLD)
-                .when(!view.can_delete, |button| {
-                    button
-                        .opacity(DISABLED_OPACITY)
-                        .tooltip(hint("The first marker starts the song"))
+                .when_some(view.delete_hint.clone(), |button, why| {
+                    button.opacity(DISABLED_OPACITY).tooltip(hint(why))
                 })
                 .child(icon("trash", theme::danger_hint(), 16.))
                 .child("Delete marker"),
