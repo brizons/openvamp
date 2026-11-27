@@ -9,24 +9,45 @@
 //! # The rules table
 //!
 //! The table is our own, written from scratch. It maps English and Spanish
-//! words to buses:
+//! words to [`Part`]s, and each part belongs to one bus ([`Part::bus`]), so
+//! the one table decides both: a name's bus ([`bus_for_name`]) is the bus of
+//! its part ([`part_for_name`](crate::part_for_name)).
 //!
-//! | Bus | English words | Spanish words |
-//! |-----|---------------|---------------|
-//! | Click & Guide | click, clk, metronome, guide, cue, count | clic, metronomo, guia, cuenta |
-//! | Drums | drum, kit, kick, kik, snare, snr, hat, hihat, hh, tom, overhead, cymbal, clap, snap, shaker, tamb, tambourine, perc, percussion, conga, bongo, cajon, timbale, cowbell, timpani; generic: room, loop, seq, sequence, beat | bateria, bombo, caja, redoblante, platillo, percusion; generic: secuencia |
-//! | Bass | bass, sub, synthbass, subbass, bassline | bajo |
-//! | Keys & Pads | keys, keyboard, kbd, piano, pno, rhodes, wurli, wurlitzer, organ, hammond, ep, clav, synth, pad, string, orchestra, orch, violin, viola, cello, brass, horn, trumpet, trombone, sax, saxophone, flute, woodwind, harp, bell, glock, glockenspiel, celesta, mellotron, accordion; generic: fx, sfx, riser, sweep, swell, ambient, ambience, atmos, atmosphere, texture, drone, arp, noise, impact | teclado, organo, sintetizador, sintetizadores, sinte, colchon, colchones, cuerda, violines, chelo, viento, metales, trompeta, saxo, flauta, campana |
-//! | Guitars | guitar, gtr, eg, ag, banjo, mandolin, mando, ukulele, uke, dobro; generic: acoustic, electric, steel, nylon | guitarra, requinto, charango; generic: electrica, electrico, acustica, acustico |
-//! | Vocals | vocal, vox, voc, bgv, bv, choir, voice, singer; generic: harmony, harmonies, spoken, speech | voz, voces, coro; generic: armonia |
+//! | Bus | Part | English words | Spanish words |
+//! |-----|------|---------------|---------------|
+//! | Click & Guide | Click | click, clk, metronome | clic, metronomo |
+//! | Click & Guide | Guide | guide, cue, count | guia, cuenta |
+//! | Drums | Drums | drum, kit, kick, kik, snare, snr, hat, hihat, hh, tom, overhead, cymbal; generic: room | bateria, bombo, caja, redoblante, platillo |
+//! | Drums | Percussion | perc, percussion, clap, snap, shaker, tamb, tambourine, conga, bongo, cajon, timbale, cowbell, timpani | percusion |
+//! | Drums | Loop | generic: loop, seq, sequence, beat | generic: secuencia |
+//! | Bass | Bass | bass, bassline | bajo |
+//! | Bass | Synth bass | sub, synthbass, subbass | |
+//! | Keys & Pads | Keys | keys, keyboard, kbd, rhodes, wurli, wurlitzer, ep, clav, mellotron, accordion | teclado |
+//! | Keys & Pads | Piano | piano, pno | |
+//! | Keys & Pads | Organ | organ, hammond | organo |
+//! | Keys & Pads | Synth | synth; generic: arp | sintetizador, sintetizadores, sinte |
+//! | Keys & Pads | Pad | pad; generic: ambient, ambience, atmos, atmosphere, texture, drone | colchon, colchones |
+//! | Keys & Pads | Strings | string, orchestra, orch, violin, viola, cello, harp | cuerda, violines, chelo |
+//! | Keys & Pads | Brass | brass, horn, trumpet, trombone | viento, metales, trompeta |
+//! | Keys & Pads | Woodwinds | sax, saxophone, flute, woodwind | saxo, flauta |
+//! | Keys & Pads | Bells | bell, glock, glockenspiel, celesta | campana |
+//! | Keys & Pads | FX | generic: fx, sfx, riser, sweep, swell, noise, impact | |
+//! | Guitars | Electric guitar | eg; generic: electric | generic: electrica, electrico |
+//! | Guitars | Acoustic guitar | ag; generic: acoustic, nylon | generic: acustica, acustico |
+//! | Guitars | Guitar | guitar, gtr, banjo, mandolin, mando, ukulele, uke, dobro; generic: steel | guitarra, requinto, charango |
+//! | Vocals | Vocals | vocal, vox, voc, voice, singer; generic: spoken, speech | voz, voces |
+//! | Vocals | Backing vocals | bgv, bv, choir; generic: harmony, harmonies | coro; generic: armonia |
 //!
 //! Words both languages share (piano, pad, sub, loop, violin) are listed once,
 //! in English. Plurals the final-`s` rule below cannot reach (voces, metales,
 //! violines, colchones, sintetizadores) are listed as they are.
 //!
-//! Two-word instruments come first: "bass guitar", "bass synth", "bajo sinte"
-//! and "bajo sintetizador" go to Bass, "bass drum" to Drums, and "voz guia"
-//! (a guide vocal, noun first) to Vocals.
+//! Two-word instruments come first: "bass guitar" is Bass; "bass synth",
+//! "synth bass", "sub bass", "bajo sinte" and "bajo sintetizador" are Synth
+//! bass; "bass drum" is Drums; "voz guia" (a guide vocal, noun first) is
+//! Vocals; "backing vocal" is Backing vocals; "electric guitar", "electric
+//! gtr" and "guitarra electrica" are Electric guitar; and "acoustic guitar",
+//! "acoustic gtr", "ac gtr" and "guitarra acustica" are Acoustic guitar.
 //!
 //! A name is split into words at every character that is not a letter
 //! (spaces, `_`, `-`, `.`, `/`, brackets, digits) and where a lowercase letter
@@ -36,16 +57,17 @@
 //! final `s` (`Toms`, `BGVs`, `Teclados`). `EG 1`, `eg_1` and `Eg1` are all
 //! "eg".
 //!
-//! The **last** instrument word of a name decides, because file names often
-//! start with the song title ("Guide Me O Thou - Piano" goes to Keys & Pads,
-//! "Cuenta Conmigo - Bajo" to Bass). A title alone can still name an
-//! instrument ("Bajo Tu Gracia" goes to Bass), which a part overrides.
-//! Generic words (loop, fx, ambient, acoustic...) decide only when the name
-//! has no instrument word: "Gtr Loop" goes to Guitars, "Loop" to Drums.
+//! The **last** instrument word of a name decides its part, and so its bus,
+//! because file names often start with the song title ("Guide Me O Thou -
+//! Piano" is Piano on Keys & Pads, "Cuenta Conmigo - Bajo" is Bass). A title
+//! alone can still name an instrument ("Bajo Tu Gracia" is Bass), which a
+//! part overrides. Generic words (loop, fx, ambient, acoustic...) decide only
+//! when the name has no instrument word: "Gtr Loop" is Guitar, "Loop" is
+//! Loop on Drums.
 //!
 //! A name with no word of the table goes nowhere ([`bus_for_name`] returns
 //! `None`); a stem whose part and file name both go nowhere goes to
-//! [`DEFAULT_BUS`].
+//! [`DEFAULT_BUS`], the bus of [`Part::Other`].
 
 use std::borrow::Cow;
 use std::fmt;
@@ -53,6 +75,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::package::{Stem, StemRole};
+use crate::part::Part;
 
 /// One of the six fixed buses, stored by its camelCase id (`keysPads`).
 ///
@@ -164,8 +187,15 @@ pub fn bus_for_stem(stem: &Stem) -> Bus {
 }
 
 /// The bus a part or file name names by the rules table (see the
-/// [module docs](self)), or `None` when it names no instrument.
+/// [module docs](self)), or `None` when it names no instrument: the bus of
+/// the part it names ([`part_for_name`](crate::part_for_name)).
 pub fn bus_for_name(name: &str) -> Option<Bus> {
+    named_part(name).map(Part::bus)
+}
+
+/// The part a name names by the rules table, or `None` when it names no
+/// instrument. [`crate::part_for_name`] is this function.
+pub(crate) fn named_part(name: &str) -> Option<Part> {
     let words: Vec<Cow<'static, str>> = words(name).into_iter().map(canonical).collect();
     let mut instrument = None;
     let mut generic = None;
@@ -173,11 +203,11 @@ pub fn bus_for_name(name: &str) -> Option<Bus> {
         let previous = index.checked_sub(1).map(|i| words[i].as_ref());
         let rule = previous
             .and_then(|previous| phrase(previous, word))
-            .map(|bus| (bus, Weight::Instrument))
+            .map(|part| (part, Weight::Instrument))
             .or_else(|| rule(word));
         match rule {
-            Some((bus, Weight::Instrument)) => instrument = Some(bus),
-            Some((bus, Weight::Generic)) => generic = Some(bus),
+            Some((part, Weight::Instrument)) => instrument = Some(part),
+            Some((part, Weight::Generic)) => generic = Some(part),
             None => {}
         }
     }
@@ -196,193 +226,207 @@ enum Weight {
 
 use Weight::{Generic, Instrument};
 
-/// The rules table: a lowercase word and where it sends a stem.
-const RULES: &[(&str, Bus, Weight)] = &[
+/// The rules table: a lowercase word, the part it names, and its weight.
+const RULES: &[(&str, Part, Weight)] = &[
     // Click & Guide.
-    ("click", Bus::ClickGuide, Instrument),
-    ("clk", Bus::ClickGuide, Instrument),
-    ("metronome", Bus::ClickGuide, Instrument),
-    ("guide", Bus::ClickGuide, Instrument),
-    ("cue", Bus::ClickGuide, Instrument),
-    ("count", Bus::ClickGuide, Instrument),
-    ("clic", Bus::ClickGuide, Instrument),
-    ("metronomo", Bus::ClickGuide, Instrument),
-    ("guia", Bus::ClickGuide, Instrument),
-    ("cuenta", Bus::ClickGuide, Instrument),
+    ("click", Part::Click, Instrument),
+    ("clk", Part::Click, Instrument),
+    ("metronome", Part::Click, Instrument),
+    ("guide", Part::Guide, Instrument),
+    ("cue", Part::Guide, Instrument),
+    ("count", Part::Guide, Instrument),
+    ("clic", Part::Click, Instrument),
+    ("metronomo", Part::Click, Instrument),
+    ("guia", Part::Guide, Instrument),
+    ("cuenta", Part::Guide, Instrument),
     // Drums.
-    ("drum", Bus::Drums, Instrument),
-    ("kit", Bus::Drums, Instrument),
-    ("kick", Bus::Drums, Instrument),
-    ("kik", Bus::Drums, Instrument),
-    ("snare", Bus::Drums, Instrument),
-    ("snr", Bus::Drums, Instrument),
-    ("hat", Bus::Drums, Instrument),
-    ("hihat", Bus::Drums, Instrument),
-    ("hh", Bus::Drums, Instrument),
-    ("tom", Bus::Drums, Instrument),
-    ("overhead", Bus::Drums, Instrument),
-    ("cymbal", Bus::Drums, Instrument),
-    ("clap", Bus::Drums, Instrument),
-    ("snap", Bus::Drums, Instrument),
-    ("shaker", Bus::Drums, Instrument),
-    ("tamb", Bus::Drums, Instrument),
-    ("tambourine", Bus::Drums, Instrument),
-    ("perc", Bus::Drums, Instrument),
-    ("percussion", Bus::Drums, Instrument),
-    ("conga", Bus::Drums, Instrument),
-    ("bongo", Bus::Drums, Instrument),
-    ("cajon", Bus::Drums, Instrument),
-    ("timbale", Bus::Drums, Instrument),
-    ("cowbell", Bus::Drums, Instrument),
-    ("timpani", Bus::Drums, Instrument),
-    ("room", Bus::Drums, Generic),
-    ("loop", Bus::Drums, Generic),
-    ("seq", Bus::Drums, Generic),
-    ("sequence", Bus::Drums, Generic),
-    ("beat", Bus::Drums, Generic),
-    ("bateria", Bus::Drums, Instrument),
-    ("bombo", Bus::Drums, Instrument),
-    ("caja", Bus::Drums, Instrument),
-    ("redoblante", Bus::Drums, Instrument),
-    ("platillo", Bus::Drums, Instrument),
-    ("percusion", Bus::Drums, Instrument),
-    ("secuencia", Bus::Drums, Generic),
+    ("drum", Part::Drums, Instrument),
+    ("kit", Part::Drums, Instrument),
+    ("kick", Part::Drums, Instrument),
+    ("kik", Part::Drums, Instrument),
+    ("snare", Part::Drums, Instrument),
+    ("snr", Part::Drums, Instrument),
+    ("hat", Part::Drums, Instrument),
+    ("hihat", Part::Drums, Instrument),
+    ("hh", Part::Drums, Instrument),
+    ("tom", Part::Drums, Instrument),
+    ("overhead", Part::Drums, Instrument),
+    ("cymbal", Part::Drums, Instrument),
+    ("clap", Part::Percussion, Instrument),
+    ("snap", Part::Percussion, Instrument),
+    ("shaker", Part::Percussion, Instrument),
+    ("tamb", Part::Percussion, Instrument),
+    ("tambourine", Part::Percussion, Instrument),
+    ("perc", Part::Percussion, Instrument),
+    ("percussion", Part::Percussion, Instrument),
+    ("conga", Part::Percussion, Instrument),
+    ("bongo", Part::Percussion, Instrument),
+    ("cajon", Part::Percussion, Instrument),
+    ("timbale", Part::Percussion, Instrument),
+    ("cowbell", Part::Percussion, Instrument),
+    ("timpani", Part::Percussion, Instrument),
+    ("room", Part::Drums, Generic),
+    ("loop", Part::Loop, Generic),
+    ("seq", Part::Loop, Generic),
+    ("sequence", Part::Loop, Generic),
+    ("beat", Part::Loop, Generic),
+    ("bateria", Part::Drums, Instrument),
+    ("bombo", Part::Drums, Instrument),
+    ("caja", Part::Drums, Instrument),
+    ("redoblante", Part::Drums, Instrument),
+    ("platillo", Part::Drums, Instrument),
+    ("percusion", Part::Percussion, Instrument),
+    ("secuencia", Part::Loop, Generic),
     // Bass.
-    ("bass", Bus::Bass, Instrument),
-    ("sub", Bus::Bass, Instrument),
-    ("synthbass", Bus::Bass, Instrument),
-    ("subbass", Bus::Bass, Instrument),
-    ("bassline", Bus::Bass, Instrument),
-    ("bajo", Bus::Bass, Instrument),
+    ("bass", Part::Bass, Instrument),
+    ("sub", Part::SynthBass, Instrument),
+    ("synthbass", Part::SynthBass, Instrument),
+    ("subbass", Part::SynthBass, Instrument),
+    ("bassline", Part::Bass, Instrument),
+    ("bajo", Part::Bass, Instrument),
     // Keys & Pads.
-    ("keys", Bus::KeysPads, Instrument),
-    ("keyboard", Bus::KeysPads, Instrument),
-    ("kbd", Bus::KeysPads, Instrument),
-    ("piano", Bus::KeysPads, Instrument),
-    ("pno", Bus::KeysPads, Instrument),
-    ("rhodes", Bus::KeysPads, Instrument),
-    ("wurli", Bus::KeysPads, Instrument),
-    ("wurlitzer", Bus::KeysPads, Instrument),
-    ("organ", Bus::KeysPads, Instrument),
-    ("hammond", Bus::KeysPads, Instrument),
-    ("ep", Bus::KeysPads, Instrument),
-    ("clav", Bus::KeysPads, Instrument),
-    ("synth", Bus::KeysPads, Instrument),
-    ("pad", Bus::KeysPads, Instrument),
-    ("string", Bus::KeysPads, Instrument),
-    ("orchestra", Bus::KeysPads, Instrument),
-    ("orch", Bus::KeysPads, Instrument),
-    ("violin", Bus::KeysPads, Instrument),
-    ("viola", Bus::KeysPads, Instrument),
-    ("cello", Bus::KeysPads, Instrument),
-    ("brass", Bus::KeysPads, Instrument),
-    ("horn", Bus::KeysPads, Instrument),
-    ("trumpet", Bus::KeysPads, Instrument),
-    ("trombone", Bus::KeysPads, Instrument),
-    ("sax", Bus::KeysPads, Instrument),
-    ("saxophone", Bus::KeysPads, Instrument),
-    ("flute", Bus::KeysPads, Instrument),
-    ("woodwind", Bus::KeysPads, Instrument),
-    ("harp", Bus::KeysPads, Instrument),
-    ("bell", Bus::KeysPads, Instrument),
-    ("glock", Bus::KeysPads, Instrument),
-    ("glockenspiel", Bus::KeysPads, Instrument),
-    ("celesta", Bus::KeysPads, Instrument),
-    ("mellotron", Bus::KeysPads, Instrument),
-    ("accordion", Bus::KeysPads, Instrument),
-    ("fx", Bus::KeysPads, Generic),
-    ("sfx", Bus::KeysPads, Generic),
-    ("riser", Bus::KeysPads, Generic),
-    ("sweep", Bus::KeysPads, Generic),
-    ("swell", Bus::KeysPads, Generic),
-    ("ambient", Bus::KeysPads, Generic),
-    ("ambience", Bus::KeysPads, Generic),
-    ("atmos", Bus::KeysPads, Generic),
-    ("atmosphere", Bus::KeysPads, Generic),
-    ("texture", Bus::KeysPads, Generic),
-    ("drone", Bus::KeysPads, Generic),
-    ("arp", Bus::KeysPads, Generic),
-    ("noise", Bus::KeysPads, Generic),
-    ("impact", Bus::KeysPads, Generic),
-    ("teclado", Bus::KeysPads, Instrument),
-    ("organo", Bus::KeysPads, Instrument),
-    ("sintetizador", Bus::KeysPads, Instrument),
-    ("sintetizadores", Bus::KeysPads, Instrument),
-    ("sinte", Bus::KeysPads, Instrument),
-    ("colchon", Bus::KeysPads, Instrument),
-    ("colchones", Bus::KeysPads, Instrument),
-    ("cuerda", Bus::KeysPads, Instrument),
-    ("violines", Bus::KeysPads, Instrument),
-    ("chelo", Bus::KeysPads, Instrument),
-    ("viento", Bus::KeysPads, Instrument),
-    ("metales", Bus::KeysPads, Instrument),
-    ("trompeta", Bus::KeysPads, Instrument),
-    ("saxo", Bus::KeysPads, Instrument),
-    ("flauta", Bus::KeysPads, Instrument),
-    ("campana", Bus::KeysPads, Instrument),
+    ("keys", Part::Keys, Instrument),
+    ("keyboard", Part::Keys, Instrument),
+    ("kbd", Part::Keys, Instrument),
+    ("piano", Part::Piano, Instrument),
+    ("pno", Part::Piano, Instrument),
+    ("rhodes", Part::Keys, Instrument),
+    ("wurli", Part::Keys, Instrument),
+    ("wurlitzer", Part::Keys, Instrument),
+    ("organ", Part::Organ, Instrument),
+    ("hammond", Part::Organ, Instrument),
+    ("ep", Part::Keys, Instrument),
+    ("clav", Part::Keys, Instrument),
+    ("synth", Part::Synth, Instrument),
+    ("pad", Part::Pad, Instrument),
+    ("string", Part::Strings, Instrument),
+    ("orchestra", Part::Strings, Instrument),
+    ("orch", Part::Strings, Instrument),
+    ("violin", Part::Strings, Instrument),
+    ("viola", Part::Strings, Instrument),
+    ("cello", Part::Strings, Instrument),
+    ("brass", Part::Brass, Instrument),
+    ("horn", Part::Brass, Instrument),
+    ("trumpet", Part::Brass, Instrument),
+    ("trombone", Part::Brass, Instrument),
+    ("sax", Part::Woodwinds, Instrument),
+    ("saxophone", Part::Woodwinds, Instrument),
+    ("flute", Part::Woodwinds, Instrument),
+    ("woodwind", Part::Woodwinds, Instrument),
+    ("harp", Part::Strings, Instrument),
+    ("bell", Part::Bells, Instrument),
+    ("glock", Part::Bells, Instrument),
+    ("glockenspiel", Part::Bells, Instrument),
+    ("celesta", Part::Bells, Instrument),
+    ("mellotron", Part::Keys, Instrument),
+    ("accordion", Part::Keys, Instrument),
+    ("fx", Part::Fx, Generic),
+    ("sfx", Part::Fx, Generic),
+    ("riser", Part::Fx, Generic),
+    ("sweep", Part::Fx, Generic),
+    ("swell", Part::Fx, Generic),
+    ("ambient", Part::Pad, Generic),
+    ("ambience", Part::Pad, Generic),
+    ("atmos", Part::Pad, Generic),
+    ("atmosphere", Part::Pad, Generic),
+    ("texture", Part::Pad, Generic),
+    ("drone", Part::Pad, Generic),
+    ("arp", Part::Synth, Generic),
+    ("noise", Part::Fx, Generic),
+    ("impact", Part::Fx, Generic),
+    ("teclado", Part::Keys, Instrument),
+    ("organo", Part::Organ, Instrument),
+    ("sintetizador", Part::Synth, Instrument),
+    ("sintetizadores", Part::Synth, Instrument),
+    ("sinte", Part::Synth, Instrument),
+    ("colchon", Part::Pad, Instrument),
+    ("colchones", Part::Pad, Instrument),
+    ("cuerda", Part::Strings, Instrument),
+    ("violines", Part::Strings, Instrument),
+    ("chelo", Part::Strings, Instrument),
+    ("viento", Part::Brass, Instrument),
+    ("metales", Part::Brass, Instrument),
+    ("trompeta", Part::Brass, Instrument),
+    ("saxo", Part::Woodwinds, Instrument),
+    ("flauta", Part::Woodwinds, Instrument),
+    ("campana", Part::Bells, Instrument),
     // Guitars.
-    ("guitar", Bus::Guitars, Instrument),
-    ("gtr", Bus::Guitars, Instrument),
-    ("eg", Bus::Guitars, Instrument),
-    ("ag", Bus::Guitars, Instrument),
-    ("banjo", Bus::Guitars, Instrument),
-    ("mandolin", Bus::Guitars, Instrument),
-    ("mando", Bus::Guitars, Instrument),
-    ("ukulele", Bus::Guitars, Instrument),
-    ("uke", Bus::Guitars, Instrument),
-    ("dobro", Bus::Guitars, Instrument),
-    ("acoustic", Bus::Guitars, Generic),
-    ("electric", Bus::Guitars, Generic),
-    ("steel", Bus::Guitars, Generic),
-    ("nylon", Bus::Guitars, Generic),
-    ("guitarra", Bus::Guitars, Instrument),
-    ("requinto", Bus::Guitars, Instrument),
-    ("charango", Bus::Guitars, Instrument),
-    ("electrica", Bus::Guitars, Generic),
-    ("electrico", Bus::Guitars, Generic),
-    ("acustica", Bus::Guitars, Generic),
-    ("acustico", Bus::Guitars, Generic),
+    ("guitar", Part::Guitar, Instrument),
+    ("gtr", Part::Guitar, Instrument),
+    ("eg", Part::ElectricGuitar, Instrument),
+    ("ag", Part::AcousticGuitar, Instrument),
+    ("banjo", Part::Guitar, Instrument),
+    ("mandolin", Part::Guitar, Instrument),
+    ("mando", Part::Guitar, Instrument),
+    ("ukulele", Part::Guitar, Instrument),
+    ("uke", Part::Guitar, Instrument),
+    ("dobro", Part::Guitar, Instrument),
+    ("acoustic", Part::AcousticGuitar, Generic),
+    ("electric", Part::ElectricGuitar, Generic),
+    ("steel", Part::Guitar, Generic),
+    ("nylon", Part::AcousticGuitar, Generic),
+    ("guitarra", Part::Guitar, Instrument),
+    ("requinto", Part::Guitar, Instrument),
+    ("charango", Part::Guitar, Instrument),
+    ("electrica", Part::ElectricGuitar, Generic),
+    ("electrico", Part::ElectricGuitar, Generic),
+    ("acustica", Part::AcousticGuitar, Generic),
+    ("acustico", Part::AcousticGuitar, Generic),
     // Vocals.
-    ("vocal", Bus::Vocals, Instrument),
-    ("vox", Bus::Vocals, Instrument),
-    ("voc", Bus::Vocals, Instrument),
-    ("bgv", Bus::Vocals, Instrument),
-    ("bv", Bus::Vocals, Instrument),
-    ("choir", Bus::Vocals, Instrument),
-    ("voice", Bus::Vocals, Instrument),
-    ("singer", Bus::Vocals, Instrument),
-    ("harmony", Bus::Vocals, Generic),
-    ("harmonies", Bus::Vocals, Generic),
-    ("spoken", Bus::Vocals, Generic),
-    ("speech", Bus::Vocals, Generic),
-    ("voz", Bus::Vocals, Instrument),
-    ("voces", Bus::Vocals, Instrument),
-    ("coro", Bus::Vocals, Instrument),
-    ("armonia", Bus::Vocals, Generic),
+    ("vocal", Part::Vocals, Instrument),
+    ("vox", Part::Vocals, Instrument),
+    ("voc", Part::Vocals, Instrument),
+    ("bgv", Part::BackingVocals, Instrument),
+    ("bv", Part::BackingVocals, Instrument),
+    ("choir", Part::BackingVocals, Instrument),
+    ("voice", Part::Vocals, Instrument),
+    ("singer", Part::Vocals, Instrument),
+    ("harmony", Part::BackingVocals, Generic),
+    ("harmonies", Part::BackingVocals, Generic),
+    ("spoken", Part::Vocals, Generic),
+    ("speech", Part::Vocals, Generic),
+    ("voz", Part::Vocals, Instrument),
+    ("voces", Part::Vocals, Instrument),
+    ("coro", Part::BackingVocals, Instrument),
+    ("armonia", Part::BackingVocals, Generic),
 ];
 
 /// Two-word instruments, checked before the second word alone.
-const PHRASES: &[(&str, &str, Bus)] = &[
-    ("bass", "guitar", Bus::Bass),
-    ("bass", "synth", Bus::Bass),
-    ("bass", "drum", Bus::Drums),
-    ("bajo", "sinte", Bus::Bass),
-    ("bajo", "sintetizador", Bus::Bass),
-    ("voz", "guia", Bus::Vocals),
+///
+/// A phrase only makes a part more precise; it never moves a name to another
+/// bus. Its part is on the bus of its second word when that word names an
+/// instrument, else on the bus of its first word, which then names one.
+const PHRASES: &[(&str, &str, Part)] = &[
+    ("bass", "guitar", Part::Bass),
+    ("bass", "synth", Part::SynthBass),
+    ("synth", "bass", Part::SynthBass),
+    ("sub", "bass", Part::SynthBass),
+    ("bass", "drum", Part::Drums),
+    ("bajo", "sinte", Part::SynthBass),
+    ("bajo", "sintetizador", Part::SynthBass),
+    ("voz", "guia", Part::Vocals),
+    ("backing", "vocal", Part::BackingVocals),
+    ("electric", "guitar", Part::ElectricGuitar),
+    ("electric", "gtr", Part::ElectricGuitar),
+    ("guitarra", "electrica", Part::ElectricGuitar),
+    ("acoustic", "guitar", Part::AcousticGuitar),
+    ("acoustic", "gtr", Part::AcousticGuitar),
+    ("ac", "gtr", Part::AcousticGuitar),
+    ("guitarra", "acustica", Part::AcousticGuitar),
 ];
 
-fn rule(word: &str) -> Option<(Bus, Weight)> {
+fn rule(word: &str) -> Option<(Part, Weight)> {
     RULES
         .iter()
         .find(|(known, _, _)| *known == word)
-        .map(|&(_, bus, weight)| (bus, weight))
+        .map(|&(_, part, weight)| (part, weight))
 }
 
-fn phrase(first: &str, second: &str) -> Option<Bus> {
+fn phrase(first: &str, second: &str) -> Option<Part> {
     PHRASES
         .iter()
         .find(|(a, b, _)| *a == first && *b == second)
-        .map(|&(_, _, bus)| bus)
+        .map(|&(_, _, part)| part)
 }
 
 /// The word as the table knows it: unchanged when the table has it or when
@@ -440,7 +484,7 @@ fn without_accent(c: char) -> char {
 }
 
 /// The file's own name, without the folders above it or its extension.
-fn file_name(file: &str) -> &str {
+pub(crate) fn file_name(file: &str) -> &str {
     let name = file.rsplit(['/', '\\']).next().unwrap_or(file);
     match name.rsplit_once('.') {
         Some((stem, _)) if !stem.is_empty() => stem,

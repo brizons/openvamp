@@ -272,3 +272,28 @@ fn every_bus_sits_in_bus_all_at_its_index() {
         assert_eq!(Bus::ALL[bus.index()], bus);
     }
 }
+
+#[test]
+fn names_that_now_pick_a_precise_part_keep_their_bus() {
+    // S2: these two-word names pick a more precise part (electric or
+    // acoustic guitar, synth bass, backing vocals) without changing the bus
+    // the words gave them before.
+    assert_names(&[
+        ("Electric Guitar", Bus::Guitars),
+        ("Song - Electric Gtr 2", Bus::Guitars),
+        ("Guitarra Eléctrica FX", Bus::Guitars),
+        ("Acoustic Guitars", Bus::Guitars),
+        ("Acoustic Gtr Loop", Bus::Guitars),
+        ("Ac Gtr", Bus::Guitars),
+        ("Piano Guitarra Acústica", Bus::Guitars),
+        ("Electric Guitar Bass", Bus::Bass),
+        ("Synth Bass Pad", Bus::KeysPads),
+        ("Sub Bass", Bus::Bass),
+        ("SubBass", Bus::Bass),
+        ("Backing Vocals", Bus::Vocals),
+        ("Backing Vox Choir", Bus::Vocals),
+    ]);
+    for name in ["Backing", "Ac", "Backing Track"] {
+        assert_eq!(bus_for_name(name), None, "{name:?} names no instrument");
+    }
+}
