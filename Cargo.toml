@@ -29,19 +29,31 @@ library = { path = "crates/library" }
 clap = { version = "4.6.7", features = ["derive"] }
 cpal = "0.18.2"
 crossterm = "0.29.0"
-# Test fixtures only for now; the song import will encode FLAC with it.
+# The song import writes FLAC stems with it; pure Rust, single-threaded.
 flacenc = { version = "0.5.1", default-features = false }
 gpui = "=0.2.2"
 hound = "3.5.1"
 rtrb = "0.4.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# FLAC only for now; the song import adds MP3 and AAC.
-symphonia = { version = "0.6.1", default-features = false, features = ["flac"] }
+# FLAC stems for the player; the song import also reads MP3, AAC in M4A and
+# the WAV files hound cannot read, and skips ID3v2 tags before any of them.
+symphonia = { version = "0.6.1", default-features = false, features = [
+    "aac",
+    "flac",
+    "id3v2",
+    "isomp4",
+    "mp3",
+    "pcm",
+    "wav",
+] }
 tempfile = "3.27.0"
 thiserror = "2.0"
 trash = "5.4.0"
 triple_buffer = "9.0.1"
+# Song import from a ZIP: stored and deflated entries only, deflate in pure
+# Rust (zlib-rs). 9.5.1 is the newest release for rust-version 1.88.
+zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [patch.crates-io]
 # libc 0.2.190+ dropped ENOATTR on Linux; see third_party/xattr-0.2.3/PATCHED.md.

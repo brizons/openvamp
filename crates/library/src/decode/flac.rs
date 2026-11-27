@@ -154,6 +154,11 @@ impl FlacStem {
         self.frames
     }
 
+    /// Channels: 1 or 2.
+    pub(crate) fn channels(&self) -> u16 {
+        self.channels
+    }
+
     /// Decodes the whole stem to interleaved `f32`, as [`crate::load_song`]
     /// decodes a WAV stem. Audio past the declared length is left out; audio
     /// that stops before it, or that misses frames, is an error.

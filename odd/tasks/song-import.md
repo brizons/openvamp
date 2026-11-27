@@ -65,9 +65,9 @@ Requirements quote `docs/mvp-spec.md` (F1) and the user verbatim. Items marked *
 
 | ID | Specs | Route | Status | Commits |
 |----|-------|-------|--------|---------|
-| T1 | S2 | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L4) | see L4 |
+| T1 | S2 | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L4; verified L7; review approved L8) | 883b398 |
 | T2 | S6 | delegated (parallel unit with T1, disjoint surface `crates/library` decoding, `Cargo.toml`, `Cargo.lock`) | done (L5); independent verifier pending | see L5 |
-| T3 | S1, S3, S4, S5 (library side) | delegated (context backstop); needs T1 and T2 | pending | |
+| T3 | S1, S3, S4, S5 (library side) | delegated (context backstop); needs T1 and T2 | done (L9); independent verifier pending | see L9 |
 | T4 | S7 | delegated (context backstop); needs T3 | pending | |
 | T5 | S8 | inline, with each task's own docs | pending | |
 
@@ -116,3 +116,45 @@ Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` an
     3. A STREAMINFO with no length is refused.
   - **S1 assumption rewritten:** a WAV or FLAC file the player cannot read as-is (for example an 8-bit or 64-bit float WAV, or a FLAC with an ID3 tag) is decoded and written as FLAC like a lossy file, instead of being refused. Only more than two channels is refused. Every stem the import writes is opened with the player's own reader before the package is finished.
   - Risk: item 3 (`LoadError::Decode`'s source type and a new public `SongProblem` variant) and item 5 (new dependencies), so T2 gets an independent verifier.
+- **L6** (2026-11-26): native review, with the slices in detached worktrees under `multitrack-app-worktrees/`.
+  - **T1** (`si-t1`, bc999ea..883b398): high risk, `review_due`; lenses reliability and readability.
+  - **T2** (`si-t2`, 883b398..0c390d5): high risk, `review_due`; lenses risk, resilience and reliability.
+  - The user granted both consents ("Revisar este cambio" for each).
+  - Each review starts only after its independent verifier, because the tier's verifier runs first. T1 names item 3, so it gets a verifier too; it was launched with this entry. The T2 verifier was launched at L5.
+  - T3 was launched in the main tree at the same time, on top of 0c390d5. The writer was told that fixes to T2's code may be forwarded.
+- **L7** (2026-11-26): the T1 verifier passed every probe, with no blockers and no advisories.
+  - **Corpus:** its own corpus of 35,806 names gave identical `bus_for_name` and `bus_for_stem` at bc999ea and at 883b398.
+  - **Acceptance:** the `EG 1.wav` acceptance passes for all its spellings.
+  - **Tests:** `cargo test -p domain` passes 152; `bus_rules.rs` only gained lines. `cargo test -p app --test mixer` passes 9 and `cargo test -p openvamp --test mixer_screen` passes 25.
+  - **Scratch:** the parent removed the T1 writer's and verifier's scratch folders, and the T2 writer's.
+  - **Review:** T1's native review started from the user's grant.
+- **L8** (2026-11-26): the T1 review (lineage review-fd7223ce85e0071f) approved and was acknowledged (`gentle-ai.review-acknowledged/v1`), so the reviewed boundary is now 883b398. It left non-blocking findings:
+  - (WARNING) the `PHRASES` doc comment in bus.rs states a rule that "bass guitar", "bass synth" and "voz guia" break;
+  - (SUGGESTION) `Part::ALL` is hand-maintained, with no check that it lists every variant;
+  - (SUGGESTION) a parts test compares `bus_for_name` with the expression it is defined as;
+  - (SUGGESTION) the "buses unchanged" invariant lives only in the log, not in a committed test.
+
+  The warning and the two test suggestions were sent to the T3 writer, because they fall within its surface. The `ALL` check stays a follow-up.
+- **L9** (2026-11-26): T3 delivered.
+  - **Domain:** `domain::import` adds `SongDraft`, `MapChange`, `DraftStem`, `to_package` → `PackagedDraft` with warnings, `DraftError`, and `song_folder_name`. `bus_for_stem` now reads `Part::from_id` first, as decided in L4.
+  - **Library:** `library::import` (with `source`, `audio`, `mp4` and `save`) adds:
+    - `probe_import(&Path) -> ImportDraft`, which exposes `stems()`, `refused()` and `song`;
+    - `Library::save_import(&draft, &mut progress, &AtomicBool)`, which writes stems on scoped threads and reports `ImportProgress`;
+    - `ImportError` (`Draft`, `Refused`, `Cancelled`, `Stem`, `Write`, `Source`, `Zip`, `NoAudio`, `TooManyFiles`, `StemsChanged`).
+  - **Dependencies:** symphonia features `aac, isomp4, mp3, pcm, wav, id3v2`; flacenc is now a normal dependency; `zip` 9.5.1 with zlib-rs; `constant_time_eq` pinned to 0.6.1, because 0.6.2 is one day old. The 9 new crates are MIT, MIT OR Apache-2.0, CC0-1.0 OR MIT-0 OR Apache-2.0, and MPL-2.0. `Cargo.lock` only adds packages.
+  - **Gapless:** MP3 lengths come from the LAME/Xing header, because symphonia 0.6.1 keeps full packet durations. M4A edit lists are read by `import/mp4.rs`, because symphonia does not apply them. Both fixtures import with their exact source length.
+  - **T1 review follow-ups:** the `PHRASES` comment is reworded, a test pins every bc999ea word and phrase to its base bus, and the parts test asserts literal buses.
+  - **Writer's assumptions, kept:**
+    - a refused file blocks the whole save;
+    - a folder's title is its whole name, and only ".zip" is removed;
+    - a change at bar 1 is an error;
+    - the song's rate is the one most stems share;
+    - imports take at most 256 files, ZIP entries over 4 GiB are refused, and empty audio files are refused.
+  - **Checks:**
+    - RED: 14 domain and 18 library tests failed against stubs.
+    - GREEN: `cargo test -p library -p domain` passes 323 tests (3 ignored); `cargo test -p app` passes 139; workspace check, clippy and `cargo doc -D warnings` are clean.
+    - Differential against 0c390d5 through render-cli on six songs: identical.
+    - Release timing: 24 five-minute stems (12 MP3, 12 WAV) save in 6.2–9.8 s in parallel, 26 s with one worker, and produce 1.4 GB.
+  - **Parent fix:** `import/save.rs` had copied the Windows reserved-name list from `setlists.rs`. It now calls `setlists::is_windows_reserved` (now `pub(crate)`). The parent re-ran fmt, `cargo test -p library -p domain` (323 pass) and clippy, all clean.
+  - **Disk:** the parent removed T3's scratch, `target/release` and `target/debug/incremental` (free 6.4 GiB).
+  - Risk: item 5 (dependencies) and item 2 (ZIP entry names as untrusted paths), so T3 gets an independent verifier.

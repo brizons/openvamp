@@ -22,6 +22,11 @@
 //! beside its `song.json`, with the rules the [settings files](SettingsError)
 //! share. A [`ConfigStore`] keeps the global bus settings and the routing of
 //! every device in the app's configuration folder ([`config_folder`]).
+//!
+//! [`probe_import`] reads a folder or ZIP of WAV, FLAC, MP3 and M4A stems as
+//! an [`ImportDraft`] to edit, and [`Library::save_import`] saves it as a new
+//! song folder in the library, copying the stems the player reads and
+//! transcoding the others to FLAC (see the [`import`] module).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -46,6 +51,7 @@ use decode::{FlacStem, starts_as_flac};
 
 mod config;
 mod decode;
+pub mod import;
 mod mix_store;
 mod setlist_order;
 mod setlist_songs;
@@ -59,6 +65,10 @@ pub use config::{
     config_folder,
 };
 pub use decode::DecodeError;
+pub use import::{
+    ImportDraft, ImportError, ImportProgress, MAX_IMPORT_FILES, ProbedStem, RefusedFile,
+    SONG_FOLDER_EXTENSION, SourceFormat, StemAction, probe_import, song_folder_name,
+};
 pub use mix_store::{MIX_FILE, SongMix, read_mix, write_mix};
 pub use setlist_songs::{SetlistSongs, SongUnavailable};
 pub use setlists::{
@@ -346,6 +356,14 @@ impl OpenedStem {
         match self {
             Self::Wav { reader, .. } => u64::from(reader.duration()),
             Self::Flac(flac) => flac.frames(),
+        }
+    }
+
+    /// Channels, from the header: 1 or 2.
+    fn channels(&self) -> u16 {
+        match self {
+            Self::Wav { reader, .. } => reader.spec().channels,
+            Self::Flac(flac) => flac.channels(),
         }
     }
 }
@@ -651,6 +669,80 @@ fn decode(stem: &Stem, opened: OpenedStem) -> Result<StemAudio, LoadError> {
         samples,
         frames,
     })
+}
+
+/// Frames [`read_through`] reads at a time.
+const READ_THROUGH_BLOCK: usize = 4_096;
+
+/// Reads every sample of an opened stem with the reader the player uses, a
+/// block at a time and keeping none, as a song is proved to play to its end
+/// before an import saves it. A WAV file must hold every sample its header
+/// declares and a FLAC file must decode every declared frame, as
+/// [`load_song`] requires. `keep_going` is asked between blocks; the result
+/// is `Ok(false)` when it said to stop.
+fn read_through(
+    stem: &Stem,
+    opened: OpenedStem,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<bool, LoadError> {
+    let decode_error = |source: DecodeError| LoadError::Decode {
+        id: stem.id.clone(),
+        file: stem.file.clone(),
+        source,
+    };
+    match opened {
+        OpenedStem::Wav {
+            mut reader,
+            max_samples,
+        } => {
+            if u64::from(reader.len()) > max_samples {
+                return Err(decode_error(
+                    hound::Error::FormatError(
+                        "the file holds fewer samples than its header declares",
+                    )
+                    .into(),
+                ));
+            }
+            let block = READ_THROUGH_BLOCK * usize::from(reader.spec().channels);
+            let mut read = 0;
+            match reader.spec().sample_format {
+                SampleFormat::Int => {
+                    for sample in reader.samples::<i32>() {
+                        sample.map_err(|error| decode_error(error.into()))?;
+                        read += 1;
+                        if read % block == 0 && !keep_going() {
+                            return Ok(false);
+                        }
+                    }
+                }
+                SampleFormat::Float => {
+                    for sample in reader.samples::<f32>() {
+                        sample.map_err(|error| decode_error(error.into()))?;
+                        read += 1;
+                        if read % block == 0 && !keep_going() {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+            Ok(true)
+        }
+        OpenedStem::Flac(mut flac) => {
+            let frames = flac.frames();
+            let mut block = vec![0.0; 2 * READ_THROUGH_BLOCK];
+            let mut at = 0;
+            while at < frames {
+                let count = (frames - at).min(READ_THROUGH_BLOCK as u64);
+                flac.read(at, &mut block[..2 * count as usize])
+                    .map_err(decode_error)?;
+                at += count;
+                if !keep_going() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
 }
 
 /// The factor that turns a `bits`-bit integer sample into `f32`: 2^-(bits - 1),

@@ -277,7 +277,7 @@ struct Found {
 }
 
 /// What the listing shows of `song`, found at `path`.
-fn entry(path: &str, song: &Song) -> SongEntry {
+pub(crate) fn entry(path: &str, song: &Song) -> SongEntry {
     let arrangements = song
         .arrangements()
         .iter()

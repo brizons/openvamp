@@ -1,6 +1,6 @@
 [package]
 name = "library"
-description = "Song package and setlist I/O: reads song folders and their WAV and FLAC stems, streams stems from disk for live playback, writes rendered WAV files, keeps setlist files and song mixes in the library folder and the bus settings and routing in the app configuration folder."
+description = "Song package and setlist I/O: reads song folders and their WAV and FLAC stems, streams stems from disk for live playback, imports folders and ZIP files of WAV, FLAC, MP3 and M4A stems as new song folders, writes rendered WAV files, keeps setlist files and song mixes in the library folder and the bus settings and routing in the app configuration folder."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,7 @@ license.workspace = true
 [dependencies]
 domain.workspace = true
 engine.workspace = true
+flacenc.workspace = true
 hound.workspace = true
 rtrb.workspace = true
 serde.workspace = true
@@ -17,7 +18,7 @@ serde_json.workspace = true
 symphonia.workspace = true
 thiserror.workspace = true
 trash.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
-flacenc.workspace = true
 tempfile.workspace = true
