@@ -220,7 +220,8 @@ fn probe_zip(path: &Path) -> Result<Vec<Probed>, ImportError> {
     Ok(entries
         .into_iter()
         .map(|(name, (format, index))| {
-            let facts = extract(&mut archive, index, &scratch.path).and_then(|file| {
+            // Read once and removed: nothing to flush to disk.
+            let facts = extract(&mut archive, index, &scratch.path, false).and_then(|file| {
                 let facts = probe_file(&scratch.path, &file, format);
                 let _ = fs::remove_file(scratch.path.join(&file));
                 facts
@@ -246,12 +247,14 @@ fn zip_error(path: &Path, error: zip::result::ZipError) -> ImportError {
 }
 
 /// Extracts ZIP entry `index` into `folder` under a name made up here, never
-/// the entry's own; returns that name. A failure is the reason the entry is
-/// refused, and leaves no file.
+/// the entry's own; returns that name. With `durable`, the file is flushed
+/// to disk, as every file a song keeps is before it is renamed into place.
+/// A failure is the reason the entry is refused, and leaves no file.
 pub(super) fn extract(
     archive: &mut ZipArchive<File>,
     index: usize,
     folder: &Path,
+    durable: bool,
 ) -> Result<String, String> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let name = format!(".entry-{}", NEXT.fetch_add(1, Ordering::Relaxed));
@@ -273,8 +276,12 @@ pub(super) fn extract(
         if copied > MAX_ENTRY_BYTES {
             return Err("it is larger than any stem (4 GiB)".to_owned());
         }
-        file.flush()
-            .map_err(|error| format!("it cannot be extracted: {error}"))?;
+        if durable {
+            file.sync_all()
+        } else {
+            file.flush()
+        }
+        .map_err(|error| format!("it cannot be extracted: {error}"))?;
         Ok(())
     })();
     match result {
@@ -393,8 +400,25 @@ fn player_reason(problem: SongProblem) -> String {
     format!("the player cannot read it as it is ({detail})")
 }
 
-/// A hidden folder, `.import-<pid>-<n>.tmp`, removed with everything in it
-/// on drop unless kept.
+/// The name of the hidden folder a [`Scratch`] makes: `.import-<pid>-<n>.tmp`,
+/// with the process's id and a number of its own.
+fn scratch_name(pid: u32, n: u64) -> String {
+    format!(".import-{pid}-{n}.tmp")
+}
+
+/// The process id in `name` when it is exactly a name [`scratch_name`]
+/// makes (numbers as it writes them, without signs or leading zeros);
+/// `None` for any other name.
+pub(super) fn scratch_pid(name: &str) -> Option<u32> {
+    let numbers = name.strip_prefix(".import-")?.strip_suffix(".tmp")?;
+    let (pid, n) = numbers.split_once('-')?;
+    let pid_value: u32 = pid.parse().ok()?;
+    let n_value: u64 = n.parse().ok()?;
+    (scratch_name(pid_value, n_value) == name).then_some(pid_value)
+}
+
+/// A hidden folder, `.import-<pid>-<n>.tmp` ([`scratch_name`]), removed with
+/// everything in it on drop unless kept.
 pub(super) struct Scratch {
     pub(super) path: PathBuf,
     kept: bool,
@@ -408,7 +432,7 @@ impl Scratch {
         let mut last_error = None;
         for _ in 0..100 {
             let n = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path = parent.join(format!(".import-{}-{n}.tmp", process::id()));
+            let path = parent.join(scratch_name(process::id(), n));
             match fs::create_dir(&path) {
                 Ok(()) => return Ok(Self { path, kept: false }),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {

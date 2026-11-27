@@ -460,6 +460,26 @@ impl LibraryPage {
         self.import.as_mut().is_some_and(SongImport::progress_moved)
     }
 
+    /// Whether a song is being saved: the Song editor waits for its save.
+    pub fn saving(&self) -> bool {
+        self.import
+            .as_ref()
+            .is_some_and(|import| import.saving().is_some())
+    }
+
+    /// Cancels the save under way, as Discard does, and waits at most
+    /// `patience` until it has stopped and removed its hidden folder from
+    /// the library: whether no save runs any more. With no patience, it
+    /// only cancels; the Song editor reads "Cancelling…" until
+    /// [`Self::saved`] has the save's result, and the Library shows then.
+    /// Quitting while a song is being saved goes through here, so the
+    /// process never ends in the middle of a save.
+    pub fn stop_save(&mut self, patience: std::time::Duration) -> bool {
+        self.import
+            .as_mut()
+            .is_none_or(|import| import.stop_save(patience))
+    }
+
     /// Whether the keys type into a field: the song search, a setlist's
     /// name, or a field of the Song editor.
     pub fn takes_keys(&self) -> bool {

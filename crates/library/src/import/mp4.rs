@@ -14,7 +14,9 @@
 //!   `00000000 00000840 000001FF 000000000001ADC1`.
 //!
 //! The edit list is read first; a file with several edits that are not
-//! empty, and no tag, is left untrimmed.
+//! empty, and no tag, is left untrimmed. So is a file whose boxes cannot be
+//! read (one cut short, one that claims more than its file holds): the
+//! decoder read its audio, and its length is counted as it decodes.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -40,9 +42,16 @@ const MAX_TAG_BYTES: u64 = 512;
 
 /// The edit list of the first audio track of `file`, in frames of its media
 /// timescale (the sample rate in M4A files); `None` without one the import
-/// can apply.
+/// can apply, or when a box on the way cannot be read.
 pub(super) fn edit_list(file: &mut File) -> io::Result<Option<EditList>> {
     let end = file.metadata()?.len();
+    // A box that cannot be read ends the search: the file plays untrimmed
+    // rather than being refused, since its decoder read its audio.
+    Ok(find_edits(file, end).unwrap_or(None))
+}
+
+/// [`edit_list`] in the first `end` bytes of `file`.
+fn find_edits(file: &mut File, end: u64) -> io::Result<Option<EditList>> {
     let Some(moov) = find(file, 0, end, *b"moov")? else {
         return Ok(None);
     };
@@ -171,7 +180,9 @@ fn children(file: &mut File, start: u64, end: u64) -> io::Result<Vec<Mp4Box>> {
             }
             size => (8, size),
         };
-        if size < header_len || at + size > end {
+        // `at` is at most `end - 8`: comparing with what is left never
+        // overflows, so a size near u64::MAX ends the walk.
+        if size < header_len || size > end - at {
             break;
         }
         boxes.push(Mp4Box {

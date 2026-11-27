@@ -4,9 +4,11 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, SystemTime};
 
 use domain::{PackagedDraft, Stem};
 
@@ -27,6 +29,18 @@ const MAX_FOLDER_NAME_BYTES: usize = 200;
 
 /// Name an empty title gets.
 const UNTITLED: &str = "Untitled";
+
+/// How long a hidden build folder of another process's import must have
+/// gone unchanged before an import removes it ([`remove_stale_builds`]).
+/// An import that runs writes into its folder every second of audio or
+/// MiB of copy, so a folder this still belongs to an import that will never
+/// finish: the app crashed or was killed, or the machine lost power.
+const STALE_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// Most entries [`remove_stale_builds`] looks at in one build folder: an
+/// import writes at most [`super::MAX_IMPORT_FILES`] stems and a few files
+/// more, so a folder holding more is not one it left.
+const MAX_BUILD_ENTRIES: usize = 4 * super::MAX_IMPORT_FILES;
 
 /// Bytes copied at a time, between two progress reports.
 const COPY_CHUNK: usize = 1 << 20;
@@ -115,6 +129,7 @@ impl Library {
         if cancel.load(Ordering::Relaxed) {
             return Err(ImportError::Cancelled);
         }
+        remove_stale_builds(&root);
         let scratch = Scratch::create_in(&root).map_err(|source| ImportError::Write {
             path: root.clone(),
             source,
@@ -144,6 +159,66 @@ impl Library {
         sync_folder(&root);
         Ok(entry(&name, &song))
     }
+}
+
+/// Removes from the library folder `root` the hidden build folders that
+/// imports cut off before they could remove them left behind: a folder
+/// whose name is exactly one an import makes (`.import-<pid>-<n>.tmp`),
+/// made by another process than this one, in which nothing has changed for
+/// [`STALE_AFTER`]. It never follows a link, and keeps a folder it cannot
+/// look into, one with more than [`MAX_BUILD_ENTRIES`] entries, and
+/// anything else in the library; what it cannot remove stays for the next
+/// import.
+fn remove_stale_builds(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(source::scratch_pid) else {
+            continue;
+        };
+        // This process's own builds are its own business: a running one
+        // is never touched, and a finished one removed itself.
+        if pid == process::id() {
+            continue;
+        }
+        let path = entry.path();
+        let is_folder = fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir());
+        let stale = is_folder
+            && last_change(&path)
+                .and_then(|changed| now.duration_since(changed).ok())
+                .is_some_and(|unchanged| unchanged > STALE_AFTER);
+        if stale {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// When `folder` or anything in it last changed, without following links;
+/// `None` when something in it cannot be read or it holds more than
+/// [`MAX_BUILD_ENTRIES`] entries.
+fn last_change(folder: &Path) -> Option<SystemTime> {
+    let mut last = fs::symlink_metadata(folder).ok()?.modified().ok()?;
+    let mut folders = vec![folder.to_owned()];
+    let mut seen = 0;
+    while let Some(next) = folders.pop() {
+        for entry in fs::read_dir(&next).ok()? {
+            let entry = entry.ok()?;
+            seen += 1;
+            if seen > MAX_BUILD_ENTRIES {
+                return None;
+            }
+            // A directory entry's metadata does not follow a link.
+            let meta = entry.metadata().ok()?;
+            last = last.max(meta.modified().ok()?);
+            if meta.is_dir() {
+                folders.push(entry.path());
+            }
+        }
+    }
+    Some(last)
 }
 
 /// Writes every stem of `draft` into `folder`'s stems folder, and reads each
@@ -286,17 +361,26 @@ fn write_stem(
             }
             let zip = archive.as_mut().expect("opened above");
             check_entry_name(zip, *entry, stem)?;
-            let name = source::extract(zip, *entry, folder).map_err(stem_error)?;
+            // A stem copied as it is is the extracted file, renamed into
+            // the song: it is flushed to disk first, as every other stem.
+            let durable = stem.action == StemAction::Copy;
+            let name = source::extract(zip, *entry, folder, durable).map_err(stem_error)?;
             (folder.join(&name), Some(folder.join(name)))
         }
         _ => unreachable!("a draft's locations match its source"),
     };
     let result = match &stem.action {
         StemAction::Copy => match &extracted {
-            Some(file) => fs::rename(file, target).map_err(write_error).map(|()| {
-                report(facts.length_frames);
-                facts.length_frames
-            }),
+            Some(file) => fs::rename(file, target)
+                .map_err(write_error)
+                .and_then(|()| {
+                    // As a copy from a folder, a cancel stops the stem here.
+                    if report(facts.length_frames) {
+                        Ok(facts.length_frames)
+                    } else {
+                        Err(ImportError::Cancelled)
+                    }
+                }),
             None => copy(&input, target, facts.length_frames, report)
                 .map_err(write_error)
                 .and_then(|copied| {

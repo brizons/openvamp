@@ -38,19 +38,28 @@ fn ending_asks_first_only_while_a_song_plays() {
             EndRequest::EndNow
         };
         assert_eq!(
-            end_request(Some(transport), false),
+            end_request(Some(transport), false, false),
             expected,
             "{transport:?}"
         );
     }
-    assert_eq!(end_request(None, false), EndRequest::EndNow, "no song");
+    assert_eq!(
+        end_request(None, false, false),
+        EndRequest::EndNow,
+        "no song"
+    );
 }
 
 #[test]
 fn a_second_request_waits_for_the_question_on_screen() {
-    for transport in ALL.map(Some).into_iter().chain([None]) {
+    for (transport, saving) in ALL
+        .map(Some)
+        .into_iter()
+        .chain([None])
+        .flat_map(|transport| [(transport, false), (transport, true)])
+    {
         assert_eq!(
-            end_request(transport, true),
+            end_request(transport, saving, true),
             EndRequest::Wait,
             "{transport:?}"
         );
@@ -158,4 +167,51 @@ fn while_the_question_is_open_the_controls_beneath_it_do_nothing() {
     // A release always reaches the hold, so it never stays counting.
     assert!(control_acts(Intent::PanicUp, true));
     assert!(control_acts(Intent::PanicUp, false));
+}
+
+#[test]
+fn ending_asks_first_while_a_song_is_being_saved_whatever_plays() {
+    for transport in ALL.map(Some).into_iter().chain([None]) {
+        assert_eq!(
+            end_request(transport, true, false),
+            EndRequest::Ask,
+            "{transport:?}"
+        );
+    }
+}
+
+#[test]
+fn the_question_while_saving_offers_keep_saving_as_its_cancel_answer() {
+    for ending in [Ending::Quit, Ending::CloseWindow] {
+        for dialog in DIALOGS {
+            let question = ending.saving_question(dialog);
+            assert_eq!(question.message, "A song is being saved", "{ending:?}");
+            let labels: Vec<(&str, bool)> = question
+                .answers
+                .iter()
+                .enumerate()
+                .map(|(index, answer)| {
+                    assert_eq!(answer.keeps_playing, !question.ends(Some(index)));
+                    (answer.label, question.ends(Some(index)))
+                })
+                .collect();
+            let expected = match dialog {
+                Dialog::Mac | Dialog::InWindow => [("Quit", true), ("Keep saving", false)],
+                Dialog::Windows => [("Keep saving", false), ("Quit", true)],
+            };
+            assert_eq!(labels, expected, "{ending:?} {dialog:?}");
+            assert!(
+                !question.ends(None),
+                "a dialog gone unanswered keeps saving"
+            );
+        }
+    }
+    assert_eq!(
+        Ending::Quit.saving_question(Dialog::Mac).detail,
+        "Quit anyway? The save is cancelled and nothing of the song is kept; a song that plays stops."
+    );
+    assert_eq!(
+        Ending::CloseWindow.saving_question(Dialog::Mac).detail,
+        "Close the window and quit anyway? The save is cancelled and nothing of the song is kept; a song that plays stops."
+    );
 }

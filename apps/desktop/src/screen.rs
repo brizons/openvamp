@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use app::{AudioOutput, SessionOptions};
 use domain::SetlistItem;
 use gpui::{
-    App, AppContext, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
+    AnyWindowHandle, App, AppContext, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
     ModifiersChangedEvent, PathPromptOptions, PromptButton, PromptLevel, Render, ScrollHandle,
     Subscription, Task, Window, prelude::*,
 };
@@ -32,6 +32,7 @@ use openvamp_desktop::show::{
     LoadedSetlist, OpenFailure, Prepared, Replaced, Show, Source, close, reopen_previous,
     replace_prepared,
 };
+use openvamp_desktop::song_import::STOP_PATIENCE;
 use openvamp_desktop::tick::Timed;
 use openvamp_desktop::view::{PerformView, SongFacts};
 
@@ -46,6 +47,10 @@ use crate::{library_ui, mixer_ui, output_ui, song_editor_ui, ui};
 /// ([`openvamp_desktop::mixer::needs_frames`]), else only when it changed
 /// what the screens show ([`Timed::turn`]).
 const POLL_EVERY: Duration = Duration::from_millis(33);
+
+/// The longest a quit waits for a song import's save, cancelled, to report
+/// that it stopped ([`Perform::end_once_saved`]).
+const QUIT_PATIENCE: Duration = Duration::from_secs(10);
 
 /// The Perform screen.
 pub struct Perform {
@@ -67,6 +72,9 @@ pub struct Perform {
     opened: Opened,
     /// Why the last library folder picked did not open.
     library_problem: Option<String>,
+    /// How the show ends once the save it cancelled has stopped
+    /// ([`Self::end_once_saved`]), and the window it ends in.
+    ending_after_save: Option<(Ending, AnyWindowHandle)>,
     /// Where the Library screen's song list is scrolled, so a song just
     /// imported scrolls into view.
     songs_scroll: ScrollHandle,
@@ -102,7 +110,22 @@ impl Perform {
                 }
             }
         });
+        // GPUI gives the future a quit handler returns 100 ms, but calls the
+        // handler itself at once: a song being saved is cancelled here, and
+        // the handler waits until the save has stopped and removed its
+        // hidden folder ([`STOP_PATIENCE`] at most), so the process never
+        // ends in the middle of a save. Quits the app can ask about first
+        // come here once the save has stopped ([`Self::end_once_saved`]);
+        // this covers the others (the Dock, logging out).
         let quit = cx.on_app_quit(|screen, _| {
+            if let Some(library) = &mut screen.library
+                && !library.stop_save(STOP_PATIENCE)
+            {
+                eprintln!(
+                    "warning: the song being saved did not stop within {} s; a later import removes its hidden folder from the library",
+                    STOP_PATIENCE.as_secs()
+                );
+            }
             screen.close_song();
             async {}
         });
@@ -125,6 +148,7 @@ impl Perform {
             library: None,
             opened: Opened::Followed,
             library_problem: None,
+            ending_after_save: None,
             songs_scroll: ScrollHandle::new(),
             settings: AudioSettings::load(ConfigStore::from_environment()),
             mixer: MixerPage::new(),
@@ -158,16 +182,19 @@ impl Perform {
         }
     }
 
-    /// Quits or closes the window: at once when nothing plays (the song,
-    /// if any, stops with its ramp first); while a song plays, only once
-    /// the person confirms ([`end_request`]). Returns whether it ended at
-    /// once, which lets the window close.
+    /// Quits or closes the window: at once when nothing plays and nothing
+    /// is being saved (the song, if any, stops with its ramp first); while a
+    /// song plays or is being saved, only once the person confirms
+    /// ([`end_request`]), and after a save, only once it has stopped
+    /// ([`Self::end_once_saved`]). Returns whether it ended at once, which
+    /// lets the window close.
     fn end_show(&mut self, ending: Ending, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let transport = self.loaded.as_mut().map(|show| {
             show.poll();
             show.snapshot().transport
         });
-        match end_request(transport, self.asking) {
+        let saving = self.library.as_ref().is_some_and(LibraryPage::saving);
+        match end_request(transport, saving, self.controls_wait()) {
             EndRequest::EndNow => {
                 self.close_song();
                 if ending == Ending::Quit {
@@ -176,15 +203,69 @@ impl Perform {
                 true
             }
             EndRequest::Ask => {
-                self.ask_before_ending(ending, window, cx);
+                self.ask_before_ending(ending, saving, window, cx);
                 false
             }
             EndRequest::Wait => false,
         }
     }
 
-    fn ask_before_ending(&mut self, ending: Ending, window: &mut Window, cx: &mut Context<Self>) {
-        let question = ending.question(Dialog::HERE);
+    /// Whether the controls wait: the question before ending the show is
+    /// on screen, or the app ends once the save it cancelled has stopped.
+    fn controls_wait(&self) -> bool {
+        self.asking || self.ending_after_save.is_some()
+    }
+
+    /// Ends the show as `ending` says, once nothing is being saved: the
+    /// song stops at once, a save under way is cancelled, and the app quits
+    /// (or the window closes) only when the save reports that it stopped
+    /// and removed its hidden folder ([`Self::run_save`]), or after
+    /// [`QUIT_PATIENCE`] at the latest, so a drive that hangs never keeps
+    /// the app open; the quit handler then still waits for the save.
+    fn end_once_saved(&mut self, ending: Ending, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_song();
+        let Some(library) = self.library.as_mut().filter(|library| library.saving()) else {
+            match ending {
+                Ending::Quit => cx.quit(),
+                Ending::CloseWindow => window.remove_window(),
+            }
+            return;
+        };
+        library.stop_save(Duration::ZERO);
+        self.ending_after_save = Some((ending, window.window_handle()));
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(QUIT_PATIENCE).await;
+            let _ = this.update(cx, |screen, cx| screen.finish_ending(cx));
+        })
+        .detach();
+    }
+
+    /// Carries out the ending [`Self::end_once_saved`] put off, if any.
+    fn finish_ending(&mut self, cx: &mut Context<Self>) {
+        let Some((ending, window)) = self.ending_after_save.take() else {
+            return;
+        };
+        self.close_song();
+        match ending {
+            Ending::Quit => cx.quit(),
+            Ending::CloseWindow => cx.defer(move |cx| {
+                let _ = window.update(cx, |_, window, _| window.remove_window());
+            }),
+        }
+    }
+
+    fn ask_before_ending(
+        &mut self,
+        ending: Ending,
+        saving: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let question = if saving {
+            ending.saving_question(Dialog::HERE)
+        } else {
+            ending.question(Dialog::HERE)
+        };
         let buttons = question.answers.map(|answer| {
             if answer.keeps_playing {
                 PromptButton::cancel(answer.label)
@@ -205,11 +286,7 @@ impl Perform {
             let _ = this.update_in(cx, |screen, window, cx| {
                 screen.asking = false;
                 if question.ends(answer) {
-                    screen.close_song();
-                    match ending {
-                        Ending::Quit => cx.quit(),
-                        Ending::CloseWindow => window.remove_window(),
-                    }
+                    screen.end_once_saved(ending, window, cx);
                 }
                 cx.notify();
             });
@@ -433,7 +510,7 @@ impl Perform {
     /// the question before ending the show is open, the controls do
     /// nothing ([`control_acts`]).
     pub fn handle(&mut self, intent: Intent, window: &mut Window, cx: &mut Context<Self>) {
-        if !control_acts(intent, self.asking) {
+        if !control_acts(intent, self.controls_wait()) {
             return;
         }
         // A pending "Click again to remove …" never outlives leaving the
@@ -560,7 +637,7 @@ impl Perform {
     /// Carries out what a Mixer screen control asks for; nothing while the
     /// question before ending the show is open.
     pub fn mixer_act(&mut self, action: MixerAction, cx: &mut Context<Self>) {
-        if self.asking {
+        if self.controls_wait() {
             return;
         }
         if let Some(show) = &mut self.loaded {
@@ -573,7 +650,7 @@ impl Perform {
     /// while the question before ending the show is open. Another device
     /// opens the song again on it.
     pub fn output_act(&mut self, action: OutputAction, cx: &mut Context<Self>) {
-        if self.asking {
+        if self.controls_wait() {
             return;
         }
         let reopen = self.output.act(
@@ -757,7 +834,7 @@ impl Perform {
     /// Folders or files dropped on "Import stems": the first one is
     /// imported, as if it was picked.
     pub fn import_dropped(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
-        if self.asking {
+        if self.controls_wait() {
             return;
         }
         if let Some(source) = paths.first() {
@@ -784,6 +861,10 @@ impl Perform {
                     if let Some(row) = library.imported_row() {
                         screen.songs_scroll.scroll_to_item(row);
                     }
+                }
+                // A quit put off until the save stopped goes ahead now.
+                if !screen.library.as_ref().is_some_and(LibraryPage::saving) {
+                    screen.finish_ending(cx);
                 }
                 cx.notify();
             });
@@ -1037,7 +1118,7 @@ impl Render for Perform {
             }))
             .child(ui::nav(self.page, cx))
             .child(ui::main().child(body))
-            .when(self.asking, |root| root.child(ui::shield()))
+            .when(self.controls_wait(), |root| root.child(ui::shield()))
     }
 }
 

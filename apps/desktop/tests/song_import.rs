@@ -6,7 +6,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use domain::{
     Arrangement, Bus, DraftStem, Part, SectionMarker, SectionType, SongDraft, SongPackage, Stem,
@@ -20,7 +22,7 @@ use openvamp_desktop::line_edit::LineKey;
 use openvamp_desktop::mixer::MixerPage;
 use openvamp_desktop::output_page::OutputPage;
 use openvamp_desktop::song_import::{
-    ChangeRow, ImportAction, SongEditorView, SongField, StemRow, stems_summary,
+    ChangeRow, ImportAction, STOP_PATIENCE, SongEditorView, SongField, StemRow, stems_summary,
 };
 use openvamp_desktop::tick::Timed;
 
@@ -926,4 +928,109 @@ fn a_save_whose_library_page_was_replaced_stops_or_stays_in_its_own_library() {
         .map(|song| song.path)
         .collect();
     assert_eq!(paths, ["Other.song"]);
+}
+
+/// A folder of `count` stems of `seconds` of 8-bit stereo noise at 48 kHz,
+/// which the import transcodes to FLAC: a save that takes a while.
+fn slow_source(folder: &Path, count: usize, seconds: u32) {
+    fs::create_dir_all(folder).unwrap();
+    let (rate, channels) = (48_000u32, 2u16);
+    let data = rate * seconds * u32::from(channels);
+    let mut bytes = Vec::with_capacity(44 + data as usize);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&rate.to_le_bytes());
+    bytes.extend_from_slice(&(rate * u32::from(channels)).to_le_bytes());
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&8u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data.to_le_bytes());
+    let mut seed: u32 = 0x1234_5678;
+    for _ in 0..data {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        bytes.push(112 + (seed >> 28) as u8);
+    }
+    for index in 0..count {
+        fs::write(folder.join(format!("Stem {index}.wav")), &bytes).unwrap();
+    }
+}
+
+/// The child half of [`quitting_while_a_song_saves_leaves_nothing_behind`]:
+/// a save of the source in `SONG_IMPORT_CHILD_SOURCE` into the library in
+/// `SONG_IMPORT_CHILD_LIBRARY` runs on a thread of its own, as on the
+/// background executor; once it is 1% done, the app quits as
+/// `SONG_IMPORT_CHILD_QUIT` says, and the process ends at once, as GPUI
+/// ends it. It exits with 4 when the save ended before it could quit.
+#[test]
+fn child_quits_while_a_song_saves() {
+    let Ok(library) = std::env::var("SONG_IMPORT_CHILD_LIBRARY") else {
+        return;
+    };
+    let source = PathBuf::from(std::env::var("SONG_IMPORT_CHILD_SOURCE").unwrap());
+    let quit = std::env::var("SONG_IMPORT_CHILD_QUIT").unwrap();
+    let mut page = LibraryPage::open(Path::new(&library), None).unwrap();
+    import(&mut page, &source);
+    act(&mut page, ImportAction::Save);
+    let job = page.take_save().unwrap();
+    let save = thread::spawn(move || job.run());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while editor(&page).saving.unwrap().percent < 1 {
+        if save.is_finished() || Instant::now() > deadline {
+            std::process::exit(4);
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    match quit.as_str() {
+        // "Quit" answered to the question: the save is cancelled, and the
+        // app quits once the save reports back.
+        "answer" => {
+            page.stop_save(Duration::ZERO);
+            page.saved(save.join().unwrap());
+            assert!(!page.saving());
+        }
+        // A quit the app cannot ask about (the Dock, logging out): the
+        // quit handler waits for the save to stop.
+        "handler" => assert!(page.stop_save(STOP_PATIENCE), "the save stopped in time"),
+        // The window and its screen went away first.
+        "drop" => drop(page),
+        other => panic!("unknown quit {other}"),
+    }
+    std::process::exit(0);
+}
+
+#[test]
+fn quitting_while_a_song_saves_leaves_nothing_behind() {
+    if std::env::var("SONG_IMPORT_CHILD_LIBRARY").is_ok() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Slow");
+    slow_source(&source, 8, 60);
+    for quit in ["answer", "handler", "drop"] {
+        let library = dir.path().join(format!("Library {quit}"));
+        write_song(&library.join("Amazing.song"));
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "child_quits_while_a_song_saves",
+                "--test-threads=1",
+            ])
+            .env("SONG_IMPORT_CHILD_LIBRARY", &library)
+            .env("SONG_IMPORT_CHILD_SOURCE", &source)
+            .env("SONG_IMPORT_CHILD_QUIT", quit)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(0), "{quit}: the child quit mid-save");
+        let mut entries: Vec<String> = fs::read_dir(&library)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, ["Amazing.song"], "{quit}: nothing left behind");
+    }
 }

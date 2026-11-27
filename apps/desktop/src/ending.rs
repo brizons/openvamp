@@ -2,6 +2,11 @@
 //! asks first, so a stray Cmd-Q or a click on the window's close button
 //! cannot stop the show. Stop, the transport control, stays immediate and
 //! never comes here.
+//!
+//! While a song is being saved (S7), ending asks first too, whatever
+//! plays: quitting cancels the save, and the app ends only once the save
+//! has stopped and removed what it wrote
+//! ([`crate::library_page::LibraryPage::stop_save`]).
 
 use app::TransportState;
 
@@ -22,21 +27,23 @@ pub enum EndRequest {
     /// Nothing plays: end at once; the song, if one is open, stops with
     /// its ramp first.
     EndNow,
-    /// A song plays: ask [`Ending::question`] first, and end only on the
-    /// answer that [`Question::ends`] the show.
+    /// A song plays or is being saved: ask [`Ending::question`] (or
+    /// [`Ending::saving_question`]) first, and end only on the answer that
+    /// [`Question::ends`] the show.
     Ask,
     /// The question is already on screen: wait for its answer.
     Wait,
 }
 
 /// What a request to end the show does, given the transport of the open
-/// song (`None`: no song is open) and whether the question is already on
-/// screen. A song asks while it [`is_playing`]: playing, or waiting for the
-/// disk to start.
-pub fn end_request(transport: Option<TransportState>, asking: bool) -> EndRequest {
+/// song (`None`: no song is open), whether a song is being saved, and
+/// whether the question is already on screen. A song asks while it
+/// [`is_playing`]: playing, or waiting for the disk to start; a save asks
+/// whatever plays.
+pub fn end_request(transport: Option<TransportState>, saving: bool, asking: bool) -> EndRequest {
     if asking {
         EndRequest::Wait
-    } else if transport.is_some_and(is_playing) {
+    } else if saving || transport.is_some_and(is_playing) {
         EndRequest::Ask
     } else {
         EndRequest::EndNow
@@ -78,8 +85,9 @@ impl Dialog {
 pub struct Answer {
     /// Its label.
     pub label: &'static str,
-    /// Whether it keeps the song playing; it is then the dialog's cancel
-    /// answer, the one Escape picks.
+    /// Whether it keeps the show going (the song playing, the save
+    /// running); it is then the dialog's cancel answer, the one Escape
+    /// picks.
     pub keeps_playing: bool,
 }
 
@@ -121,6 +129,37 @@ impl Ending {
             detail: match self {
                 Self::Quit => "Quitting stops the song.",
                 Self::CloseWindow => "Closing the window stops the song and quits.",
+            },
+            answers: match dialog {
+                Dialog::Mac | Dialog::InWindow => [end, keep],
+                Dialog::Windows => [keep, end],
+            },
+        }
+    }
+}
+
+impl Ending {
+    /// The question to ask in `dialog` before ending this way while a song
+    /// is being saved, whether or not one plays: the answers go in the same
+    /// order as [`Ending::question`]'s, so neither Space nor Escape quits.
+    pub fn saving_question(self, dialog: Dialog) -> Question {
+        let end = Answer {
+            label: "Quit",
+            keeps_playing: false,
+        };
+        let keep = Answer {
+            label: "Keep saving",
+            keeps_playing: true,
+        };
+        Question {
+            message: "A song is being saved",
+            detail: match self {
+                Self::Quit => {
+                    "Quit anyway? The save is cancelled and nothing of the song is kept; a song that plays stops."
+                }
+                Self::CloseWindow => {
+                    "Close the window and quit anyway? The save is cancelled and nothing of the song is kept; a song that plays stops."
+                }
             },
             answers: match dialog {
                 Dialog::Mac | Dialog::InWindow => [end, keep],

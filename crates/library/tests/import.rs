@@ -27,6 +27,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime};
 
 use common::{flac_bytes, write_flac, write_int};
 use domain::{
@@ -1299,4 +1300,176 @@ fn a_wav_or_flac_cut_short_after_the_probe_is_not_saved() {
         );
         assert_eq!(tree(&library_dir), Vec::<String>::new(), "{name}");
     }
+}
+
+/// Sets the modification time of `path` to `ago` before now, a folder's
+/// after everything in it, since adding to a folder changes its time.
+fn set_age(path: &Path, ago: Duration) {
+    let meta = fs::symlink_metadata(path).unwrap();
+    if meta.is_dir() {
+        for entry in fs::read_dir(path).unwrap() {
+            set_age(&entry.unwrap().path(), ago);
+        }
+    }
+    open_for_times(path)
+        .set_modified(SystemTime::now() - ago)
+        .unwrap();
+}
+
+#[cfg(windows)]
+fn open_for_times(path: &Path) -> fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_BACKUP_SEMANTICS lets a folder open as a file.
+    fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(0x0200_0000)
+        .open(path)
+        .unwrap()
+}
+
+#[cfg(not(windows))]
+fn open_for_times(path: &Path) -> fs::File {
+    fs::File::open(path).unwrap()
+}
+
+/// A hidden build folder named `name` in `library`, with a stem half
+/// written in it, as an import cut off would leave it.
+fn build_folder(library: &Path, name: &str) -> PathBuf {
+    let folder = library.join(name);
+    fs::create_dir_all(folder.join("stems")).unwrap();
+    fs::write(folder.join("stems/drums.flac"), b"half a stem").unwrap();
+    folder
+}
+
+#[test]
+fn an_import_removes_what_imports_cut_off_long_ago_left_and_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Song");
+    wav(&source.join("Drums.wav"), RATE, 1_000);
+    let library_dir = dir.path().join("Library");
+    fs::create_dir(&library_dir).unwrap();
+    let ours = std::process::id();
+    let other = ours.wrapping_add(1);
+    let long_ago = Duration::from_secs(2 * 3_600);
+
+    // Left by another process's import over an hour ago (a crash, a kill):
+    // removed.
+    let stale = build_folder(&library_dir, &format!(".import-{other}-0.tmp"));
+    set_age(&stale, long_ago);
+    // Another process's import, still writing or only just stopped: kept.
+    build_folder(&library_dir, &format!(".import-{other}-1.tmp"));
+    let writing = build_folder(&library_dir, &format!(".import-{other}-2.tmp"));
+    set_age(&writing, long_ago);
+    open_for_times(&writing.join("stems/drums.flac"))
+        .set_modified(SystemTime::now() - Duration::from_secs(60))
+        .unwrap();
+    // This process's own, however old: kept.
+    let own = build_folder(&library_dir, &format!(".import-{ours}-7.tmp"));
+    set_age(&own, long_ago);
+    // Names the import never makes, however old: kept.
+    let others = [
+        format!(".import-{other}-3.tmp.bak"),
+        format!(".import-{other}-3"),
+        format!("import-{other}-3.tmp"),
+        format!(".import-0{other}-3.tmp"),
+        format!(".import-{other}-03.tmp"),
+        ".import--3.tmp".to_owned(),
+        format!(".import-{other}-.tmp"),
+        format!(".import-x{other}-3.tmp"),
+        format!(".Import-{other}-3.tmp"),
+    ];
+    for name in &others {
+        let folder = build_folder(&library_dir, name);
+        set_age(&folder, long_ago);
+    }
+    // A file with a build folder's name: kept.
+    let file = library_dir.join(format!(".import-{other}-4.tmp"));
+    fs::write(&file, b"not a folder").unwrap();
+    set_age(&file, long_ago);
+    // A link with a build folder's name: kept, and so is what it links to.
+    #[cfg(unix)]
+    {
+        let target = dir.path().join("Elsewhere");
+        build_folder(&target, "inside");
+        set_age(&target, long_ago);
+        std::os::unix::fs::symlink(&target, library_dir.join(format!(".import-{other}-5.tmp")))
+            .unwrap();
+    }
+    let before: Vec<String> = tree(&library_dir);
+
+    let entry = save(&Library::new(&library_dir), &probe_import(&source).unwrap()).unwrap();
+
+    let stale_name = format!(".import-{other}-0.tmp");
+    let mut expected: Vec<String> = before
+        .into_iter()
+        .filter(|path| !path.starts_with(&stale_name))
+        .collect();
+    expected.extend(
+        tree(&library_dir.join(&entry.song))
+            .into_iter()
+            .map(|path| format!("{}/{path}", entry.song)),
+    );
+    expected.push(entry.song.clone());
+    expected.sort();
+    assert_eq!(tree(&library_dir), expected);
+    #[cfg(unix)]
+    assert!(
+        dir.path()
+            .join("Elsewhere/inside/stems/drums.flac")
+            .exists()
+    );
+}
+
+/// `apple.m4a` with `tail` appended after its audio, as a damaged file
+/// would end, in a source folder of its own.
+fn apple_with_tail(dir: &Path, tail: &[u8]) -> PathBuf {
+    let source = dir.join("Song");
+    fs::create_dir_all(&source).unwrap();
+    let mut bytes = fs::read(fixture("apple.m4a")).unwrap();
+    bytes.extend_from_slice(tail);
+    fs::write(source.join("Pad.m4a"), bytes).unwrap();
+    source
+}
+
+#[test]
+fn an_m4a_box_claiming_more_than_the_file_ends_the_box_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    // A box with a 64-bit size near u64::MAX: adding it to its offset
+    // overflows.
+    let mut tail = Vec::new();
+    tail.extend_from_slice(&1u32.to_be_bytes());
+    tail.extend_from_slice(b"free");
+    tail.extend_from_slice(&(u64::MAX - 7).to_be_bytes());
+    let source = apple_with_tail(dir.path(), &tail);
+
+    let draft = probe_import(&source).unwrap();
+
+    assert!(draft.refused().is_empty(), "{:?}", draft.refused());
+    let stem = &draft.stems()[0];
+    assert!(!stem.estimated_length, "the iTunSMPB tag before it is read");
+    assert_eq!(draft.song.stems()[0].length_frames, 60_010);
+}
+
+#[test]
+fn an_m4a_whose_boxes_cannot_be_read_imports_untrimmed_at_its_decoded_length() {
+    let dir = tempfile::tempdir().unwrap();
+    // A box whose 64-bit size the file ends before.
+    let mut tail = Vec::new();
+    tail.extend_from_slice(&1u32.to_be_bytes());
+    tail.extend_from_slice(b"free");
+    let source = apple_with_tail(dir.path(), &tail);
+    let library_dir = dir.path().join("Library");
+    fs::create_dir(&library_dir).unwrap();
+
+    let draft = probe_import(&source).unwrap();
+
+    assert!(draft.refused().is_empty(), "{:?}", draft.refused());
+    assert!(draft.stems()[0].estimated_length);
+    let entry = save(&Library::new(&library_dir), &draft).unwrap();
+    let loaded = load_song(&library_dir.join(&entry.song)).unwrap();
+    assert!(
+        loaded.stems[0].samples.len() >= 60_010,
+        "untrimmed: {} frames",
+        loaded.stems[0].samples.len()
+    );
 }
