@@ -285,6 +285,44 @@ fn a_new_marker_moves_a_setlists_positions_onto_the_audio_they_played() {
 }
 
 #[test]
+fn each_setlist_item_moves_once_even_when_another_lands_on_its_old_positions() {
+    let bench = Bench::new();
+    let library = bench.library();
+    let mut pair = Setlist::new("Pair");
+    pair.items = [2, 3]
+        .into_iter()
+        .map(|position| {
+            SetlistItem::Song(SongItem {
+                arrangement: "live".to_owned(),
+                start_position: Some(position),
+                end_position: Some(position),
+                ..SongItem::new(SONG)
+            })
+        })
+        .collect();
+    library.save_setlist(&pair).unwrap();
+    let mut page = opened(&bench);
+
+    // A marker at bar 4, before both choruses: position 2 moves to 3, and
+    // position 3, which the first item now holds, moves to 4.
+    let along = (3.0 / BARS as f64 * f64::from(ALONG)).round() as u32;
+    song(&mut page, SongAction::PlaceCursor(along));
+    song(&mut page, SongAction::AddMarker);
+    save(&mut page);
+
+    let positions: Vec<_> = bench
+        .setlist("Pair")
+        .items
+        .iter()
+        .map(|item| match item {
+            SetlistItem::Song(item) => (item.start_position, item.end_position),
+            SetlistItem::Click(_) => unreachable!("Pair plays songs"),
+        })
+        .collect();
+    assert_eq!(positions, [(Some(3), Some(3)), (Some(4), Some(4))]);
+}
+
+#[test]
 fn a_marker_that_splits_a_section_the_setlist_plays_keeps_both_parts_in_its_range() {
     let bench = Bench::new();
     let mut page = opened(&bench);

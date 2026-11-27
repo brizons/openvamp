@@ -396,8 +396,14 @@ fn write_fixes(
 ) -> (Vec<String>, Vec<(String, String)>) {
     let mut notes = Vec::new();
     let mut moves = Vec::new();
-    let mut files: Vec<&str> = fixes.iter().map(|fix| fix.file.as_str()).collect();
-    files.dedup();
+    // Each file once, in the order the fixes name them: a file opened twice
+    // would move its items twice.
+    let mut files: Vec<&str> = Vec::new();
+    for fix in fixes {
+        if !files.contains(&fix.file.as_str()) {
+            files.push(fix.file.as_str());
+        }
+    }
     for file in files {
         let of_file: Vec<&SetlistFix> = fixes.iter().filter(|fix| fix.file == file).collect();
         let name = &of_file[0].name;
@@ -408,28 +414,29 @@ fn write_fixes(
                 continue;
             }
         };
+        // Every item is matched against the setlist as it was read, before
+        // any edit, so an item one fix moves never matches a later fix's
+        // old positions and moves again.
+        let planned: Vec<_> = editor
+            .setlist()
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                SetlistItem::Song(item) if item.song == song => of_file
+                    .iter()
+                    .find(|fix| {
+                        item.arrangement == fix.arrangement
+                            && (item.start_position, item.end_position) == fix.from
+                    })
+                    .map(|fix| (index, fix.to)),
+                _ => None,
+            })
+            .collect();
         let mut failed = None;
-        for fix in &of_file {
-            let items: Vec<usize> = editor
-                .setlist()
-                .items
-                .iter()
-                .enumerate()
-                .filter_map(|(index, item)| match item {
-                    SetlistItem::Song(item)
-                        if item.song == song
-                            && item.arrangement == fix.arrangement
-                            && (item.start_position, item.end_position) == fix.from =>
-                    {
-                        Some(index)
-                    }
-                    _ => None,
-                })
-                .collect();
-            for index in items {
-                if let Err(error) = editor.apply(Edit::StartEnd(index, fix.to.0, fix.to.1)) {
-                    failed.get_or_insert(error.to_string());
-                }
+        for (index, (start, end)) in planned {
+            if let Err(error) = editor.apply(Edit::StartEnd(index, start, end)) {
+                failed.get_or_insert(error.to_string());
             }
         }
         match failed {
