@@ -6,10 +6,19 @@
 //! query over a source range returns exactly the ticks a plan places for a
 //! segment covering that range. Building the grid allocates; every query is a
 //! binary search over it and allocates nothing.
+//!
+//! The grid also gives the sample where each bar and each beat starts
+//! ([`BeatGrid::bar_lines`], [`BeatGrid::beat_lines`]), from a song or from
+//! bare tempo and time-signature maps ([`BeatGrid::from_maps`]): an import
+//! places its map changes on these bar lines, and the song editor snaps
+//! markers to them and counts bars with them.
 
 use std::ops::Range;
 
 use crate::compile::ClickLevel;
+use crate::package::{
+    MAX_SONG_HOURS, TempoPoint, TimeSignaturePoint, check_tempo_map, check_time_signature_map,
+};
 use crate::song::Song;
 use crate::timeline::Timeline;
 
@@ -65,6 +74,54 @@ impl BeatGrid {
         let beats = positions(&[ClickLevel::Downbeat, ClickLevel::Beat]);
         let bars = positions(&[ClickLevel::Downbeat]);
         Self { ticks, beats, bars }
+    }
+
+    /// The grid of a song `length` frames long at `sample_rate` with these
+    /// maps, as [`BeatGrid::new`] computes it for a song that has them.
+    /// `None` when the maps break a package rule (see [`crate::validate`]),
+    /// the rate is 0, or the length is over [`MAX_SONG_HOURS`].
+    pub fn from_maps(
+        sample_rate: u32,
+        length: u64,
+        tempo_map: &[TempoPoint],
+        time_signature_map: &[TimeSignaturePoint],
+    ) -> Option<Self> {
+        if sample_rate == 0 || length > MAX_SONG_HOURS * 3_600 * u64::from(sample_rate) {
+            return None;
+        }
+        let mut errors = Vec::new();
+        check_tempo_map(tempo_map, &mut errors);
+        check_time_signature_map(time_signature_map, &mut errors);
+        if !errors.is_empty() {
+            return None;
+        }
+        // The grid reads only the rate, the length and the maps.
+        let song = Song {
+            title: String::new(),
+            artist: None,
+            key: None,
+            sample_rate,
+            length,
+            tempo_map: tempo_map.to_vec(),
+            time_signature_map: time_signature_map.to_vec(),
+            stems: Vec::new(),
+            sections: Vec::new(),
+            arrangements: Vec::new(),
+        };
+        Some(Self::new(&song))
+    }
+
+    /// The sample where each bar starts, sorted, from the song start up to
+    /// its end: `bar_lines()[n - 1]` is where bar `n` starts. Bars restart
+    /// at every time-signature change.
+    pub fn bar_lines(&self) -> &[u64] {
+        &self.bars
+    }
+
+    /// The sample where each beat starts, sorted; every bar line is also a
+    /// beat line.
+    pub fn beat_lines(&self) -> &[u64] {
+        &self.beats
     }
 
     /// The click ticks whose source position lies in `range`, sorted by
