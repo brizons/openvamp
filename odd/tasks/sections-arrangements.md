@@ -62,7 +62,7 @@ Requirements quote `docs/mvp-spec.md` (F2) and the user verbatim. Items marked *
 |----|-------|-------|--------|---------|
 | T1 | S1, S2 (domain) | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L3; verified L4; review approved L6) | 57965f1 |
 | T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | done (L5; verified L7; review approved L8) | d35205d |
-| T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | done (L9); split, verifier and screenshot check pending | |
+| T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | done (L9; split L10; verified L11 with B1 in correction; reviews approved L12) | 0d0975e, 19e1a0f, dc274d7 |
 | T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | done (L10); verifier and screenshot check pending | see L10 |
 | T5 | S6 | inline, with each task's own docs | pending | |
 
@@ -242,4 +242,28 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
     - A setlist open in the Library is refreshed.
     - Quit waits for a song save in flight.
   - **Correction:** the T3 writer was resumed for the fix, which lands after T4.
+- **L12** (2026-11-27): the three T3 reviews were granted by the user ("Revisar este cambio" for each). All approved and were acknowledged:
+  - 7a28f89..0d0975e
+  - 0d0975e..19e1a0f
+  - 19e1a0f..dc274d7
+
+  **Sent to the T3 writer** with the B1 correction:
+  - the in-use setlist guard fails open on unreadable setlists;
+  - a quit while another prompt shows skips the unsaved question;
+  - the "Delete marker" tooltip names the wrong reason;
+  - the `ICONS` list is incomplete.
+
+  **Kept as follow-ups:**
+  - doc links to `song_edit` from the first commit (they resolve at the series end);
+  - the header ↔ import two-way module dependency;
+  - `import_moved` naming;
+  - `saving` returning a ticket;
+  - the `start_rename` probe on Default;
+  - the bar-thousandths constant;
+  - a dead match arm;
+  - `maps_locked` only dimming;
+  - duplicated small builders;
+  - a few untested branches.
+
+  The quit-during-song-save warning is already part of the B1 correction batch.
 
