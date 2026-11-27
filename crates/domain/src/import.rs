@@ -31,7 +31,6 @@ use std::fmt;
 use thiserror::Error;
 
 use crate::bus::{file_name, without_accent};
-use crate::compile::ClickLevel;
 use crate::grid::BeatGrid;
 use crate::package::{
     Arrangement, DEFAULT_ARRANGEMENT_ID, FORMAT_VERSION, MAX_BPM, MAX_SONG_HOURS, MIN_BPM,
@@ -322,18 +321,12 @@ impl SongDraft {
 
     /// The id each stem gets, in stem order: see the [module docs](self).
     pub fn stem_ids(&self) -> Vec<String> {
-        let mut taken = HashSet::new();
+        let mut taken: HashSet<String> = HashSet::new();
         self.stems
             .iter()
             .map(|stem| {
-                let base = slug(file_name(&stem.source_name));
-                let id = (1u64..)
-                    .map(|n| match n {
-                        1 => base.clone(),
-                        n => format!("{base}-{n}"),
-                    })
-                    .find(|id| !taken.contains(id))
-                    .expect("some numbered id is free");
+                let base = slug_or(file_name(&stem.source_name), "stem");
+                let id = unique_id(&base, |id| taken.contains(id));
                 taken.insert(id.clone());
                 id
             })
@@ -633,31 +626,28 @@ fn bar_lines(
     tempo_map: &[TempoPoint],
     time_signature_map: &[TimeSignaturePoint],
 ) -> Vec<u64> {
-    // The grid reads only the rate, the length and the maps.
-    let song = Song {
-        title: String::new(),
-        artist: None,
-        key: None,
-        sample_rate,
-        length,
-        tempo_map: tempo_map.to_vec(),
-        time_signature_map: time_signature_map.to_vec(),
-        stems: Vec::new(),
-        sections: Vec::new(),
-        arrangements: Vec::new(),
-    };
-    BeatGrid::new(&song)
-        .clicks_in(0..length)
-        .iter()
-        .filter(|click| click.level == ClickLevel::Downbeat)
-        .map(|click| click.at)
-        .collect()
+    // `maps` checked the values and the length, so the grid is built.
+    BeatGrid::from_maps(sample_rate, length, tempo_map, time_signature_map)
+        .map(|grid| grid.bar_lines().to_vec())
+        .unwrap_or_default()
+}
+
+/// `base` if `taken` does not hold it, else the first of `base-2`,
+/// `base-3`… it does not hold. Stem, section and arrangement ids share it.
+pub(crate) fn unique_id(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    (1u64..)
+        .map(|n| match n {
+            1 => base.to_owned(),
+            n => format!("{base}-{n}"),
+        })
+        .find(|id| !taken(id))
+        .expect("some numbered id is free")
 }
 
 /// `name` as an id: lowercase ASCII letters and digits without accents,
 /// with one `-` for every run of anything else, at most [`MAX_ID_BYTES`]
-/// long; `stem` when nothing is left.
-fn slug(name: &str) -> String {
+/// long; `fallback` when nothing is left.
+pub(crate) fn slug_or(name: &str, fallback: &str) -> String {
     let mut slug = String::new();
     let mut separated = false;
     for c in name
@@ -679,7 +669,7 @@ fn slug(name: &str) -> String {
         }
     }
     if slug.is_empty() {
-        "stem".to_owned()
+        fallback.to_owned()
     } else {
         slug
     }

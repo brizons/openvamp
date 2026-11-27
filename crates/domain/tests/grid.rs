@@ -6,8 +6,9 @@ mod common;
 
 use common::{RATE, SongSpec, info, marker};
 use domain::{
-    BarBeat, BeatGrid, ClickEvent, ClickLevel, CompileOptions, RenderPlan, SectionType, Song,
-    SourceClick, compile, validate,
+    BarBeat, BeatGrid, ClickEvent, ClickLevel, CompileOptions, DraftStem, MAX_SONG_HOURS,
+    MapChange, RenderPlan, SectionType, Song, SongDraft, SourceClick, StoredFormat, TempoPoint,
+    TimeSignature, TimeSignaturePoint, compile, validate,
 };
 
 const BAR: u64 = 96_000;
@@ -185,5 +186,171 @@ fn bar_and_beat_count_from_one_at_the_song_start() {
             bar: before.bar + 1,
             beat: 1
         }
+    );
+}
+
+#[test]
+fn from_maps_gives_the_grid_of_a_song_with_those_maps() {
+    let song = changing_spec().build();
+
+    let grid = BeatGrid::from_maps(
+        song.sample_rate(),
+        song.length(),
+        song.tempo_map(),
+        song.time_signature_map(),
+    );
+
+    assert_eq!(grid, Some(BeatGrid::new(&song)));
+}
+
+#[test]
+fn bar_lines_and_beat_lines_are_where_each_bar_and_each_beat_starts() {
+    let tempo = [TempoPoint { at: 0, bpm: 120.0 }];
+    let meter = [TimeSignaturePoint {
+        at: 0,
+        numerator: 4,
+        denominator: 4,
+    }];
+    let grid = BeatGrid::from_maps(RATE, 2 * BAR + 1, &tempo, &meter).unwrap();
+
+    assert_eq!(grid.bar_lines(), [0, BAR, 2 * BAR]);
+    let beats: Vec<u64> = (0..=8).map(|beat| beat * 24_000).collect();
+    assert_eq!(grid.beat_lines(), beats.as_slice());
+
+    // Across tempo and meter changes they are the plan's downbeat and beat
+    // ticks.
+    let song = changing_spec().build();
+    let grid = BeatGrid::new(&song);
+    let ticks = |levels: &[ClickLevel]| -> Vec<u64> {
+        plan(&song, "default")
+            .clicks
+            .iter()
+            .filter(|click| levels.contains(&click.level))
+            .map(|click| click.at)
+            .collect()
+    };
+    assert_eq!(grid.bar_lines(), ticks(&[ClickLevel::Downbeat]).as_slice());
+    assert_eq!(
+        grid.beat_lines(),
+        ticks(&[ClickLevel::Downbeat, ClickLevel::Beat]).as_slice()
+    );
+    assert!(
+        grid.bar_lines().contains(&(9 * BAR + 5)),
+        "6/8 restarts a bar"
+    );
+}
+
+#[test]
+fn from_maps_refuses_maps_that_break_the_package_rules() {
+    let tempo = [TempoPoint { at: 0, bpm: 120.0 }];
+    let meter = [TimeSignaturePoint {
+        at: 0,
+        numerator: 4,
+        denominator: 4,
+    }];
+    let late_tempo = [TempoPoint { at: 5, bpm: 120.0 }];
+    let slow = [TempoPoint { at: 0, bpm: 0.0 }];
+    let no_beats = [TimeSignaturePoint {
+        at: 0,
+        numerator: 0,
+        denominator: 4,
+    }];
+    let odd_note = [TimeSignaturePoint {
+        at: 0,
+        numerator: 4,
+        denominator: 3,
+    }];
+    let too_long = MAX_SONG_HOURS * 3_600 * u64::from(RATE) + 1;
+
+    assert!(BeatGrid::from_maps(RATE, BAR, &tempo, &meter).is_some());
+    assert_eq!(BeatGrid::from_maps(0, BAR, &tempo, &meter), None);
+    assert_eq!(BeatGrid::from_maps(RATE, too_long, &tempo, &meter), None);
+    assert_eq!(BeatGrid::from_maps(RATE, BAR, &[], &meter), None);
+    assert_eq!(BeatGrid::from_maps(RATE, BAR, &tempo, &[]), None);
+    assert_eq!(BeatGrid::from_maps(RATE, BAR, &late_tempo, &meter), None);
+    assert_eq!(BeatGrid::from_maps(RATE, BAR, &slow, &meter), None);
+    assert_eq!(BeatGrid::from_maps(RATE, BAR, &tempo, &no_beats), None);
+    assert_eq!(BeatGrid::from_maps(RATE, BAR, &tempo, &odd_note), None);
+}
+
+#[test]
+fn the_existing_queries_still_agree_with_the_bar_and_beat_lines() {
+    let song = changing_spec().build();
+    let grid = BeatGrid::new(&song);
+
+    for (index, &line) in grid.bar_lines().iter().enumerate() {
+        assert_eq!(grid.next_bar_line(line), Some(line));
+        assert_eq!(
+            grid.bar_and_beat(line),
+            BarBeat {
+                bar: index as u64 + 1,
+                beat: 1
+            }
+        );
+    }
+    for pair in grid.beat_lines().windows(2) {
+        let (beat, next) = (grid.bar_and_beat(pair[0]), grid.bar_and_beat(pair[1]));
+        assert!(
+            next == BarBeat {
+                bar: beat.bar,
+                beat: beat.beat + 1
+            } || next
+                == BarBeat {
+                    bar: beat.bar + 1,
+                    beat: 1
+                },
+            "{} -> {}",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
+#[test]
+fn a_draft_still_places_each_change_on_the_bar_lines_of_the_maps_before_it() {
+    let mut draft = SongDraft::new(
+        "Song",
+        vec![DraftStem::new(
+            "Drums.wav",
+            StoredFormat::Wav,
+            RATE,
+            60 * 48_000,
+        )],
+    );
+    draft.changes = vec![
+        MapChange {
+            bar: 7,
+            bpm: None,
+            time_signature: Some(TimeSignature {
+                numerator: 3,
+                denominator: 4,
+            }),
+        },
+        MapChange {
+            bar: 5,
+            bpm: Some(90.0),
+            time_signature: None,
+        },
+    ];
+
+    let package = draft.to_package().unwrap().package;
+
+    let length = draft.length_frames();
+    let start = [TimeSignaturePoint {
+        at: 0,
+        numerator: 4,
+        denominator: 4,
+    }];
+    let before_tempo =
+        BeatGrid::from_maps(RATE, length, &[TempoPoint { at: 0, bpm: 120.0 }], &start).unwrap();
+    let before_meter = BeatGrid::from_maps(RATE, length, &package.tempo_map, &start).unwrap();
+    assert_eq!(package.tempo_map[1].at, before_tempo.bar_lines()[4]);
+    assert_eq!(
+        package.time_signature_map[1].at,
+        before_meter.bar_lines()[6]
+    );
+    assert_eq!(
+        (package.tempo_map[1].at, package.time_signature_map[1].at),
+        (384_000, 640_000)
     );
 }

@@ -59,7 +59,7 @@ Requirements quote `docs/mvp-spec.md` (F2) and the user verbatim. Items marked *
 
 | ID | Specs | Route | Status | Commits |
 |----|-------|-------|--------|---------|
-| T1 | S1, S2 (domain) | delegated (parallel unit with T2, disjoint surface `crates/domain`) | pending | |
+| T1 | S1, S2 (domain) | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L3; verified L4) | see L4 |
 | T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | pending | |
 | T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | pending | |
 | T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | pending | |
@@ -86,3 +86,37 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
     - Background jobs use `cx.background_executor()` with tickets, and `facts.rs` has a per-folder cache to copy.
   - **Design:** `SongEditor.dc.html` holds the marker panel (waveform one bar per musical bar), the inspector and the arrangement panel; `Main.dc.html`'s song map shows the waveform. The explorer's handoff lists the colors and sizes.
   - Free disk: 14 GiB.
+- **L3** (2026-11-27): T1 delivered.
+  - **New code:**
+    - `domain::edit::SongEditor` over a `SongPackage` plus its length: markers (`add_marker`, `move_marker`, `set_marker_type`, `delete_marker`), arrangements (`new_arrangement`, `rename_arrangement`, `delete_arrangement`, `insert_section`, `append_section`, `remove_section`, `move_section`, `set_infinite_loop`), and `snap`, `section_range`, `bars_in`, and `summary` (Display "4 sections · 12 bars · 0:24").
+    - `Snap { Bar, Beat }` and a typed `SongEditError`, with sections named by label and arrangements by name. Each edit runs on a copy that must pass `validate`.
+    - `SectionType::ALL`, and `BeatGrid::from_maps`, `bar_lines` and `beat_lines`. The private `import.rs::bar_lines` now uses them, so there is still one grid.
+  - **Writer's assumptions, kept:**
+    - Default can be neither renamed nor deleted.
+    - A new arrangement starts with every section once, in song order.
+    - Splitting a looped section keeps the flag on its first part.
+    - New ids are slugs (`verse-2`).
+    - A tie snaps to the earlier line.
+    - A bar counts in the section it starts in.
+  - **For T3:** deleting an arrangement leaves stale entries in `mix.json` and in setlists that name it, so the desktop must handle that.
+  - **Checks:**
+    - RED: the tests did not compile first. Five deliberate mutations were each caught.
+    - `crates/engine/tests/arrangement_seams.rs` pins the F2 seam acceptance; it fails with the crossfade turned off.
+    - `cargo test -p domain` and the clippy, fmt, doc and workspace checks are clean. The parent re-ran `--test song_edit` (24) and `--test grid` (10).
+  - Risk: item 3 (shared helpers in import.rs: stem ids and bar lines; covered by the existing import tests and a new grid regression test).
+- **L4** (2026-11-27): the T1 verifier passed every probe, with no blockers.
+  - **Grid:** bar and beat lines equal a hand calculation on three songs.
+  - **Add and split:** 18,270 add attempts, all snapped as computed by hand, and every split kept each arrangement's audio.
+  - **Random sequences:** 36,000 random edits, each keeping `validate` passing; every refusal left the package equal.
+  - **Acceptance:** the move acceptance holds in two arrangements, and the seam test fails on two hard-cut mutants.
+  - **No change elsewhere:** `SongDraft::maps`, stem ids and `BeatGrid` queries are byte-identical at baseline and candidate over 135 drafts and 7 songs. `cargo test -p domain` passed 198.
+  - **Advisories:**
+    - a split looped section keeps the flag on its first part only;
+    - duplicate arrangement names were possible, including a second "Default";
+    - long names give ids up to 66 bytes;
+    - a name with no ASCII gives the id `arrangement`.
+  - **Parent fix:** arrangement names are now unique without regard to case. `new_arrangement` and `rename_arrangement` refuse a taken name with `SongEditError::NameTaken` ("an arrangement named \"…\" already exists"), and renaming an arrangement to its own name in another case is allowed.
+    - RED: the new test did not compile against the old error type.
+    - GREEN: `cargo test -p domain` passes 199; fmt and clippy are clean.
+    - Amended into the T1 commit, which had not been pushed.
+

@@ -13,6 +13,11 @@
 //! its title, tempo, time signature, key and parts, and
 //! [`SongDraft::to_package`] turns it into a checked [`SongPackage`].
 //!
+//! A [`SongEditor`] edits a saved song's section markers and arrangements
+//! (F2): every edit leaves a package [`validate`] accepts, or leaves it
+//! unchanged with a [`SongEditError`]. Markers snap to the bar or beat lines
+//! of the song's [`BeatGrid`] ([`Snap`]).
+//!
 //! A stem's instrument is one of the fixed [`Part`]s: [`part_for_file`] picks
 //! one from its file name by the rules table, and each part belongs to one
 //! bus. Stems play through six [`Bus`]es: [`bus_for_stem`] picks one from the
@@ -26,6 +31,7 @@
 
 pub mod bus;
 pub mod compile;
+pub mod edit;
 pub mod grid;
 pub mod import;
 pub mod mix;
@@ -42,6 +48,7 @@ pub use compile::{
     ClickEvent, ClickLevel, CompileError, CompileOptions, CueEvent, CueTiming,
     DEFAULT_SEAM_CROSSFADE, RenderPlan, Segment, compile, seam_fade,
 };
+pub use edit::{ArrangementSummary, Snap, SongEditError, SongEditor};
 pub use grid::{BarBeat, BeatGrid, SourceClick};
 pub use import::{
     DEFAULT_ARRANGEMENT_NAME, DEFAULT_IMPORT_BPM, DEFAULT_IMPORT_TIME_SIGNATURE, DraftError,

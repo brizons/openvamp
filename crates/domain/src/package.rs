@@ -137,6 +137,26 @@ pub enum SectionType {
 }
 
 impl SectionType {
+    /// Every type, in declared order: the built-in list a section marker's
+    /// type is chosen from (F2.2).
+    pub const ALL: [SectionType; 15] = [
+        SectionType::CountOff,
+        SectionType::Intro,
+        SectionType::Verse,
+        SectionType::PreChorus,
+        SectionType::Chorus,
+        SectionType::PostChorus,
+        SectionType::Bridge,
+        SectionType::Instrumental,
+        SectionType::Interlude,
+        SectionType::Tag,
+        SectionType::Vamp,
+        SectionType::Turnaround,
+        SectionType::Breakdown,
+        SectionType::Outro,
+        SectionType::Ending,
+    ];
+
     /// The type as players and lists show it: "Count-off", "Pre-chorus".
     pub fn name(self) -> &'static str {
         match self {
@@ -740,7 +760,9 @@ pub(crate) fn denominator_valid(denominator: u32) -> bool {
     matches!(denominator, 1 | 2 | 4 | 8 | 16 | 32)
 }
 
-fn check_tempo_map(map: &[TempoPoint], errors: &mut Vec<ValidationError>) {
+/// The tempo map rules of [`validate`]. A grid built from bare maps
+/// ([`crate::BeatGrid::from_maps`]) shares them.
+pub(crate) fn check_tempo_map(map: &[TempoPoint], errors: &mut Vec<ValidationError>) {
     check_positions(MapKind::Tempo, map.iter().map(|point| point.at), errors);
     for point in map {
         if !bpm_in_range(point.bpm) {
@@ -752,7 +774,11 @@ fn check_tempo_map(map: &[TempoPoint], errors: &mut Vec<ValidationError>) {
     }
 }
 
-fn check_time_signature_map(map: &[TimeSignaturePoint], errors: &mut Vec<ValidationError>) {
+/// The time-signature map rules of [`validate`]; see [`check_tempo_map`].
+pub(crate) fn check_time_signature_map(
+    map: &[TimeSignaturePoint],
+    errors: &mut Vec<ValidationError>,
+) {
     check_positions(
         MapKind::TimeSignature,
         map.iter().map(|point| point.at),
