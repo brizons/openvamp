@@ -21,7 +21,10 @@
 //! - Perform: the song facts, read again [`crate::facts::RETRY_AFTER`]
 //!   after a failed read. The screen starts the read on a turn, but what
 //!   shows changes only when it comes back, and the screen draws then;
-//! - Library: nothing; it changes only with its controls.
+//! - Library: the progress of a song import being saved, drawn on the
+//!   turns it moved ([`LibraryPage::import_moved`]), whatever screen
+//!   shows; reading a source and the end of a save are drawn when they
+//!   come back from the background executor, as the song facts are.
 //!
 //! The notices and problems of every screen stay until a control or a
 //! change clears them; none times out. Tooltips are gpui's own: it shows
@@ -34,6 +37,7 @@ use app::{SetlistCommandError, SetlistState, Snapshot};
 use crate::action::UiAction;
 use crate::audio_settings::AudioSettings;
 use crate::hold::PanicHold;
+use crate::library_page::LibraryPage;
 use crate::mixer::{MixerPage, needs_frames};
 use crate::output_page::{OutputPage, Settling};
 use crate::show::Show;
@@ -79,6 +83,8 @@ pub struct Timed<'a> {
     pub output: &'a mut OutputPage,
     /// The settings bus and output changes are saved to.
     pub settings: &'a mut AudioSettings,
+    /// The Library screen's state, with a song import being saved.
+    pub library: Option<&'a mut LibraryPage>,
 }
 
 impl Timed<'_> {
@@ -86,14 +92,16 @@ impl Timed<'_> {
     /// changes that have settled, moves the session on and settles the
     /// output changes waiting for the device. Returns whether the screens
     /// draw again: while a hold fills or the song needs frames
-    /// ([`needs_frames`]), else only when the turn changed what they draw
-    /// ([`Drawn`]).
+    /// ([`needs_frames`]), when a song import's save moved on, else only
+    /// when the turn changed what they draw ([`Drawn`]).
     pub fn turn(self, now: Instant) -> bool {
         let counting = self.hold.is_counting();
         let fires = self.hold.tick(now);
+        // A song being saved moves on with or without a show.
+        let saving = self.library.is_some_and(LibraryPage::import_moved);
         let Some(show) = self.show else {
-            // Nothing moves without a song, except a hold's fill.
-            return counting;
+            // Nothing else moves without a song, but a hold's fill.
+            return counting || saving;
         };
         // What the screens drew from, unless they draw this turn anyway.
         let before =
@@ -105,6 +113,7 @@ impl Timed<'_> {
         show.poll();
         self.output.follow(Some(&mut *show), self.settings, now);
         counting
+            || saving
             || needs_frames(show.snapshot())
             || before.is_none_or(|before| before != Drawn::of(show, self.mixer, self.output))
     }

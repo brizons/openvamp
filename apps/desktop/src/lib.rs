@@ -18,7 +18,9 @@
 //! whether they draw again. For the Library screen,
 //! [`library_page`] carries out its controls and says what it shows,
 //! [`shelf`] lists, creates, duplicates and moves setlists, [`editor`] edits and
-//! saves one, and [`line_edit`] is its one-line text field. The GPUI views
+//! saves one, [`song_import`] reads a folder or ZIP of stems, edits the song
+//! it makes in the Song editor and saves it into the library, and
+//! [`line_edit`] is their one-line text field. The GPUI views
 //! in the binary only draw these views and dispatch these actions.
 
 #![forbid(unsafe_code)]
@@ -40,6 +42,7 @@ pub mod reorder;
 pub mod shelf;
 pub mod show;
 pub mod song;
+pub mod song_import;
 pub mod strip;
 pub mod tick;
 pub mod view;

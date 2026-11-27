@@ -299,6 +299,7 @@ impl Bench {
             mixer: &mut self.mixer,
             output: &mut self.page,
             settings: &mut self.settings,
+            library: None,
         }
         .turn(self.clock)
     }
@@ -1344,6 +1345,7 @@ fn a_hold_of_panic_draws_on_every_turn_while_it_counts_with_or_without_a_song() 
             mixer: &mut mixer,
             output: &mut bench.page,
             settings: &mut bench.settings,
+            library: None,
         }
         .turn(now)
     };

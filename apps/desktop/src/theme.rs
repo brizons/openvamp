@@ -59,6 +59,11 @@ pub fn badge() -> Rgba {
 pub fn chip_border() -> Rgba {
     rgb(0x3A3F48)
 }
+/// The dashed border of the Library's "Import stems" drop zone.
+pub fn drop_border() -> Rgba {
+    rgb(0x4A505B)
+}
+
 /// Tertiary text: units, counts.
 pub fn text_faint() -> Rgba {
     rgb(0x8A919C)
@@ -268,7 +273,12 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/infinite.svg",
         include_bytes!("../assets/icons/infinite.svg"),
     ),
+    (
+        "icons/import.svg",
+        include_bytes!("../assets/icons/import.svg"),
+    ),
     ("icons/jump.svg", include_bytes!("../assets/icons/jump.svg")),
+    ("icons/left.svg", include_bytes!("../assets/icons/left.svg")),
     (
         "icons/library.svg",
         include_bytes!("../assets/icons/library.svg"),

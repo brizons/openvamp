@@ -10,6 +10,7 @@ mod library_ui;
 mod mixer_ui;
 mod output_ui;
 mod screen;
+mod song_editor_ui;
 mod theme;
 mod ui;
 
@@ -23,7 +24,7 @@ usage: openvamp [SONG_DIR]
        openvamp SETLIST_FILE
 
 Opens the Perform screen. SONG_DIR is a song folder: song.json and the WAV
-stems it lists; without it, use \"Open song…\" (Cmd/Ctrl-O) or \"Open
+or FLAC stems it lists; without it, use \"Open song…\" (Cmd/Ctrl-O) or \"Open
 setlist…\". SETLIST_FILE is a file ending in .setlist.json in the Setlists
 folder of a library folder, whose songs are in that library folder. Songs
 play on the system's default audio output, at their sample rate.";

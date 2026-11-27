@@ -73,6 +73,9 @@ pub enum Intent {
     ShowPage(Page),
     /// "Open library…": picks a library folder for the Library screen.
     OpenLibrary,
+    /// "Import stems": picks a folder or ZIP of stems to import into the
+    /// library on the Library screen.
+    ImportStems,
     /// A control of the Library screen.
     Library(LibraryAction),
     /// "Perform": opens the setlist in the editor on the Perform screen.
