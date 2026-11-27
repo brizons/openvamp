@@ -60,7 +60,7 @@ Requirements quote `docs/mvp-spec.md` (F2) and the user verbatim. Items marked *
 | ID | Specs | Route | Status | Commits |
 |----|-------|-------|--------|---------|
 | T1 | S1, S2 (domain) | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L3; verified L4; review approved L6) | 57965f1 |
-| T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | done (L5); independent verifier pending | see L5 |
+| T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | done (L5; verified L7); review running | d35205d |
 | T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | pending | |
 | T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | pending | |
 | T5 | S6 | inline, with each task's own docs | pending | |
@@ -141,4 +141,22 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
   - SUGGESTION: the 24-hour song limit is computed inline in `from_maps`;
   - SUGGESTION: `import::bar_lines` hides a broken invariant with `unwrap_or_default`.
 - T2's independent verifier and the T3 writer (the desktop Song editor) were launched at the same time; the verifier works in a scratch copy.
+- **L7** (2026-11-27): the T2 verifier passed every probe, with no blockers.
+  - **Overview:** it matches an independent reference over 24 random songs and every format and channel pair, with click and guide stems excluded, and no allocation above 64 KiB.
+  - **Cache:**
+    - it is read in about 350 µs from stem stats only, and is stale on any fingerprint change;
+    - hostile caches (every truncation and flipped byte, huge counts, symlinks) are stale, never a panic;
+    - read-only folders still give the overview, and cancel leaves nothing.
+  - **Save:**
+    - it round-trips;
+    - ten invalid packages are refused with the tree unchanged;
+    - unknown fields survive on kept items and are dropped with deleted or re-id'd items;
+    - every error path writes nothing.
+  - **No change elsewhere:** load, list, mix, setlist and settings behaviour, and render-cli output, are byte-identical at baseline and candidate. `cargo test -p library` passed 195.
+  - **Advisories:**
+    - a 0600 `song.json` becomes 0644 after a save;
+    - a symlinked `song.json` inside the folder is replaced by a file;
+    - the FNV hash is not tamper-proof;
+    - a junk cache up to 64 MiB is read before it is rejected.
+  - **Review:** the user granted T2's review ("Revisar este cambio"), slice 57965f1..d35205d, lenses risk, resilience and reliability.
 
