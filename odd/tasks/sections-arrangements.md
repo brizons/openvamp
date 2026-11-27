@@ -62,7 +62,7 @@ Requirements quote `docs/mvp-spec.md` (F2) and the user verbatim. Items marked *
 |----|-------|-------|--------|---------|
 | T1 | S1, S2 (domain) | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L3; verified L4; review approved L6) | 57965f1 |
 | T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | done (L5; verified L7; review approved L8) | d35205d |
-| T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | done (L9; split L10; verified L11 with B1 in correction; reviews approved L12) | 0d0975e, 19e1a0f, dc274d7 |
+| T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | done (L9; split L10; reviews approved L12; B1 fixed L13, rechecked L14, review with correction approved L16–L17) | 0d0975e, 19e1a0f, dc274d7, c43d0d0, aa4ff27 |
 | T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | done (L10; verified L15; review approved L16) | 0010532 |
 | T5 | S6 | inline, with each task's own docs | done (L17) | see L17 |
 
@@ -338,4 +338,24 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
     - `docs/architecture.md` (Decision 6) describes `waveforms/overview.bin`, its fingerprints, the rebuild rules (the editor in the background, Perform only while stopped or paused) and the atomic song save.
     - `README.md` lists the Song editor's sections and arrangements and the Perform waveform, and "Not built yet" drops F2.
     - The desktop README came with T3 and T4.
+- **L18** (2026-11-27): the feature is closed.
+  - **Seam check:** `cargo test --workspace` passed 1,068, failed 0, ignored 9.
+  - **Branch:** 20 commits on main d9e25b1, about 13,750 changed lines.
+  - **Reviews:** every slice was reviewed and approved:
+    - T1: 2827125..57965f1
+    - T2: 57965f1..d35205d
+    - T3: 7a28f89..0d0975e, 0d0975e..19e1a0f, 19e1a0f..dc274d7
+    - T4: dc274d7..0010532
+    - setlist fix: 0010532..c43d0d0, with its correction
+  - **Delivery:** stacked PRs to `main`, one per review slice. Push and PRs are the user's call.
+  - **Follow-ups**, collected from the logs:
+    - **Domain:** split looped sections, the `SectionType::ALL` sync, open-ended ranges becoming explicit;
+    - **Waveform cache:** coarse mtimes, silent write failures, an unbounded `song.json` read in `load_overview`;
+    - **Perform:** a failed read is not retried, a build finished just before play is dropped;
+    - **Editor:**
+      - a quit during the save question is dropped;
+      - UI-thread waits on library switch;
+      - a stale note after a bad number;
+      - the import notice hidden behind the editor;
+    - **Save:** a 0600 `song.json` becomes 0644.
 
