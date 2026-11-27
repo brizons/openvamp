@@ -3,10 +3,13 @@
 //! facts, Discard and Save song, and the stems panel) and reports what the
 //! person does as an [`Intent`]. It decides nothing.
 //!
-//! The canvas's section markers and arrangement panels are F2 and are not
-//! drawn: the tempo and meter changes take the left of the screen, and the
-//! stems the rest. A stem's part menu opens under its row, as the setlist
-//! editor's item controls and the Mixer's bus choices do.
+//! For an import, the canvas's section markers and arrangement panels are
+//! not drawn (an import has one Intro section; they are edited from the
+//! song's edit link, [`crate::song_sections_ui`]): the tempo and meter
+//! changes take the left of the screen, and the stems the rest. A stem's
+//! part menu opens under its row, as the setlist editor's item controls
+//! and the Mixer's bus choices do. The header, the notes and the stems
+//! panel are shared with the Song editor of a library song.
 
 use domain::Bus;
 use gpui::{
@@ -25,18 +28,18 @@ use crate::ui::{button, hint, icon, one_line_text};
 
 /// How a control that does nothing now is drawn, as on the canvas
 /// (`button:disabled`).
-const DISABLED_OPACITY: f32 = 0.45;
+pub(crate) const DISABLED_OPACITY: f32 = 0.45;
 
 /// The height of the header, as on the canvas.
-const HEADER_HEIGHT: f32 = 72.;
+pub(crate) const HEADER_HEIGHT: f32 = 72.;
 /// The padding of [`crate::ui::main`], above and below the screen.
-const SCREEN_PADDING: f32 = 16.;
+pub(crate) const SCREEN_PADDING: f32 = 16.;
 /// The gap between the header, the notes and the panels.
-const GAP: f32 = 12.;
+pub(crate) const GAP: f32 = 12.;
 /// The padding of a panel.
-const PANEL_PADDING: f32 = 14.;
+pub(crate) const PANEL_PADDING: f32 = 14.;
 /// The gap between the rows of a panel's column.
-const PANEL_GAP: f32 = 10.;
+pub(crate) const PANEL_GAP: f32 = 10.;
 /// A stem row's height: 36 points and its divider.
 const STEM_ROW: f32 = 37.;
 /// The height of "Show N more".
@@ -50,7 +53,7 @@ const CHANGES_WIDTH: f32 = 330.;
 /// The width of a part menu's column.
 const MENU_COLUMN: f32 = 160.;
 
-fn act(action: ImportAction) -> Intent {
+pub(crate) fn act(action: ImportAction) -> Intent {
     Intent::Library(LibraryAction::Import(action))
 }
 
@@ -67,7 +70,7 @@ pub fn song_editor(
         .flex()
         .flex_col()
         .gap(px(GAP))
-        .child(header(view, cx))
+        .child(header(view, HeaderStyle::IMPORT, cx))
         .when(notes > 0, |page| page.child(notes_panel(view)))
         .child(
             div()
@@ -76,11 +79,33 @@ pub fn song_editor(
                 .flex()
                 .gap(px(GAP))
                 .child(changes_panel(view, cx))
-                .child(stems_panel(view, stems_that_fit(view, viewport, notes), cx)),
+                .child(stems_panel(
+                    view,
+                    stems_that_fit(view, viewport, notes, 0.),
+                    None,
+                    cx,
+                )),
         )
 }
 
-fn panel() -> Div {
+/// How the header differs between an import and a song of the library.
+#[derive(Clone, Copy)]
+pub(crate) struct HeaderStyle {
+    /// What the Library link says it does.
+    pub(crate) back_hint: &'static str,
+    /// Whether Tempo, Time and "Tempo or meter change" do nothing.
+    pub(crate) maps_locked: bool,
+}
+
+impl HeaderStyle {
+    /// An import's: the Library link discards the draft.
+    const IMPORT: Self = Self {
+        back_hint: "Discard the import and go back to the Library",
+        maps_locked: false,
+    };
+}
+
+pub(crate) fn panel() -> Div {
     div()
         .flex()
         .flex_col()
@@ -92,7 +117,7 @@ fn panel() -> Div {
         .rounded(px(14.))
 }
 
-fn panel_heading(name: &'static str, title: &'static str) -> impl IntoElement {
+pub(crate) fn panel_heading(name: &'static str, title: &'static str) -> impl IntoElement {
     div()
         .flex()
         .items_center()
@@ -105,8 +130,14 @@ fn panel_heading(name: &'static str, title: &'static str) -> impl IntoElement {
 
 /// The header: back to the Library, the song's facts, "Tempo or meter
 /// change", Discard and Save song.
-fn header(view: &SongEditorView, cx: &mut Context<Perform>) -> impl IntoElement {
+pub(crate) fn header(
+    view: &SongEditorView,
+    style: HeaderStyle,
+    cx: &mut Context<Perform>,
+) -> impl IntoElement {
     let locked = view.saving.is_some();
+    let maps =
+        |field: Stateful<Div>| field.when(style.maps_locked, |f| f.opacity(DISABLED_OPACITY));
     div()
         .h(px(HEADER_HEIGHT))
         .flex_none()
@@ -123,7 +154,7 @@ fn header(view: &SongEditorView, cx: &mut Context<Perform>) -> impl IntoElement 
                 .gap(px(4.))
                 .text_size(px(14.))
                 .text_color(theme::text_muted())
-                .tooltip(hint("Discard the import and go back to the Library"))
+                .tooltip(hint(style.back_hint))
                 .child(icon("left", theme::text_muted(), 16.))
                 .child("Library"),
         )
@@ -140,12 +171,26 @@ fn header(view: &SongEditorView, cx: &mut Context<Perform>) -> impl IntoElement 
         .child(labelled(
             "Tempo",
             Some("metronome"),
-            field("song-tempo", &view.tempo, SongField::Tempo, NUMBER, "", cx),
+            maps(field(
+                "song-tempo",
+                &view.tempo,
+                SongField::Tempo,
+                NUMBER,
+                "",
+                cx,
+            )),
         ))
         .child(labelled(
             "Time",
             None,
-            field("song-time", &view.time, SongField::Time, SHORT, "", cx),
+            maps(field(
+                "song-time",
+                &view.time,
+                SongField::Time,
+                SHORT,
+                "",
+                cx,
+            )),
         ))
         .child(
             to_the_bottom(button("add-change", cx, act(ImportAction::AddChange)))
@@ -159,7 +204,7 @@ fn header(view: &SongEditorView, cx: &mut Context<Perform>) -> impl IntoElement 
                 .border_color(theme::chip_border())
                 .text_size(px(13.))
                 .text_color(theme::text_muted())
-                .when(locked, |button: Stateful<Div>| {
+                .when(locked || style.maps_locked, |button: Stateful<Div>| {
                     button.opacity(DISABLED_OPACITY)
                 })
                 .child(icon("plus", theme::text_muted(), 14.))
@@ -330,13 +375,13 @@ fn field(
 }
 
 /// How many lines the notes above the panels hold.
-fn notes_lines(view: &SongEditorView) -> usize {
+pub(crate) fn notes_lines(view: &SongEditorView) -> usize {
     view.problems.len() + view.warnings.len() + usize::from(view.save_problem.is_some())
 }
 
 /// What keeps the song from being saved, in red, and the warnings that do
 /// not, in amber: the `domain` and `library` crates' words.
-fn notes_panel(view: &SongEditorView) -> impl IntoElement {
+pub(crate) fn notes_panel(view: &SongEditorView) -> impl IntoElement {
     let line = |text: &String, color| {
         div()
             .flex()
@@ -430,7 +475,7 @@ fn changes_panel(view: &SongEditorView, cx: &mut Context<Perform>) -> impl IntoE
         )
 }
 
-fn change_row(change: &ChangeRow, cx: &mut Context<Perform>) -> AnyElement {
+pub(crate) fn change_row(change: &ChangeRow, cx: &mut Context<Perform>) -> AnyElement {
     let index = change.index;
     div()
         .flex_none()
@@ -493,8 +538,14 @@ fn change_row(change: &ChangeRow, cx: &mut Context<Perform>) -> AnyElement {
 }
 
 /// How many stem rows the stems panel has room for before "Show N more",
-/// in a window whose content is `viewport`, under `notes` lines of notes.
-fn stems_that_fit(view: &SongEditorView, viewport: Size<Pixels>, notes: usize) -> usize {
+/// in a window whose content is `viewport`, under `notes` lines of notes
+/// and `above` points of other panels.
+pub(crate) fn stems_that_fit(
+    view: &SongEditorView,
+    viewport: Size<Pixels>,
+    notes: usize,
+    above: f32,
+) -> usize {
     let notes = if notes == 0 {
         0.
     } else {
@@ -505,16 +556,21 @@ fn stems_that_fit(view: &SongEditorView, viewport: Size<Pixels>, notes: usize) -
     } else {
         PANEL_GAP + 20. + view.refused.len() as f32 * 38.
     };
+    let source = if view.source.is_empty() {
+        0.
+    } else {
+        16. + PANEL_GAP
+    };
     let around = 2. * SCREEN_PADDING
         + HEADER_HEIGHT
         + GAP
         + notes
+        + above
         + 2. * PANEL_PADDING
         // The heading, the source line and "Show N more", with their gaps.
         + 24.
         + PANEL_GAP
-        + 16.
-        + PANEL_GAP
+        + source
         + PANEL_GAP
         + SHOW_MORE
         + refused;
@@ -522,15 +578,23 @@ fn stems_that_fit(view: &SongEditorView, viewport: Size<Pixels>, notes: usize) -
     ((room / STEM_ROW).floor().max(3.)) as usize
 }
 
-/// The stems, with their bus buttons and the files the import refuses.
-fn stems_panel(view: &SongEditorView, fit: usize, cx: &mut Context<Perform>) -> impl IntoElement {
+/// The stems, with their bus buttons and the files the import refuses;
+/// `width` points wide, or the room left when `None`.
+pub(crate) fn stems_panel(
+    view: &SongEditorView,
+    fit: usize,
+    width: Option<f32>,
+    cx: &mut Context<Perform>,
+) -> impl IntoElement {
     // One more row takes the room of the button that would show it.
     let collapsed = !view.all_stems && view.stems.len() > fit + 1;
     let shown = if collapsed { fit } else { view.stems.len() };
     let menu = view.part_menu.as_ref();
-    panel()
-        .flex_1()
-        .min_w_0()
+    let panel = match width {
+        Some(width) => panel().w(px(width)).flex_none(),
+        None => panel().flex_1().min_w_0(),
+    };
+    panel
         .child(
             div()
                 .flex()
@@ -544,12 +608,14 @@ fn stems_panel(view: &SongEditorView, fit: usize, cx: &mut Context<Perform>) -> 
                         .child(view.stems_summary.clone()),
                 ),
         )
-        .child(
-            div()
-                .text_size(px(12.))
-                .text_color(theme::text_faint())
-                .child(one_line_text(format!("From {}", view.source))),
-        )
+        .when(!view.source.is_empty(), |panel| {
+            panel.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme::text_faint())
+                    .child(one_line_text(format!("From {}", view.source))),
+            )
+        })
         .child(
             div()
                 .id("stems")
