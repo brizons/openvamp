@@ -268,4 +268,16 @@ Risk: T2 and T3 add dependencies (item 5) and change `LoadError`, which `app` an
   - **Next:**
     - the T3 writer was resumed for B1–B4, as one fix commit to be moved after 05b8af2;
     - the T4 verifier was launched at the same time in a scratch copy.
+- **L19** (2026-11-26): the T3 correction batch landed as b05d730. The parent moved it right after 4318887, so the T3 library slice is 6ea066c..b05d730. T4 is now dca6066 (was 6aa0db8), and the doc commits follow it. The final tree is identical to the previous head, which is kept as `song-import-backup`. The fixes:
+  - **B1:** a frame larger than its raw 24-bit samples is re-encoded verbatim, and STREAMINFO's frame sizes are the written ones. A save failure names the stem and keeps the `LoadError` detail.
+  - **B2:** the `iTunSMPB` fallback in `import/mp4.rs`, with the fixture `tests/import/apple.m4a` (4.5 KB).
+  - **B3:** `ProbedStem.estimated_length`; the save trusts the decoder's frame count for those stems. Fixture `tests/import/noxing.mp3` (32 KB).
+  - **B4:** the probe refuses sources cut short, and `read_through` reads every written stem before the rename.
+  - **Checks:**
+    - RED/GREEN for each blocker;
+    - `cargo test -p library -p domain` passes 335 tests (3 ignored); the workspace check and clippy are clean;
+    - the parent re-ran `--test import` (28 passed, 1 ignored);
+    - the release timing was not re-measured because of low disk.
+
+  The T3 verifier is rechecking B1–B4 on b05d730.
 
