@@ -59,7 +59,7 @@ Requirements quote `docs/mvp-spec.md` (F2) and the user verbatim. Items marked *
 
 | ID | Specs | Route | Status | Commits |
 |----|-------|-------|--------|---------|
-| T1 | S1, S2 (domain) | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L3; verified L4) | see L4 |
+| T1 | S1, S2 (domain) | delegated (parallel unit with T2, disjoint surface `crates/domain`) | done (L3; verified L4; review approved L6) | 57965f1 |
 | T2 | S3, S4 save (library) | delegated (parallel unit with T1, disjoint surface `crates/library`) | done (L5); independent verifier pending | see L5 |
 | T3 | S1–S4 (desktop Song editor) | delegated (context backstop); needs T1 and T2 | pending | |
 | T4 | S5 (Perform song map) | delegated (context backstop); needs T2 and T3 | pending | |
@@ -135,4 +135,10 @@ Risk: T2 rewrites existing `song.json` files (item 1, changing stored data) and 
     - The parent re-ran `--test waveform` (13) and `--test save_song` (10).
     - Release build of 24 five-minute stems: 4.1 s (WAV) and 4.7 s (FLAC); a cache read takes 0.6 ms.
   - Risk: item 1 (it rewrites existing `song.json` files) and item 3 (shared load, setlist and settings helpers), so T2 gets an independent verifier.
+- **L6** (2026-11-27): T1's native review (lineage review-83f1cc62ad90ed8c, 2827125..57965f1) approved and was acknowledged, so the reviewed boundary is now 57965f1. Non-blocking findings, kept as follow-ups:
+  - WARNING ×2: the edit.rs docs promise that a split keeps every arrangement's audio, but a looped section split keeps its loop flag on the first part only, and no test pins that;
+  - WARNING: `SectionType::ALL` is not tied to the enum at compile time;
+  - SUGGESTION: the 24-hour song limit is computed inline in `from_maps`;
+  - SUGGESTION: `import::bar_lines` hides a broken invariant with `unwrap_or_default`.
+- T2's independent verifier and the T3 writer (the desktop Song editor) were launched at the same time; the verifier works in a scratch copy.
 
